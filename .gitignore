@@ -1,0 +1,9 @@
+# Real secrets; only the *.example templates are tracked.
+secrets/**/*.env
+secrets/**/*.pem
+# Per-agent Hermes state (config, sessions, memories, logs).
+data/
+
+*.pyc
+# Local Compose settings (e.g. HERMES_UID); Compose reads ./.env automatically.
+/.env

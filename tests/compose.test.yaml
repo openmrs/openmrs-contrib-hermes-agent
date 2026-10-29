@@ -1,0 +1,79 @@
+# Compose override used by tests/run.sh. Replaces every secret with tests/fixtures values, swaps in
+# the generated mock LiteLLM config, and adds fake Jev, Rovo MCP, Anthropic, and GitHub endpoints, and
+# a git server standing in for GitHub for the sandbox.
+# TEST_WORK is a temporary directory created by run.sh, which also generates the GitHub App key pair
+# there. Agent data lives in this project's own agents-data volume.
+
+services:
+  postgres:
+    env_file: !override [tests/fixtures/postgres.env]
+
+  litellm:
+    env_file: !override [tests/fixtures/litellm.env, tests/fixtures/master.env]
+    ports: !override
+      - "127.0.0.1:${TEST_LITELLM_PORT:-14000}:4000"
+    volumes:
+      - ${TEST_WORK:?run tests/run.sh}/litellm.yaml:/app/config.yaml:ro
+      - ./tests:/tests:ro
+    environment:
+      TYPESAFE_API_BASE: http://fake-jev:8001
+      ROUTER_CLASSIFIERS: ${TEST_ROUTER_CLASSIFIERS:-jev,llm}
+      ROUTER_CLASSIFIER_MODEL: ${TEST_ROUTER_CLASSIFIER_MODEL:-classifier-mock}
+      TYPESAFE_API_KEY: ${TEST_TYPESAFE_API_KEY-test-typesafe-key}
+      ROVO_JIRA_WRITE_API_KEY: ${TEST_ROVO_JIRA_WRITE_API_KEY-test-rovo-jira-write-key}
+
+  admin:
+    env_file: !override [tests/fixtures/master.env]
+    volumes:
+      - ./tests:/tests:ro
+      - ${TEST_WORK}/github-levels.json:/templates/github-levels.json:ro
+
+  github-token:
+    env_file: !override [{path: "${TEST_WORK}/github-app.env"}]
+    environment:
+      GITHUB_API_URL: http://fake-github:8004
+    volumes:
+      - ${TEST_WORK}/github-levels.json:/app/levels.json:ro
+
+  sandbox:
+    environment:
+      SANDBOX_GIT_BASE: git://fake-git:8005
+
+  # Serves the test repository run.sh creates with git daemon, from the sandbox image (which has
+  # git). Like GitHub, it speaks git's smart protocol, which the sandbox's partial clones need.
+  # safe.directory: the repository belongs to the host user, not the container's.
+  fake-git:
+    image: hermes-sandbox:local
+    networks: [sandbox]
+    volumes:
+      - ${TEST_WORK}/git:/srv:ro
+    entrypoint: ["git", "-c", "safe.directory=*", "daemon", "--export-all", "--base-path=/srv", "--port=8005", "--reuseaddr"]
+
+  fake-jev:
+    image: python:3.12-slim
+    networks: [agents]
+    volumes:
+      - ./tests/fake_jev.py:/app/fake_jev.py:ro
+    command: ["python", "-u", "/app/fake_jev.py"]
+
+  fake-rovo:
+    image: python:3.12-slim
+    networks: [agents]
+    volumes:
+      - ./tests/fake_rovo.py:/app/fake_rovo.py:ro
+    command: ["python", "-u", "/app/fake_rovo.py"]
+
+  fake-anthropic:
+    image: python:3.12-slim
+    networks: [agents]
+    volumes:
+      - ./tests/fake_anthropic.py:/app/fake_anthropic.py:ro
+    command: ["python", "-u", "/app/fake_anthropic.py"]
+
+  fake-github:
+    image: python:3.12-slim
+    networks: [agents]
+    volumes:
+      - ./tests/fake_github.py:/app/fake_github.py:ro
+      - ${TEST_WORK}/github-app.pub.pem:/app/public.pem:ro
+    command: ["python", "-u", "/app/fake_github.py"]

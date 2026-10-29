@@ -1,0 +1,160 @@
+name: Release
+
+# Cuts a release from main: picks the version, runs the tests and publishes the images under that
+# version (build.yml), then tags v<version> and creates a GitHub Release listing every change since
+# the previous release. Nothing is committed: the tag is the only record of a version.
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Version bump from the latest v<major>.<minor>.<patch> tag. Ignored when release_version is set."
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      release_version:
+        description: "Exact version to release (e.g. 1.2.0, or 1.2.0-beta.1 for a pre-release). Overrides release_type."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # The shared OpenMRS release scripts, pinned.
+  GHA_WORKFLOWS_REPO: openmrs/openmrs-contrib-gha-workflows
+  GHA_WORKFLOWS_SHA: d1ccdf0e943770b36bcd2f0c8c8275ffe8413c7c
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      base_ref: ${{ steps.prev.outputs.base_ref }}
+      is_latest: ${{ steps.prev.outputs.is_latest }}
+      prerelease: ${{ steps.prev.outputs.prerelease }}
+    steps:
+      - name: Require the default branch
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::Releases can only be cut from '$DEFAULT_BRANCH' (this run is on '$REF_NAME'). Pick '$DEFAULT_BRANCH' in the 'Use workflow from' dropdown."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GHA_WORKFLOWS_REPO }}
+          ref: ${{ env.GHA_WORKFLOWS_SHA }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+          path: .gha-workflows
+
+      - name: Compute release version
+        id: version
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          git tag --list 'v*' | python3 -c '
+          import os, re, sys
+          SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?$")
+          stable = [tuple(map(int, m.groups()[:3])) for m in (SEMVER.match(t.strip()[1:]) for t in sys.stdin)
+                    if m and not m.group(4)]
+          current = max(stable, default=(0, 0, 0))
+          exact = os.environ["RELEASE_VERSION"].strip().removeprefix("v")
+          if exact:
+              m = SEMVER.match(exact)
+              if not m:
+                  sys.exit(f"::error::release_version {exact!r} is not a version like 1.2.0 or 1.2.0-beta.1")
+              if tuple(map(int, m.groups()[:3])) <= current:
+                  sys.exit(f"::error::release_version {exact} is not newer than the latest release " + "%d.%d.%d" % current)
+              version = exact
+          else:
+              major, minor, patch = current
+              version = {"major": f"{major + 1}.0.0", "minor": f"{major}.{minor + 1}.0",
+                         "patch": f"{major}.{minor}.{patch + 1}"}[os.environ["RELEASE_TYPE"]]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\ntag=v{version}\n")
+          '
+          echo "- **Version:** \`$(sed -n 's/^version=//p' "$GITHUB_OUTPUT")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify tag does not exist
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG already exists. Release aborted to prevent overwriting."
+            exit 1
+          fi
+
+      # Base for the release notes (the latest stable release older than this one), and whether this
+      # release is the newest stable one, which decides the :latest image tag and the Latest badge.
+      - name: Resolve previous release tag
+        id: prev
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          TAG_PREFIX: ""
+        run: git tag --list 'v*' | python3 .gha-workflows/.github/scripts/select_previous_release.py
+
+  images:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      latest: ${{ needs.prepare.outputs.is_latest == 'true' }}
+    secrets: inherit
+
+  # Tags only once the images are published, so a tag always has images behind it.
+  github_release:
+    needs: [prepare, images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" --silent
+
+      - name: Create release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          # GitHub's generated notes: every PR merged since the previous release, with its author.
+          ARGS=(-f tag_name="$RELEASE_TAG")
+          if [ -n "$BASE_REF" ]; then ARGS+=(-f previous_tag_name="$BASE_REF"); fi
+          gh api -X POST "repos/$REPO/releases/generate-notes" "${ARGS[@]}" --jq .body > "$RUNNER_TEMP/release-notes.md"
+          if [ ! -s "$RUNNER_TEMP/release-notes.md" ]; then
+            echo "::error::GitHub returned empty release notes for $RELEASE_TAG"
+            exit 1
+          fi
+
+      # github.token deliberately: a Release created with it raises no `release` event, so it can't
+      # set off other workflows.
+      - name: Create release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.prepare.outputs.is_latest }}

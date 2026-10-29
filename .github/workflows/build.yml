@@ -1,0 +1,109 @@
+name: Build images
+
+# Runs tests/run.sh, then builds the stack's images for linux/amd64 and linux/arm64 and, except on
+# pull requests, publishes them to Docker Hub:
+#   push to main          :nightly and :<short sha>
+#   called by release.yml :<version>, plus :latest when the release is the newest stable one
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version (without the v prefix) to tag the images with"
+        type: string
+        required: true
+      latest:
+        description: "Also tag the images :latest"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run tests/run.sh
+        run: tests/run.sh
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - image: openmrsinfra/hermes-admin
+            context: admin
+          - image: openmrsinfra/hermes-github-token
+            context: github-token
+          - image: openmrsinfra/hermes
+            context: hermes/image
+          - image: openmrsinfra/hermes-sandbox
+            context: sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Determine tags and build arguments
+        id: meta
+        env:
+          IMAGE: ${{ matrix.image }}
+          CONTEXT: ${{ matrix.context }}
+          VERSION: ${{ inputs.version }}
+          LATEST: ${{ inputs.latest }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            tags="$IMAGE:$VERSION"
+            if [ "$LATEST" = "true" ]; then tags="$tags,$IMAGE:latest"; fi
+          elif [ "$EVENT" = "push" ]; then
+            tags="$IMAGE:nightly,$IMAGE:${GITHUB_SHA::7}"
+          else
+            tags="$IMAGE:ci"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          # The Hermes base image is pinned in compose.yaml (x-hermes-agent), so the published image
+          # is built from the same one the stack and tests use.
+          build_args=""
+          if [ "$CONTEXT" = "hermes/image" ]; then
+            hermes_image=$(docker compose --profile '*' -f compose.yaml config --no-env-resolution --format json \
+              | jq -r '.services["agent-default"].build.args.HERMES_IMAGE')
+            if [ -z "$hermes_image" ] || [ "$hermes_image" = "null" ]; then
+              echo "::error::Could not read HERMES_IMAGE for agent-default from compose.yaml"
+              exit 1
+            fi
+            build_args="HERMES_IMAGE=$hermes_image"
+          fi
+          echo "build_args=$build_args" >> "$GITHUB_OUTPUT"
+          echo "- \`$IMAGE\`: ${tags//,/, }" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ steps.meta.outputs.build_args }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.context }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.context }}

@@ -1,0 +1,16 @@
+{
+  "github_read": {
+    "description": "Read-only access to the App installation's repositories: code, PRs, CI runs, checks, statuses, deployments, artifacts, and code quality",
+    "permissions": {
+      "actions": "read",
+      "artifact_metadata": "read",
+      "checks": "read",
+      "code_quality": "read",
+      "contents": "read",
+      "deployments": "read",
+      "metadata": "read",
+      "pull_requests": "read",
+      "statuses": "read"
+    }
+  }
+}
