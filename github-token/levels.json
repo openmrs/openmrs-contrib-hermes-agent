@@ -12,5 +12,13 @@
       "pull_requests": "read",
       "statuses": "read"
     }
+  },
+  "github_pr": {
+    "description": "Push branches and open pull requests. Pushes are limited to apollo/* branches by an org ruleset, not by this service",
+    "permissions": {
+      "contents": "write",
+      "metadata": "read",
+      "pull_requests": "write"
+    }
   }
 }

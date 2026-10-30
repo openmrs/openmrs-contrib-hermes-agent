@@ -73,10 +73,13 @@ jobs:
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           # The Hermes base image is pinned in compose.yaml (x-hermes-agent), so the published image
-          # is built from the same one the stack and tests use.
+          # is built from the same one the stack and tests use. `config` needs every required env
+          # file to exist, so it runs against the placeholder secrets the tests use.
           build_args=""
           if [ "$CONTEXT" = "hermes/image" ]; then
-            hermes_image=$(docker compose --profile '*' -f compose.yaml config --no-env-resolution --format json \
+            python3 tests/compose_isolation.py write-secrets "$RUNNER_TEMP/compose-config/secrets"
+            hermes_image=$(docker compose --profile '*' --project-directory "$RUNNER_TEMP/compose-config" \
+              -f compose.yaml config --no-env-resolution --format json \
               | jq -r '.services["agent-default"].build.args.HERMES_IMAGE')
             if [ -z "$hermes_image" ] || [ "$hermes_image" = "null" ]; then
               echo "::error::Could not read HERMES_IMAGE for agent-default from compose.yaml"

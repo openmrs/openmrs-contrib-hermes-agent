@@ -19,7 +19,8 @@ import json
 import os
 import sys
 
-AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID"}
+AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                     "GIT_COMMITTER_EMAIL"}
 # Secret files and the only services allowed to receive them.
 SECRET_FILES = {
     "litellm.env": {"litellm"},

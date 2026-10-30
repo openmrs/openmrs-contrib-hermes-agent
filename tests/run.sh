@@ -34,9 +34,10 @@
 #      refuses an MCP server with an empty credential, and only warns about one that's down.
 #   8. Requests to each tier model carry prompt-cache markers on the system prompt and the
 #      latest message.
-#   9. The agent's gh gets GitHub App tokens from github-token only for the levels its key was
-#      granted; tokens carry each level's permissions and repository limits, are reused, and need
-#      a valid, unrevoked key; the App key never reaches the agent.
+#   9. The agent's gh, and git through it, get GitHub App tokens from github-token only for the
+#      levels its key was granted; tokens carry each level's permissions and repository limits,
+#      are reused, and need a valid, unrevoked key; the App key never reaches the agent, and
+#      commits are authored as the configured bot.
 #  10. The sandbox builds a branch or pull request of a repository (from a local git server) with
 #      the chosen JDK, only for keys granted it; runs builds as an unprivileged user on a
 #      read-only root filesystem; leaves no processes or files for the next job except its caches;
@@ -52,6 +53,8 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 compose_cmd="${COMPOSE:-docker compose}"
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-14000}"
+# Exported so they win over any values in the repository's .env, which Compose also reads.
+export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
 expected_context=512000
 # LiteLLM's log line when a classifier plugin call goes wrong (as opposed to declining).
@@ -216,10 +219,10 @@ python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_
 # with the public one.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
 openssl rsa -in "$TEST_WORK/github-app.pem" -pubout -out "$TEST_WORK/github-app.pub.pem" 2>/dev/null
-# Both levels share the test App; github_test_write exists only in the tests, to check that write
+# All levels share the test App; github_test_write exists only in the tests, to check that write
 # permissions and repository limits reach GitHub and that grants are enforced per level.
 github_key_base64="$(base64 < "$TEST_WORK/github-app.pem" | tr -d '\n')"
-for prefix in GITHUB_READ GITHUB_TEST_WRITE; do
+for prefix in GITHUB_READ GITHUB_PR GITHUB_TEST_WRITE; do
   echo "${prefix}_APP_ID=12345"
   echo "${prefix}_INSTALLATION_ID=67890"
   echo "${prefix}_PRIVATE_KEY_BASE64=$github_key_base64"
@@ -262,7 +265,7 @@ compose up -d --wait --wait-timeout 180 postgres litellm github-token sandbox fa
 
 echo "== 2. Admin tool"
 expect "servers lists the configured MCP servers" '["rovo_confluence_write", "rovo_jira_write", "rovo_read", "sandbox"]' "$(admin servers --json)"
-expect "levels lists the GitHub access levels" '["github_read", "github_test_write"]' "$(admin levels --json)"
+expect "levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin levels --json)"
 expect_ok "create default (rovo_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
   create default --mcp rovo_read --github github_read --slack-from-stdin
@@ -446,9 +449,12 @@ else
 fi
 
 echo "== 3. Hermes side tasks use fast"
+# The check runs as the container's root, so it deletes what Hermes wrote to check-home itself:
+# with rootful Docker those files are root-owned on the host, and cleanup couldn't remove them.
 if compose run --rm --no-deps -T -e HERMES_HOME=/check-home -e LITELLM_API_KEY=sk-placeholder \
   -v "$TEST_WORK/check-home:/check-home" -v "$root/tests/hermes_side_tasks.py:/check.py:ro" \
-  --entrypoint /opt/hermes/.venv/bin/python agent-default /check.py; then
+  --entrypoint sh agent-default -c \
+  '/opt/hermes/.venv/bin/python /check.py; status=$?; find /check-home -mindepth 1 -delete; exit $status'; then
   pass "all side tasks route to litellm/fast"
 else
   fail "side task routing (see output above)"
@@ -668,13 +674,22 @@ done
 
 echo "== 9. GitHub"
 compose up -d --no-deps agent-default >/dev/null
-expect "github-token has credentials for each level" "github_read: configured github_test_write: configured" \
+expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_test_write: configured" \
   "$(compose exec -T github-token python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/healthz").read().decode())' 2>&1 |
     tr '\n' ' ' | sed 's/ *$//')"
 expect "agent gh is the pinned version" "2.103.3" \
   "$(compose exec -T agent-default gh --version 2>&1 | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
 expect "agent gh gets a github_read token" "ghs_test_1" "$(compose exec -T agent-default gh auth token 2>&1)"
 expect "github-token reuses an unexpired token" "ghs_test_1" "$(compose exec -T agent-default gh auth token 2>&1)"
+git_credential() {
+  printf 'protocol=https\nhost=github.com\n\n' |
+    compose exec -T -e GIT_TERMINAL_PROMPT=0 "$@" agent-default git credential fill 2>&1 | sed -n 's/^password=//p'
+}
+expect "agent git gets GitHub credentials through gh" "ghs_test_1" "$(git_credential)"
+expect "agent git gets no credentials for a level it wasn't granted" "" "$(git_credential -e GH_LEVEL=github_test_write)"
+expect "agent commits are authored and committed as the bot" \
+  "$GIT_BOT_NAME <$GIT_BOT_EMAIL> $GIT_BOT_NAME <$GIT_BOT_EMAIL>" \
+  "$(compose exec -T agent-default sh -c 'echo $(git var GIT_AUTHOR_IDENT | sed "s/>.*/>/") $(git var GIT_COMMITTER_IDENT | sed "s/>.*/>/")' 2>&1)"
 expect "github_read token: valid App JWT, levels.json permissions, no repository limit" "1" \
   "$(log_count_fixed fake-github "mint path_ok=True jwt_ok=True permissions=$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["github_read"]["permissions"], sort_keys=True, separators=(",", ":")))' "$root/github-token/levels.json") repositories=null")"
 if compose exec -T -e GH_LEVEL=github_test_write agent-default gh auth token >"$TEST_WORK/out" 2>&1; then

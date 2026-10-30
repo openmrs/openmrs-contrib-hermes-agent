@@ -1,5 +1,6 @@
-# The Hermes image plus the GitHub CLI. `gh` is wrapped so every run gets a short-lived, read-only
-# token from the github-token service; no GitHub credential is stored in the agent.
+# The Hermes image plus the GitHub CLI. `gh` is wrapped so every run gets a short-lived token from
+# the github-token service, and git uses it as its GitHub credential helper; no GitHub credential is
+# stored in the agent.
 #
 # To update gh, change GH_VERSION and both checksums (from gh_<version>_checksums.txt on the
 # release page), then rebuild: docker compose build.
@@ -19,4 +20,5 @@ RUN python3 /fetch_gh.py
 FROM ${HERMES_IMAGE}
 COPY --from=gh /gh /usr/local/lib/gh/gh
 COPY gh /usr/local/bin/gh
-RUN chmod 755 /usr/local/bin/gh
+COPY gitconfig /etc/gitconfig
+RUN chmod 755 /usr/local/bin/gh && chmod 644 /etc/gitconfig

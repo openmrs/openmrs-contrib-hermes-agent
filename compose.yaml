@@ -53,6 +53,11 @@ x-hermes-agent: &hermes-agent
   environment:
     HERMES_UID: ${HERMES_UID:-10000}
     HERMES_GID: ${HERMES_GID:-10000}
+    # The github_pr App's bot account, from ./.env; commits fail until both are set (see README.md).
+    GIT_AUTHOR_NAME: ${GIT_BOT_NAME:-}
+    GIT_AUTHOR_EMAIL: ${GIT_BOT_EMAIL:-}
+    GIT_COMMITTER_NAME: ${GIT_BOT_NAME:-}
+    GIT_COMMITTER_EMAIL: ${GIT_BOT_EMAIL:-}
 
 services:
   postgres:

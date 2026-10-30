@@ -62,9 +62,9 @@ manages agents' keys and access.
   LiteLLM refuses the agent's requests until spend resets on the 1st of the month (UTC).
 - **GitHub access is granted per level, and tokens are short-lived.** Access levels are defined
   in `github-token/levels.json`: each names its token permissions and, optionally, the
-  repositories it's limited to. Today there's one, `github_read`, read-only. Each level should
-  have its own GitHub App, installed only where that level needs access; GitHub caps every token
-  at its App's permissions.
+  repositories it's limited to: `github_read` (read-only) and `github_pr` (push branches and open
+  pull requests). Each level should have its own GitHub App, installed only where that level needs
+  access; GitHub caps every token at its App's permissions.
   - **Tokens are per run.** An agent's `gh` sends its LiteLLM key to `github-token` on every run.
     `github-token` checks the key with LiteLLM and only issues a token for a level in the key's
     `github_levels` metadata, which the admin tool manages. Revoked keys get nothing, and grant
@@ -74,6 +74,16 @@ manages agents' keys and access.
   - **Agent keys may call `/key/info`** so `github-token` can read their grants. LiteLLM only
     answers a non-admin key about itself or keys with the same `user_id`, and each agent's keys
     get their own `user_id`, so agents can't read each other's key info.
+  - **`github_pr` pushes are limited by GitHub, not by this stack.** The agent gets an ordinary
+    token with Contents and Pull requests write, and Hermes doesn't ask before using it. Two org
+    rulesets (see [Setup](#setup)) stop the App from pushing anywhere but `apollo/*` branches, or
+    creating, moving, or deleting tags; that includes merging, which updates the base branch.
+    Rulesets don't cover the rest of what those permissions allow, so a prompt-injected agent
+    could still edit or delete GitHub Releases, send `repository_dispatch` events, and comment on,
+    review, retitle, or close any pull request. Pushes to `apollo/*` also run any workflow that
+    triggers on pushes to every branch, with whatever secrets it exposes, so check that none hand
+    secrets to build steps. The App must not have the Workflows permission, which keeps the agent
+    from changing workflow files.
 - **MCP access is granted per server.** Each MCP server in `litellm/config.yaml` holds its own
   credential, and each agent's key is granted an explicit list of servers (possibly none). Name
   servers `<integration>_<level>` and give each level its own, separately scoped service account,
@@ -169,12 +179,30 @@ whichever is available (see [Managing agents](#managing-agents)).
    Install it on the `openmrs` org, generate a private key, and fill in `secrets/github-app.env`
    from `secrets/github-app.env.example`. The permissions in `github-token/levels.json` must
    match the App's, or GitHub refuses the token. Without the App, everything but `gh` works.
+
+   For the `github_pr` level (optional), an org owner first creates two org rulesets that apply
+   to all repositories, each with org admins and the Admin, Maintain, and Write repository roles
+   (and any deploy keys release tooling pushes with) as bypass actors, but not the App:
+   - a branch ruleset targeting all branches except `apollo/**`, with Restrict creations,
+     Restrict updates, and Restrict deletions;
+   - a tag ruleset targeting all tags, with the same three rules.
+
+   Then create a second App with Read and write Contents and Pull requests (never Workflows),
+   install it on the `openmrs` org, and add its `GITHUB_PR_*` values to `secrets/github-app.env`.
+   Before granting it, check with a scratch repository that the App's token can push to
+   `apollo/test` but not to `main`, and can't create a tag.
+
+   Commits are authored as the App's bot account, set in the [host settings](#host-settings):
+   `GIT_BOT_NAME=<app-slug>[bot]` and
+   `GIT_BOT_EMAIL=<user-id>+<app-slug>[bot]@users.noreply.github.com`, with the bot's user ID
+   from `gh api 'users/<app-slug>[bot]' --jq .id`.
 5. **Create the agent:**
    ```sh
    bin/admin create default --mcp rovo_jira_write,rovo_confluence_write,sandbox --github github_read
    ```
    This starts LiteLLM and Postgres if they aren't running. An agent can't start until `create`
-   has made its directory in the `agents-data` volume.
+   has made its directory in the `agents-data` volume. To let it open pull requests, add
+   `github_pr` to `--github`.
 6. **Slack:** give each agent its own Slack app. Generate the app's manifest from Hermes:
    ```sh
    docker compose run --rm --no-deps -T -e HERMES_HOME=/tmp/hermes \
@@ -212,6 +240,7 @@ git). None of them are secrets.
 |---|---|---|
 | `LITELLM_HOST_PORT` | `4000` | Host port for LiteLLM's admin UI, bound to 127.0.0.1 |
 | `HERMES_UID`, `HERMES_GID` | `10000` | User and group agents run as, and that own their files in `agents-data` |
+| `GIT_BOT_NAME`, `GIT_BOT_EMAIL` | (none) | Author and committer of agents' commits: the `github_pr` App's bot account. Commits fail until both are set |
 
 ## Managing agents
 
@@ -419,6 +448,8 @@ It checks:
   replaces its router, and declines re-entry.
 - **GitHub** (with a test-only write level alongside `github_read`):
   - the agent's `gh` is the pinned version and gets a `github_read` token, which is reused;
+  - the agent's `git` gets its GitHub credentials through `gh`, only for granted levels, and
+    commits as the bot in `GIT_BOT_NAME` and `GIT_BOT_EMAIL`;
   - `github-token` signs a valid App JWT (checked against the App's public key) and requests
     exactly each level's permissions and repository limits;
   - a level the key wasn't granted is refused (403), as are a missing, unknown, or revoked key
