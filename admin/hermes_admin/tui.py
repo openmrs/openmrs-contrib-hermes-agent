@@ -15,7 +15,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
-from .agents import DEFAULT_BUDGET, SLACK_VARS, Agent, AgentError, Agents, validate_budget, validate_name
+from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
+                     validate_budget, validate_name)
 from .litellm import LiteLLMError
 
 DIALOG_CSS = """
@@ -77,6 +78,7 @@ class CreateDialog(_Dialog):
             yield Input(placeholder="SLACK_BOT_TOKEN", password=True, id="SLACK_BOT_TOKEN")
             yield Input(placeholder="SLACK_APP_TOKEN", password=True, id="SLACK_APP_TOKEN")
             yield Input(placeholder="SLACK_ALLOWED_USERS (comma-separated member IDs)", id="SLACK_ALLOWED_USERS")
+            yield Input(placeholder="SLACK_HOME_CHANNEL (channel ID)", id="SLACK_HOME_CHANNEL")
             yield Static("", classes="error", id="error")
             yield self._buttons("Create")
 
@@ -144,7 +146,7 @@ class SlackDialog(_Dialog):
             yield Label("Blank fields keep their current value. The agent must be restarted afterwards.")
             for var in SLACK_VARS:
                 state = "set" if self._agent.env_set.get(var) else "not set"
-                yield Input(placeholder=f"{var} ({state})", password=var != "SLACK_ALLOWED_USERS", id=var)
+                yield Input(placeholder=f"{var} ({state})", password=var in SLACK_TOKEN_VARS, id=var)
             yield self._buttons("Save")
 
     @on(Button.Pressed, "#confirm")
@@ -227,14 +229,15 @@ class AdminApp(App):
         table = self.query_one("#agents", DataTable)
         table.clear()
         for a in listed:
-            slack_set = [a.env_set.get(var) for var in SLACK_VARS]
+            required_set = [a.env_set.get(var) for var in SLACK_REQUIRED_VARS]
+            any_set = any(a.env_set.get(var) for var in SLACK_VARS)
             table.add_row(
                 a.name,
                 "active" if len(a.key_hashes) == 1 else f"{len(a.key_hashes)} keys" if a.key_hashes else "no key",
                 ", ".join(a.mcp_servers) or "none",
                 ", ".join(a.github_levels) or "none",
                 f"${a.spend:,.2f} / ${a.budget:,.0f}" if a.budget is not None else "none",
-                "set" if all(slack_set) else "partial" if any(slack_set) else "not set",
+                "set" if all(required_set) else "partial" if any_set else "not set",
                 "present" if a.has_data else "none",
                 key=a.name,
             )

@@ -49,7 +49,11 @@ ALLOWED_ROUTES = [
 # LiteLLM's sentinel for "no MCP servers"; an empty list would mean "inherit".
 NO_MCP_SERVERS = "no-mcp-servers"
 
-SLACK_VARS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS")
+# Tokens are masked when entered. An agent's Slack setup is complete once SLACK_REQUIRED_VARS are
+# set; SLACK_HOME_CHANNEL (a channel ID) is optional.
+SLACK_TOKEN_VARS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
+SLACK_REQUIRED_VARS = (*SLACK_TOKEN_VARS, "SLACK_ALLOWED_USERS")
+SLACK_VARS = (*SLACK_REQUIRED_VARS, "SLACK_HOME_CHANNEL")
 KEY_VAR = "LITELLM_API_KEY"
 SECRET_VARS = (KEY_VAR, *SLACK_VARS)
 

@@ -26,7 +26,8 @@
 #   4. The `auto` router's classifier chain: Jev decides; Jev fails -> LLM classifier decides.
 #   5. Hermes end to end: context length is 512000 for `auto`, chat goes through the router,
 #      session titles come from `fast`, the read-only SOUL.md reaches the model, MCP reaches only
-#      the granted server, and the agent holds no other secrets and can't reach Postgres.
+#      the granted server, the agent can't change its .env but sees admin's changes after a
+#      restart, and the agent holds no other secrets and can't reach Postgres.
 #   6. tier_classifier.py internals: refuses router classifier models, follows Router rebuilds,
 #      declines re-entry.
 #   7. Classifier fallbacks: both fail -> heuristic; classifier model `auto` is refused without
@@ -540,6 +541,9 @@ expect_refused "agent can't write its SOUL.md" compose exec -T agent-default sh 
 expect "config.yaml in the agent is hermes/config.yaml" "$(shasum -a 256 < "$root/hermes/config.yaml" | cut -d' ' -f1)" \
   "$(compose exec -T agent-default cat /opt/data/config.yaml | shasum -a 256 | cut -d' ' -f1)"
 expect_refused "agent can't write its config.yaml" compose exec -T agent-default sh -c 'echo changed >> /opt/data/config.yaml'
+# .env is mounted read-only over the agent's home, so the agent can neither edit nor replace it.
+expect_refused "agent can't write its .env" compose exec -T agent-default sh -c 'echo X=1 >> /opt/data/.env'
+expect_refused "agent can't replace its .env" compose exec -T agent-default sh -c 'rm /opt/data/.env'
 expect "hermes/config.yaml's _config_version is the Hermes image's" \
   "$(compose exec -T agent-default /opt/hermes/.venv/bin/python -c \
     'from hermes_cli.config_defaults import DEFAULT_CONFIG; print(DEFAULT_CONFIG["_config_version"])' 2>&1)" \
@@ -596,6 +600,11 @@ if compose exec -T agent-default python3 -c 'import socket; socket.create_connec
 else
   pass "agent can't reach Postgres"
 fi
+# admin replaces .env with a new file, which the read-only mount picks up when the agent restarts.
+expect_ok "slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' slack default --from-stdin
+compose restart agent-default >/dev/null
+expect "the agent sees admin's .env changes after a restart" "SLACK_HOME_CHANNEL=C0TEST" \
+  "$(compose exec -T agent-default sh -c 'grep "^SLACK_HOME_CHANNEL=" /opt/data/.env' 2>&1)"
 compose stop agent-default >/dev/null
 
 echo "== 6. tier_classifier.py internals"

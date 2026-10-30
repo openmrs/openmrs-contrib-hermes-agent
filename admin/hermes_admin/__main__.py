@@ -12,7 +12,8 @@ import getpass
 import json
 import sys
 
-from .agents import DEFAULT_BUDGET, SLACK_VARS, Agent, AgentError, Agents, Settings, validate_name
+from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
+                     Settings, validate_name)
 from .litellm import LiteLLMError
 
 RESTART_HINT = "Restart the agent to apply: docker compose restart agent-{name}"
@@ -28,6 +29,12 @@ COMPOSE_SERVICE = """\
         target: /opt/data
         volume:
           subpath: {name}
+      - type: volume
+        source: agents-data
+        target: /opt/data/.env
+        read_only: true
+        volume:
+          subpath: {name}/.env
       - ./hermes/souls/{name}.md:/opt/data/SOUL.md:ro
       - ./hermes/config.yaml:/opt/data/config.yaml:ro
 """
@@ -63,7 +70,7 @@ def _describe(agent: Agent) -> str:
     status = "active" if agent.provisioned else "no key"
     if len(agent.key_hashes) > 1:
         status += f" ({len(agent.key_hashes)} keys: interrupted rotation, run `rotate` to clean up)"
-    slack = "set" if all(agent.env_set.get(var) for var in SLACK_VARS) else "incomplete" if any(
+    slack = "set" if all(agent.env_set.get(var) for var in SLACK_REQUIRED_VARS) else "incomplete" if any(
         agent.env_set.get(var) for var in SLACK_VARS) else "not set"
     return "\n".join([
         f"{agent.name}",
@@ -93,7 +100,7 @@ def _prompt_slack(keep_existing: bool) -> dict[str, str]:
     hint = " (blank keeps the current value)" if keep_existing else " (blank to skip)"
     values = {}
     for var in SLACK_VARS:
-        ask = input if var == "SLACK_ALLOWED_USERS" else getpass.getpass
+        ask = getpass.getpass if var in SLACK_TOKEN_VARS else input
         value = ask(f"{var}{hint}: ").strip()
         if value:
             values[var] = value

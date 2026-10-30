@@ -194,7 +194,9 @@ services:
 
   # One service per agent, named agent-<name>, mounting only its own agents-data subdirectory,
   # its own SOUL.md (Hermes' identity prompt), and the shared hermes/config.yaml. Both files are
-  # read-only so the agent can't rewrite its instructions or where its requests go.
+  # read-only so the agent can't rewrite its instructions or where its requests go. The agent's
+  # .env (its key and Slack settings) is mounted read-only over its own copy for the same reason;
+  # admin still writes it through the whole volume, and changes apply when the agent restarts.
   # To add an agent, print its block with `docker compose run --rm admin compose <name>` and add
   # it here, write hermes/souls/<name>.md, then run `docker compose run --rm admin create <name>`;
   # the agent can't start until that has run.
@@ -206,6 +208,12 @@ services:
         target: /opt/data
         volume:
           subpath: default
+      - type: volume
+        source: agents-data
+        target: /opt/data/.env
+        read_only: true
+        volume:
+          subpath: default/.env
       - ./hermes/souls/default.md:/opt/data/SOUL.md:ro
       - ./hermes/config.yaml:/opt/data/config.yaml:ro
 

@@ -79,15 +79,22 @@ for name, service in sorted(agents.items()):
     check(f"{name}: no extra environment variables", not extra, sorted(extra))
     check(f"{name}: only on the agents network", network_names(service) == {"agents"}, sorted(network_names(service)))
     service_mounts = mounts(service)
-    data = [m for m in service_mounts if m.get("source") == "agents-data"]
+    agents_data = [m for m in service_mounts if m.get("source") == "agents-data"]
+    data = [m for m in agents_data if m.get("target") == "/opt/data"]
+    envs = [m for m in agents_data if m.get("target") == "/opt/data/.env"]
     souls = [m for m in service_mounts if m.get("target") == "/opt/data/SOUL.md"]
     configs = [m for m in service_mounts if m.get("target") == "/opt/data/config.yaml"]
-    check(f"{name}: mounts only its own agents-data subdirectory, SOUL.md, and config.yaml",
-          len(service_mounts) == 3 and len(data) == 1 and len(souls) == 1 and len(configs) == 1, service_mounts)
+    check(f"{name}: mounts only its own agents-data subdirectory, .env, SOUL.md, and config.yaml",
+          len(service_mounts) == 4 and len(agents_data) == 2 and len(data) == 1 and len(envs) == 1
+          and len(souls) == 1 and len(configs) == 1, service_mounts)
     check(f"{name}: agents-data subdirectory is {expected_subpath!r}",
-          len(data) == 1 and data[0].get("type") == "volume" and data[0].get("target") == "/opt/data"
+          len(data) == 1 and data[0].get("type") == "volume"
           and (data[0].get("volume") or {}).get("subpath") == expected_subpath,
           data)
+    check(f"{name}: .env is {expected_subpath}/.env in agents-data, read-only",
+          len(envs) == 1 and envs[0].get("type") == "volume" and envs[0].get("read_only") is True
+          and (envs[0].get("volume") or {}).get("subpath") == f"{expected_subpath}/.env",
+          envs)
     check(f"{name}: SOUL.md is hermes/souls/{expected_subpath}.md, read-only",
           len(souls) == 1 and souls[0].get("type") == "bind" and souls[0].get("read_only") is True
           and str(souls[0].get("source", "")).replace("\\", "/").endswith(f"/hermes/souls/{expected_subpath}.md"),
@@ -96,9 +103,9 @@ for name, service in sorted(agents.items()):
           len(configs) == 1 and configs[0].get("type") == "bind" and configs[0].get("read_only") is True
           and str(configs[0].get("source", "")).replace("\\", "/").endswith("/hermes/config.yaml"),
           configs)
-    for m in data:
+    for m in agents_data:
         subpath = (m.get("volume") or {}).get("subpath")
-        check(f"{name}: agents-data subdirectory not shared", subpath not in subpaths,
+        check(f"{name}: agents-data subpath not shared", subpath not in subpaths,
               f"{subpath!r} also used by {subpaths.get(subpath)}")
         subpaths[subpath] = name
 
