@@ -180,6 +180,13 @@ whichever is available (see [Managing agents](#managing-agents)).
    from `secrets/github-app.env.example`. The permissions in `github-token/levels.json` must
    match the App's, or GitHub refuses the token. Without the App, everything but `gh` works.
 
+   Each App's private key goes in as base64 on one line. To add one (after removing the empty
+   line copied from the example):
+   ```sh
+   printf 'GITHUB_READ_PRIVATE_KEY_BASE64=%s\n' "$(base64 < your-app.private-key.pem | tr -d '\n')" \
+     >> secrets/github-app.env
+   ```
+
    For the `github_pr` level (optional), an org owner first creates two org rulesets that apply
    to all repositories, each with org admins and the Admin, Maintain, and Write repository roles
    (and any deploy keys release tooling pushes with) as bypass actors, but not the App:
