@@ -20,7 +20,7 @@
 #      the interactive interface.
 #   3. Every Hermes side task, including background review and curator, uses LiteLLM's `fast`.
 #   4. `auto` classifier chain: Jev decides; if Jev fails, the LLM classifier does.
-#   5. Hermes end to end: `auto` context length is 512000; chat goes through the router; titles
+#   5. Hermes end to end: `auto` context length is 768000; chat goes through the router; titles
 #      come from `fast`; the read-only SOUL.md reaches the model; MCP reaches only granted servers;
 #      the terminal, file tools, and execute_code run in the workspace; the agent can't change its
 #      .env but sees admin's changes after a restart; it holds no other secrets and can't reach
@@ -54,7 +54,7 @@ export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-14000}"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
-expected_context=512000
+expected_context=768000
 # LiteLLM's log line when a classifier plugin call goes wrong (as opposed to declining).
 plugin_error_pattern='classifier plugin (failed|timed out|returned)'
 

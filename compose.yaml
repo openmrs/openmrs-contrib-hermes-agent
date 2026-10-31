@@ -67,7 +67,8 @@ x-workspace: &workspace
   # the workspace user.
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID, SYS_CHROOT]
   read_only: true
-  tmpfs: ["/tmp:size=2g", "/run"]
+  # exec because Docker defaults tmpfs to noexec, and builds load native libraries from /tmp
+  tmpfs: ["/tmp:size=2g,exec", "/run"]
   networks: [workspaces, workspace-egress]
   environment: &workspace-environment
     # Resets after this many minutes with no one logged in: kills the workspace user's processes and,
