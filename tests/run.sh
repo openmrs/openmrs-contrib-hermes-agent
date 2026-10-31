@@ -798,11 +798,12 @@ expect_refused "agent refuses a workspace whose host key isn't the pinned one" \
     ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o GlobalKnownHostsFile=/tmp/kh \
       -o StrictHostKeyChecking=accept-new workspace@workspace-default true
   status=$?; rm -f /tmp/fake /tmp/fake.pub /tmp/kh; exit $status'
-# Leaves files, a background process, and a cache entry, then lets the idle limit (one minute in
-# tests/compose.test.yaml) pass with no one logged in.
-resets_before="$(log_count_fixed workspace-default "reset after going idle")"
+# Leaves files, a background process, and a cache entry, then lets the idle limit (15 seconds in
+# tests/compose.test.yaml) pass with no one logged in. Counts resets only after the login, so a
+# reset from earlier logins can't pass for this one.
 ws 'echo x > ~/left; echo x > /tmp/left; echo x > /dev/shm/left; touch /cache/m2/kept
   (setsid sleep 600 >/dev/null 2>&1 &)' >/dev/null 2>&1
+resets_before="$(log_count_fixed workspace-default "reset after going idle")"
 compose stop agent-default >/dev/null
 # Waits up to three minutes for a reset after $resets_before, and prints whether one happened. On a
 # timeout it prints the workspace's log, which shows its logins.
@@ -831,9 +832,9 @@ expect "a reset leaves no files or processes, only the caches" "/cache/m2/kept" 
 export TEST_WORKSPACE_KEEP_FILES=true
 compose up -d --wait --wait-timeout 180 --force-recreate --no-deps workspace-default >/dev/null
 compose up -d --no-deps agent-default >/dev/null
-resets_before="$(log_count_fixed workspace-default "reset after going idle")"
 ws 'echo x > ~/left; echo x > /tmp/left; echo x > /dev/shm/left; touch /cache/m2/kept
   (setsid sleep 600 >/dev/null 2>&1 &)' >/dev/null 2>&1
+resets_before="$(log_count_fixed workspace-default "reset after going idle")"
 compose stop agent-default >/dev/null
 expect "WORKSPACE_KEEP_FILES: workspace resets after going idle" "reset" "$(wait_for_reset)"
 expect "WORKSPACE_KEEP_FILES: a reset kills processes but keeps /work" "/work/home/left /cache/m2/kept" \

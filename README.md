@@ -290,7 +290,7 @@ GitHub Actions publishes images for `linux/amd64` and `linux/arm64` to Docker Hu
 `openmrsinfra/hermes-github-token`, and `openmrsinfra/hermes-workspace`.
 
 - **Pushes to `main`** publish `:nightly` and `:<short sha>` once `tests/run.sh` passes. Pull
-  requests build without publishing.
+  requests only run the tests.
 - **Releases:** run the Release workflow from `main` with `patch`, `minor`, `major`, or an exact
   version (e.g. `1.2.0-beta.1`). It runs the tests, publishes `:<version>` (and `:latest` for the
   newest stable), tags `v<version>`, and creates a GitHub Release listing merged pull requests.
@@ -322,4 +322,4 @@ COMPOSE=docker-compose tests/run.sh   # e.g. with Podman
 
 It uses fake credentials and fake model, Jev, Rovo, Anthropic, and GitHub endpoints, runs as a
 separate Compose project that cleans up after itself, and takes about 5 minutes. CI runs it on every
-pull request and push to `main`.
+pull request and push to `main` that changes more than `README.md`.

@@ -1,13 +1,15 @@
 name: Build images
 
-# Runs tests/run.sh, then builds the stack's images for linux/amd64 and linux/arm64 and, except on
-# pull requests, publishes them to Docker Hub:
+# Runs tests/run.sh, then, except on pull requests, builds the stack's images for linux/amd64 and
+# linux/arm64 and publishes them to Docker Hub:
 #   push to main          :nightly and :<short sha>
 #   called by release.yml :<version>, plus :latest when the release is the newest stable one
 on:
   push:
     branches: [main]
+    paths-ignore: [README.md, hermes/souls/*.md]
   pull_request:
+    paths-ignore: [README.md, hermes/souls/*.md]
   workflow_call:
     inputs:
       version:
@@ -33,11 +35,49 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        id: buildx
+
+      # Loads the publish job's cached layers into the builder, so tests/run.sh's `compose build`
+      # mostly reuses them. Build arguments must match compose.yaml's, or the layers won't match.
+      - name: Read build arguments from compose.yaml
+        id: args
+        run: echo "hermes_image=$(yq '."x-hermes-agent".build.args.HERMES_IMAGE' compose.yaml)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: admin
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=admin
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: github-token
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=github-token
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: hermes/image
+          build-args: HERMES_IMAGE=${{ steps.args.outputs.hermes_image }}
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=hermes/image
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: workspace
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=workspace
+
       - name: Run tests/run.sh
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: tests/run.sh
 
   publish:
     needs: test
+    # The test job already builds every image for amd64.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -63,20 +103,16 @@ jobs:
           CONTEXT: ${{ matrix.context }}
           VERSION: ${{ inputs.version }}
           LATEST: ${{ inputs.latest }}
-          EVENT: ${{ github.event_name }}
         run: |
           if [ -n "$VERSION" ]; then
             tags="$IMAGE:$VERSION"
             if [ "$LATEST" = "true" ]; then tags="$tags,$IMAGE:latest"; fi
-          elif [ "$EVENT" = "push" ]; then
-            tags="$IMAGE:nightly,$IMAGE:${GITHUB_SHA::7}"
           else
-            tags="$IMAGE:ci"
+            tags="$IMAGE:nightly,$IMAGE:${GITHUB_SHA::7}"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          # The Hermes base image is pinned in compose.yaml (x-hermes-agent), so the published image
-          # is built from the same one the stack and tests use. `config` needs every required env
-          # file to exist, so it runs against the placeholder secrets the tests use.
+          # Build from the Hermes base pinned in compose.yaml, like the stack and tests. `config`
+          # needs every required env file, so it uses the tests' placeholder secrets.
           build_args=""
           if [ "$CONTEXT" = "hermes/image" ]; then
             python3 tests/compose_isolation.py write-secrets "$RUNNER_TEMP/compose-config/secrets"
@@ -97,7 +133,6 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -108,7 +143,7 @@ jobs:
           context: ${{ matrix.context }}
           build-args: ${{ steps.meta.outputs.build_args }}
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=${{ matrix.context }}
           cache-to: type=gha,mode=max,scope=${{ matrix.context }}

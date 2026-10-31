@@ -33,10 +33,10 @@ services:
     volumes:
       - ${TEST_WORK}/github-levels.json:/app/levels.json:ro
 
-  # A short idle limit, so run.sh can watch a reset.
+  # A 15-second idle limit, so run.sh can watch a reset.
   workspace-default:
     environment:
-      WORKSPACE_IDLE_MINUTES: "1"
+      WORKSPACE_IDLE_MINUTES: "0.25"
       WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
       WORKSPACE_POLL_SECONDS: "2"
 
