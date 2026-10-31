@@ -11,7 +11,7 @@ model:
   default: auto
   # Hermes can't look up `auto`'s window. Tier models have 1M-token windows but degrade past ~500k,
   # so history is compacted before then.
-  context_length: 512000
+  context_length: 768000
   # Must match providers.litellm.base_url, or Hermes silently ignores context_length and assumes 256k.
   base_url: http://litellm:4000/v1
 
