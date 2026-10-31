@@ -14,7 +14,7 @@ The monthly budget is on the agent's LiteLLM user (`hermes-agent-<name>`), not a
 survives `rotate`.
 
 `<agents_dir>/<name>` is the agent's Hermes home (/opt/data), mounted only by that agent. Its `.env`
-holds the LiteLLM key and Slack tokens; `ssh/` holds the agent's SSH key and the workspace's host
+holds the LiteLLM key, Slack tokens, and workspace host name; `ssh/` holds the agent's SSH key and the workspace's host
 key. `<workspaces_dir>/<name>` holds the workspace's authorized key, host key, and workspace key,
 root-only and mounted only by that workspace. Both are read at startup, so changes need a restart.
 """
@@ -56,6 +56,7 @@ WORKSPACE_ROUTES = ["/key/info"]
 WORKSPACE_MODELS = ["no-default-models"]
 # Where agents reach their workspace's sshd (see workspace/supervisor.py and hermes/config.yaml).
 WORKSPACE_SSH_PORT = 2222
+WORKSPACE_HOST_VAR = "TERMINAL_SSH_HOST"
 
 # SLACK_TOKEN_VARS are masked when entered. Slack setup is complete once SLACK_REQUIRED_VARS are set.
 SLACK_TOKEN_VARS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
@@ -430,6 +431,9 @@ class Agents:
         # Drop the comment, which known_hosts would read as a marker or host name.
         host_entry = " ".join(host_public.split()[:2])
         self._write_file(ssh / "known_hosts", f"[workspace-{name}]:{WORKSPACE_SSH_PORT} {host_entry}\n", 0o644, uid, gid)
+        # Hermes reads the host only from the profile's .env or config.yaml, never the container's
+        # environment, and config.yaml is shared by every agent.
+        self._write_env(name, {WORKSPACE_HOST_VAR: f"workspace-{name}"})
 
     @staticmethod
     def _write_file(path: Path, content: str, mode: int, uid: int, gid: int) -> None:

@@ -287,7 +287,8 @@ expect "budgets are on the agent's LiteLLM user, monthly" "50.0 1mo" \
      python3 -c 'import json, sys; u = json.load(open(sys.argv[1]))["user_info"]; print(u["max_budget"], u["budget_duration"])' \
      "$TEST_WORK/body")"
 expect "default's .env: mode 600, owned by the Hermes user" "600 10000" "$(admin_sh 'stat -c "%a %u" /agents/default/.env')"
-expect "default's .env has key and Slack settings" "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN" \
+expect "default's .env has key, Slack settings, and workspace host" \
+  "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN TERMINAL_SSH_HOST" \
   "$(admin_sh 'cut -d= -f1 /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
 expect "create gives the agent a workspace key, not a second agent key" "1 1 True" \
   "$(agent_field default keys) $(agent_field default workspace_keys) $(agent_field default has_workspace)"
@@ -385,7 +386,11 @@ expect_ok "delete legacy --purge" admin delete legacy --purge --yes
 expect_ok "grant nobody github_read" admin grant nobody --github github_read
 old_nobody_workspace_key="$(workspace_key nobody)"
 old_nobody_ssh_key="$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)"
+# Agents created before admin wrote the workspace host to .env get it from rotate.
+admin_sh 'grep -v ^TERMINAL_SSH_HOST= /agents/nobody/.env > /agents/nobody/.env.new && cat /agents/nobody/.env.new > /agents/nobody/.env && rm /agents/nobody/.env.new'
 expect_ok "rotate nobody" admin rotate nobody
+expect "rotate writes the workspace host to .env" "TERMINAL_SSH_HOST=workspace-nobody" \
+  "$(admin_sh 'grep ^TERMINAL_SSH_HOST= /agents/nobody/.env')"
 expect "rotate revokes the old workspace key and leaves one" "401 1" \
   "$(request GET /key/info "$old_nobody_workspace_key") $(agent_field nobody workspace_keys)"
 expect "rotate issues a new workspace key and SSH key" "new new" \

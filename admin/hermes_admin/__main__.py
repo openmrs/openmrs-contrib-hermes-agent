@@ -24,9 +24,6 @@ ROTATE_HINT = "Restart the agent and its workspace to apply: docker compose rest
 COMPOSE_SERVICE = """\
   agent-{name}:
     <<: *hermes-agent
-    environment:
-      <<: *hermes-agent-environment
-      TERMINAL_SSH_HOST: workspace-{name}
     depends_on:
       litellm:
         condition: service_healthy

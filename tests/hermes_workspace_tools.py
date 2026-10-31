@@ -3,11 +3,18 @@
 Runs in the agent container (on stdin, as the Hermes user). Prints one summary line: the user and
 host the terminal ran as, whether write_file's file reached the terminal, whether read_file can see
 the agent's own SOUL.md, and the user execute_code ran as.
+
+Gateway turns and subagents run tools under a terminal scope built only from the profile's .env and
+config.yaml, ignoring the process environment, so the tools are called under that scope here too.
 """
 
 import json
 
+from hermes_constants import get_hermes_home
 from model_tools import handle_function_call
+from tools.terminal_scope import install_profile_terminal_scope
+
+install_profile_terminal_scope(get_hermes_home())
 
 
 def call(name, args):

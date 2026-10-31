@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT", "TERMINAL_SSH_HOST"}
+AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT"}
 WORKSPACE_ENV_ALLOWED = {"WORKSPACE_IDLE_MINUTES", "WORKSPACE_KEEP_FILES", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
                          "GIT_COMMITTER_EMAIL"}
 # Secret files and the only services allowed to receive them.
@@ -78,10 +78,8 @@ for name, service in sorted(agents.items()):
     check(f"{name}: no extra environment variables", not extra, sorted(extra))
     check(f"{name}: only on the agents and workspaces networks", network_names(service) == {"agents", "workspaces"},
           sorted(network_names(service)))
-    check(f"{name}: runs commands in workspace-{expected_subpath}",
-          (service.get("environment") or {}).get("TERMINAL_SSH_HOST") == f"workspace-{expected_subpath}"
-          and f"workspace-{expected_subpath}" in services,
-          (service.get("environment") or {}).get("TERMINAL_SSH_HOST"))
+    check(f"{name}: has a workspace-{expected_subpath} service", f"workspace-{expected_subpath}" in services,
+          sorted(services))
     service_mounts = mounts(service)
     agents_data = [m for m in service_mounts if m.get("source") == "agents-data"]
     data = [m for m in agents_data if m.get("target") == "/opt/data"]

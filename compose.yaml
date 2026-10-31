@@ -46,7 +46,7 @@ x-hermes-agent: &hermes-agent
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID]
   command: ["gateway", "run"]
   networks: [agents, workspaces]
-  environment: &hermes-agent-environment
+  environment:
     HERMES_UID: ${HERMES_UID:-10000}
     HERMES_GID: ${HERMES_GID:-10000}
     # Hermes' file tools only write under this path; they run in the workspace, hence its /work.
@@ -199,9 +199,6 @@ services:
   # then run `bin/admin create <name>` (required before the agent can start).
   agent-default:
     <<: *hermes-agent
-    environment:
-      <<: *hermes-agent-environment
-      TERMINAL_SSH_HOST: workspace-default
     depends_on:
       litellm:
         condition: service_healthy

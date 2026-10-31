@@ -60,7 +60,7 @@ agent:
   budget_warning_ratio: 0.8
 
 # The terminal, file tools, and execute_code run over SSH in the agent's own workspace
-# (TERMINAL_SSH_HOST in compose.yaml), not here. Only the host key the admin tool writes to
+# (TERMINAL_SSH_HOST, which the admin tool writes to each agent's .env), not here. Only the host key the admin tool writes to
 # ssh/known_hosts is trusted (see hermes/image).
 #
 # The workspace resets when idle (see workspace/supervisor.py). A session whose directory was removed
