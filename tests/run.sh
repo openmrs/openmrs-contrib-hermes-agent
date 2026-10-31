@@ -1,49 +1,46 @@
 #!/usr/bin/env bash
 #
-# Repeatable checks for this stack's security properties and for the parts that depend on LiteLLM
-# and Hermes internals. Re-run after changing any image in compose.yaml or a Dockerfile,
-# compose.yaml itself, litellm/config.yaml, litellm/tier_classifier.py, hermes/config.yaml,
-# hermes/image/, admin/, or github-token/ (including levels.json).
+# Checks this stack's security properties and the parts that depend on LiteLLM and Hermes
+# internals. Re-run after changing compose.yaml, any image or Dockerfile, litellm/, hermes/,
+# admin/, github-token/, or workspace/.
 #
 # Usage: tests/run.sh
 #
-# Uses fake credentials, mock models, and fake Jev, Rovo MCP, Anthropic, and GitHub endpoints, so
-# nothing reaches a real provider. Runs as a separate Compose project ("hermes-test") with its own
-# volumes, and removes its containers and volumes on exit, so it does not touch a running stack.
-# Requests to LiteLLM are made from inside its container, so no host port is needed. Needs Docker
-# Compose 2.24.4 or later (for the !override tag in tests/compose.test.yaml), and python3, openssl,
-# shasum, base64, and git on the host.
+# Uses fake credentials, mock models, and fake Jev, Rovo, Anthropic, and GitHub endpoints, so
+# nothing reaches a real provider. Runs as its own Compose project ("hermes-test") and removes its
+# containers and volumes on exit, so a running stack is untouched. Needs Docker Compose 2.24.4+
+# (for !override) and python3, openssl, shasum, base64, and git on the host.
 #
 # What it checks:
-#   1. compose.yaml keeps secrets, volumes, and networks separated, and every service runs with
-#      no-new-privileges and only the capabilities it needs (static).
-#   2. The admin tool: create / grant / rotate / slack / delete, key lockdown (no management API,
-#      no provider passthroughs, agent models only), per-agent monthly budgets that survive key
-#      rotation, per-key MCP access with the right injected credential, and the interactive
-#      interface.
-#   3. Every Hermes side task resolves to LiteLLM's `fast` model, including tasks that resolve a
-#      full runtime (background review, curator).
-#   4. The `auto` router's classifier chain: Jev decides; Jev fails -> LLM classifier decides.
-#   5. Hermes end to end: context length is 512000 for `auto`, chat goes through the router,
-#      session titles come from `fast`, the read-only SOUL.md reaches the model, MCP reaches only
-#      the granted server, the agent can't change its .env but sees admin's changes after a
-#      restart, and the agent holds no other secrets and can't reach Postgres.
+#   1. compose.yaml separates secrets, volumes, and networks; every service has no-new-privileges
+#      and only the capabilities it needs (static).
+#   2. Admin tool: create/grant/rotate/slack/delete; key lockdown (no management API, no provider
+#      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
+#      rotation; per-key MCP access with the right credential; root-only workspace configuration;
+#      the interactive interface.
+#   3. Every Hermes side task, including background review and curator, uses LiteLLM's `fast`.
+#   4. `auto` classifier chain: Jev decides; if Jev fails, the LLM classifier does.
+#   5. Hermes end to end: `auto` context length is 512000; chat goes through the router; titles
+#      come from `fast`; the read-only SOUL.md reaches the model; MCP reaches only granted servers;
+#      the terminal, file tools, and execute_code run in the workspace; the agent can't change its
+#      .env but sees admin's changes after a restart; it holds no other secrets and can't reach
+#      Postgres.
 #   6. tier_classifier.py internals: refuses router classifier models, follows Router rebuilds,
 #      declines re-entry.
-#   7. Classifier fallbacks: both fail -> heuristic; classifier model `auto` is refused without
-#      recursing; ROUTER_CLASSIFIERS=llm skips Jev; no TypeSafe key skips Jev. The admin tool
-#      refuses an MCP server with an empty credential, and only warns about one that's down.
-#   8. Requests to each tier model carry prompt-cache markers on the system prompt and the
-#      latest message.
-#   9. The agent's gh, and git through it, get GitHub App tokens from github-token only for the
-#      levels its key was granted; tokens carry each level's permissions and repository limits,
-#      are reused, and need a valid, unrevoked key; the App key never reaches the agent, and
-#      commits are authored as the configured bot.
-#  10. The sandbox builds a branch or pull request of a repository (from a local git server) with
-#      the chosen JDK, only for keys granted it; runs builds as an unprivileged user on a
-#      read-only root filesystem; leaves no processes or files for the next job except its caches;
-#      times jobs out, runs one at a time, and holds no secrets. Then purging the agents removes
-#      all of their data.
+#   7. Classifier fallbacks: both fail -> heuristic; classifier model `auto` refused without
+#      recursing; ROUTER_CLASSIFIERS=llm and a missing TypeSafe key skip Jev. Admin refuses an MCP
+#      server with an empty credential and only warns about one that's down.
+#   8. Each tier model's requests mark the system prompt and latest message for prompt caching.
+#   9. gh in the workspace (and git through it) gets GitHub App tokens only for granted levels;
+#      tokens carry each level's permissions and repository limits, are reused, and need a valid,
+#      unrevoked key; the App key never reaches the agent or workspace; commits are authored as
+#      the bot.
+#  10. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
+#      run as an unprivileged user on a read-only root filesystem, with each JDK; a branch and a pull
+#      request clone from a local git server; the workspace can't read its configuration or reach
+#      LiteLLM or Postgres, and holds no agent secrets; going idle kills its processes and deletes
+#      its files except the caches, or with WORKSPACE_KEEP_FILES keeps /work, also across restarts.
+#      Then purging the agents removes all of their data.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
@@ -54,7 +51,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 compose_cmd="${COMPOSE:-docker compose}"
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-14000}"
-# Exported so they win over any values in the repository's .env, which Compose also reads.
+# Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
 expected_context=512000
@@ -97,8 +94,8 @@ expect_refused() {
   if "$@" >"$TEST_WORK/out" 2>&1; then fail "$name (command succeeded)"; else pass "$name"; fi
 }
 
-# Logs are written to a file before searching: grep -q on a pipe can exit early, and under
-# pipefail the writer's SIGPIPE would turn a match into a failed (non-matching) pipeline.
+# Logs go to a file first: grep on a pipe can exit early, and under pipefail the writer's SIGPIPE
+# would fail the pipeline.
 log_count() {
   local service="$1" pattern="$2"
   compose logs --no-log-prefix "$service" > "$TEST_WORK/$service.log" 2>&1 || true
@@ -119,19 +116,18 @@ jev_calls() {
   log_count fake-jev "jev request"
 }
 
-# Runs the admin tool, as an operator would.
 admin() {
   compose run --rm -T admin "$@"
 }
 
-# Runs the admin tool with the given text on stdin (for --slack-from-stdin / --from-stdin).
+# Runs admin with $1 on stdin, expanding escapes like \n.
 admin_stdin() {
   local input="$1"
   shift
   printf '%b' "$input" | compose run --rm -T admin "$@"
 }
 
-# Runs a shell command in the admin container, which mounts the whole agents-data volume at /agents.
+# Runs a shell command in the admin container, which has all of agents-data at /agents.
 admin_sh() {
   compose run --rm -T --entrypoint sh admin -c "$1"
 }
@@ -140,7 +136,7 @@ agent_key() {
   admin_sh "sed -n 's/^LITELLM_API_KEY=//p' /agents/$1/.env"
 }
 
-# Sends an HTTP request to LiteLLM; prints the status code and leaves the body in $TEST_WORK/body.
+# Requests LiteLLM; prints the status and leaves the body in $TEST_WORK/body.
 request() {
   local method="$1" path="$2" key="$3" data="${4:-}"
   [ -n "$data" ] || data='{}'
@@ -149,7 +145,7 @@ request() {
   head -n 1 "$TEST_WORK/response"
 }
 
-# Prints the reply text from the tier model the `auto` router picked.
+# Prints `auto`'s reply, which names the tier model that answered.
 ask_auto() {
   local key="$1" prompt="$2"
   request POST /v1/chat/completions "$key" \
@@ -186,8 +182,8 @@ expect_route_denied() {
   fi
 }
 
-# Calls the fake Rovo `whoami` tool on one MCP server; prints the account LiteLLM authenticated
-# as ("read"/"jira-write"/"confluence-write"/"none"), "denied", or "error <status>: <body>".
+# Calls fake Rovo's `whoami` on one MCP server; prints the account LiteLLM used
+# (read/jira-write/confluence-write/none), "denied", or "error <status>: <body>".
 rovo_whoami() {
   local key="$1" server_id="$2" status
   status="$(request POST /mcp-rest/tools/call "$key" \
@@ -216,12 +212,11 @@ agent_field() {
 echo "== Setup"
 compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
 python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml"
-# A throwaway GitHub App key pair: github-token signs with the private key, fake-github verifies
-# with the public one.
+# Throwaway GitHub App key pair: github-token signs, fake-github verifies.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
 openssl rsa -in "$TEST_WORK/github-app.pem" -pubout -out "$TEST_WORK/github-app.pub.pem" 2>/dev/null
-# All levels share the test App; github_test_write exists only in the tests, to check that write
-# permissions and repository limits reach GitHub and that grants are enforced per level.
+# All levels share the test App. The test-only github_test_write checks that write permissions
+# and repository limits reach GitHub and that grants are enforced per level.
 github_key_base64="$(base64 < "$TEST_WORK/github-app.pem" | tr -d '\n')"
 for prefix in GITHUB_READ GITHUB_PR GITHUB_TEST_WRITE; do
   echo "${prefix}_APP_ID=12345"
@@ -233,7 +228,7 @@ levels = json.load(open(sys.argv[1]))
 levels["github_test_write"] = {"permissions": {"contents": "write", "metadata": "read", "pull_requests": "write"},
                                "repositories": ["openmrs-test-repo"]}
 json.dump(levels, open(sys.argv[2], "w"), indent=2)' "$root/github-token/levels.json" "$TEST_WORK/github-levels.json"
-# The sandbox's test repository: `main` and a pull request (refs/pull/7/head) that differ in one
+# The workspace's test repository: `main` and a pull request (refs/pull/7/head) that differ in one
 # file, served by fake-git, which allows partial clones as GitHub does.
 git -c init.defaultBranch=main init -q "$TEST_WORK/repo"
 git_test() { git -C "$TEST_WORK/repo" -c user.name=test -c user.email=test@example.org "$@"; }
@@ -247,8 +242,8 @@ mkdir -p "$TEST_WORK/check-home"
 cp "$root/hermes/config.yaml" "$TEST_WORK/check-home/config.yaml"
 
 echo "== 1. compose.yaml isolation (static)"
-# The static checks resolve env files against placeholder secrets in their own project directory
-# (see tests/compose_isolation.py), so real secrets/*.env never reach the output.
+# Resolved against placeholder secrets (see tests/compose_isolation.py), so real secrets/*.env
+# never reach the output.
 python3 "$root/tests/compose_isolation.py" write-secrets "$TEST_WORK/compose-check/secrets"
 # shellcheck disable=SC2086
 if $compose_cmd --profile '*' --project-directory "$TEST_WORK/compose-check" -f "$root/compose.yaml" \
@@ -260,12 +255,12 @@ else
 fi
 
 echo "== Starting LiteLLM"
-compose --profile admin build admin agent-default github-token sandbox >/dev/null
-compose up -d --wait --wait-timeout 180 postgres litellm github-token sandbox fake-jev fake-rovo fake-anthropic \
+compose --profile admin build admin agent-default workspace-default github-token >/dev/null
+compose up -d --wait --wait-timeout 180 postgres litellm github-token fake-jev fake-rovo fake-anthropic \
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
-expect "servers lists the configured MCP servers" '["rovo_confluence_write", "rovo_jira_write", "rovo_read", "sandbox"]' "$(admin servers --json)"
+expect "servers lists the configured MCP servers" '["rovo_confluence_write", "rovo_jira_write", "rovo_read"]' "$(admin servers --json)"
 expect "levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin levels --json)"
 expect_ok "create default (rovo_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
@@ -294,6 +289,23 @@ expect "budgets are on the agent's LiteLLM user, monthly" "50.0 1mo" \
 expect "default's .env: mode 600, owned by the Hermes user" "600 10000" "$(admin_sh 'stat -c "%a %u" /agents/default/.env')"
 expect "default's .env has key and Slack settings" "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN" \
   "$(admin_sh 'cut -d= -f1 /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
+expect "create gives the agent a workspace key, not a second agent key" "1 1 True" \
+  "$(agent_field default keys) $(agent_field default workspace_keys) $(agent_field default has_workspace)"
+expect "default's SSH key: mode 600, owned by the Hermes user; known_hosts pins workspace-default" \
+  "600 10000 [workspace-default]:2222 ssh-ed25519" \
+  "$(admin_sh 'stat -c "%a %u" /agents/default/ssh/id_ed25519; cut -d" " -f1,2 /agents/default/ssh/known_hosts' | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace configuration is root-only" "700 0 600 0 600 0 600 0" \
+  "$(admin_sh 'cd /workspaces/default && stat -c "%a %u" . authorized_keys ssh_host_ed25519_key litellm_key' | tr '\n' ' ' | sed 's/ $//')"
+workspace_key() {
+  admin_sh "cat /workspaces/$1/litellm_key"
+}
+default_workspace_key="$(workspace_key default)"
+expect "workspace key can read its own key info" "200" "$(request GET /key/info "$default_workspace_key")"
+for route in "POST /v1/chat/completions" "GET /v1/models" "POST /mcp-rest/tools/call" "POST /key/generate" \
+  "POST /anthropic/v1/messages"; do
+  # shellcheck disable=SC2086 # split "METHOD PATH"
+  expect_route_denied "workspace key" "$default_workspace_key" $route
+done
 
 # A key the tool didn't create must be invisible to it and untouched.
 request POST /key/generate "$master_key" '{"key_alias": "someone-else", "metadata": {"hermes_agent": "default"}}' >/dev/null
@@ -304,8 +316,8 @@ reader_key="$(agent_key default)"
 writer_key="$(agent_key writer)"
 nobody_key="$(agent_key nobody)"
 
-# Agent keys may call /key/info (github-token uses it to read their grants), but only about
-# themselves: each agent's keys have their own user_id.
+# Agent keys may call /key/info (github-token reads grants with it), but only for their own keys:
+# each agent has its own user_id.
 expect "agent key can read its own key info" "200" "$(request GET /key/info "$writer_key")"
 expect "agent key can't read another agent's key info" "403" \
   "$(request GET "/key/info?key=$(printf '%s' "$reader_key" | shasum -a 256 | cut -d' ' -f1)" "$writer_key")"
@@ -362,8 +374,7 @@ expect "grant changes the budget" "75.0" "$(agent_field writer budget)"
 expect "budget grant leaves access unchanged" "github_test_write rovo_jira_write" \
   "$(agent_field writer github_levels) $(agent_field writer mcp_servers)"
 expect_refused "grant refuses a zero budget" admin grant writer --budget 0
-# Agents created before budgets existed have a key but no LiteLLM user; their next grant gives
-# them one.
+# Agents from before budgets have a key but no LiteLLM user; their next grant adds one.
 request POST /key/generate "$master_key" '{"user_id": "hermes-agent-legacy",
   "metadata": {"managed_by": "hermes-admin", "hermes_agent": "legacy", "github_levels": []}}' >/dev/null
 expect "an agent without a LiteLLM user has no budget" "None" "$(agent_field legacy budget)"
@@ -372,15 +383,22 @@ expect "grant gives an agent without a budget the default" "1000.0" "$(agent_fie
 expect_ok "delete legacy --purge" admin delete legacy --purge --yes
 
 expect_ok "grant nobody github_read" admin grant nobody --github github_read
+old_nobody_workspace_key="$(workspace_key nobody)"
+old_nobody_ssh_key="$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)"
 expect_ok "rotate nobody" admin rotate nobody
+expect "rotate revokes the old workspace key and leaves one" "401 1" \
+  "$(request GET /key/info "$old_nobody_workspace_key") $(agent_field nobody workspace_keys)"
+expect "rotate issues a new workspace key and SSH key" "new new" \
+  "$([ "$(workspace_key nobody)" != "$old_nobody_workspace_key" ] && echo new || echo same) $(
+    [ "$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)" != "$old_nobody_ssh_key" ] && echo new || echo same)"
 new_nobody_key="$(agent_key nobody)"
 expect "rotate revokes the old key" "401" "$(request GET /v1/models "$nobody_key")"
 expect "rotate's new key works" "200" "$(request GET /v1/models "$new_nobody_key")"
 expect "rotate leaves one key" "1" "$(agent_field nobody keys)"
 expect "rotate keeps GitHub grants" "github_read" "$(agent_field nobody github_levels)"
 
-# The budget is on the agent's LiteLLM user, so it covers all of the agent's keys and a rotated key
-# can't reset the month's spend. LiteLLM refuses requests (422) once spend reaches the budget.
+# The budget is on the agent's LiteLLM user, so rotating keys can't reset spend. LiteLLM answers
+# 422 once spend reaches it.
 expect_ok "grant nobody a tiny budget" admin grant nobody --budget 0.000001
 expect "an agent under budget is answered" "200" \
   "$(request POST /v1/chat/completions "$new_nobody_key" '{"model": "fast", "messages": [{"role": "user", "content": "hi"}]}')"
@@ -411,14 +429,17 @@ expect "delete revokes the key" "401" "$(request GET /v1/models "$new_nobody_key
 expect "delete keeps the agent's data" "False True" "$(agent_field nobody provisioned) $(agent_field nobody has_data)"
 expect "delete keeps the agent's budget" "1000.0" "$(agent_field nobody budget)"
 expect "delete removes secrets from .env" "" "$(admin_sh 'grep -E "^(LITELLM_API_KEY|SLACK_)" /agents/nobody/.env || true')"
+expect "delete revokes the workspace key and removes the SSH key and workspace configuration" "0 absent absent" \
+  "$(agent_field nobody workspace_keys) $(admin_sh 'for p in /agents/nobody/ssh /workspaces/nobody; do
+    test -e $p && echo present || echo absent; done' | tr '\n' ' ' | sed 's/ $//')"
 expect_ok "re-create a deleted agent, reusing its data" admin create nobody
 expect_ok "delete nobody --purge" admin delete nobody --purge --yes
 expect "purge removes the agent's data" "absent" "$(admin_sh 'test -e /agents/nobody && echo present || echo absent')"
 expect "purge removes the agent's LiteLLM user" "404" "$(request GET /user/info?user_id=hermes-agent-nobody "$master_key")"
 expect "unmanaged key untouched" "200" "$(request GET /v1/models "$unmanaged_key")"
 
-# `admin compose` must print exactly the agent-default block in compose.yaml, and a block for a new
-# agent must pass the static isolation checks once added to compose.yaml.
+# `admin compose` must match compose.yaml's agent-default block, and its block for a new agent
+# must pass the isolation checks.
 admin compose default > "$TEST_WORK/compose-default.yaml" 2>/dev/null || true
 if [ -s "$TEST_WORK/compose-default.yaml" ] &&
   python3 -c 'import sys; sys.exit(open(sys.argv[2]).read() not in open(sys.argv[1]).read())' \
@@ -427,8 +448,8 @@ if [ -s "$TEST_WORK/compose-default.yaml" ] &&
 else
   fail "compose prints the agent-default block in compose.yaml (got: $(cat "$TEST_WORK/compose-default.yaml"))"
 fi
-# The block relies on compose.yaml's x-hermes-agent anchor, so it's inserted into a copy of
-# compose.yaml (before the top-level networks: key) rather than passed as an override file.
+# The block uses compose.yaml's x-hermes-agent anchor, so it goes into a copy of compose.yaml, not
+# an override file.
 admin compose extra 2>/dev/null > "$TEST_WORK/compose-extra-block.yaml" || true
 python3 -c 'import sys; c = open(sys.argv[1]).read(); b = open(sys.argv[2]).read(); print(c.replace("\nnetworks:\n", "\n" + b + "\nnetworks:\n", 1), end="")' \
   "$root/compose.yaml" "$TEST_WORK/compose-extra-block.yaml" > "$TEST_WORK/compose-extra.yaml"
@@ -450,8 +471,8 @@ else
 fi
 
 echo "== 3. Hermes side tasks use fast"
-# The check runs as the container's root, so it deletes what Hermes wrote to check-home itself:
-# with rootful Docker those files are root-owned on the host, and cleanup couldn't remove them.
+# Clears check-home from inside: with rootful Docker, Hermes' files there are root-owned on the
+# host and cleanup couldn't remove them.
 if compose run --rm --no-deps -T -e HERMES_HOME=/check-home -e LITELLM_API_KEY=sk-placeholder \
   -v "$TEST_WORK/check-home:/check-home" -v "$root/tests/hermes_side_tasks.py:/check.py:ro" \
   --entrypoint sh agent-default -c \
@@ -472,8 +493,8 @@ set_jev_mode REASONING
 expect_auto "Jev REASONING routes to strong" "Prove it." "strong-model-answered" 1
 expect "Jev received the TypeSafe key on every call" "0" "$(log_count fake-jev "auth_ok=False")"
 set_jev_mode fail
-# The LLM classifier's own call is charged to the agent whose request it routes, so it counts
-# against the agent's budget. Spend logs are written asynchronously, so this polls.
+# The LLM classifier's call is charged to the agent whose request it routes. Spend logs are
+# written asynchronously, so this polls.
 classifier_query="select count(*) from \"LiteLLM_SpendLogs\" where model_group = 'classifier-mock'
   and \"user\" = 'hermes-agent-default';"
 classifier_calls() {
@@ -495,7 +516,7 @@ expect_no_plugin_errors "classifier chain"
 echo "== 5. Hermes end to end"
 set_jev_mode MEDIUM
 denied_before="$(log_count litellm "not allowed to call this route")"
-compose up -d --no-deps agent-default >/dev/null
+compose up -d --wait --wait-timeout 180 workspace-default >/dev/null && compose up -d --no-deps agent-default >/dev/null
 context=""
 for _ in $(seq 1 60); do
   context="$(compose exec -T agent-default sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
@@ -529,19 +550,17 @@ expect "Hermes user profile memory is off" "false" \
   "$(compose exec -T agent-default hermes config get memory.user_profile_enabled 2>&1 | tr -d '[:space:]')"
 expect "Hermes prunes sessions after 30 days" "true 30" \
   "$(compose exec -T agent-default sh -c 'echo $(hermes config get sessions.auto_prune) $(hermes config get sessions.retention_days)' 2>&1)"
-# The agent's SOUL.md is the repo file, mounted read-only: Hermes neither replaces it at boot nor
-# can write to it, and its text reaches the model. The test config (tests/make_litellm_config.py)
-# has LiteLLM store prompts in its spend logs, written asynchronously, so the prompt check polls.
+# SOUL.md is the repo file, mounted read-only. The test LiteLLM config stores prompts in spend
+# logs, written asynchronously, so the prompt check polls.
 soul_file="$root/hermes/souls/default.md"
 expect "SOUL.md in the agent is hermes/souls/default.md" "$(shasum -a 256 < "$soul_file" | cut -d' ' -f1)" \
   "$(compose exec -T agent-default cat /opt/data/SOUL.md | shasum -a 256 | cut -d' ' -f1)"
 expect_refused "agent can't write its SOUL.md" compose exec -T agent-default sh -c 'echo changed >> /opt/data/SOUL.md'
-# config.yaml is likewise the repo file, read-only. Its _config_version must be the image's, or
-# Hermes' startup migration would try to rewrite it.
+# config.yaml too. Its _config_version must match the image's, or Hermes' startup migration would
+# try to rewrite it.
 expect "config.yaml in the agent is hermes/config.yaml" "$(shasum -a 256 < "$root/hermes/config.yaml" | cut -d' ' -f1)" \
   "$(compose exec -T agent-default cat /opt/data/config.yaml | shasum -a 256 | cut -d' ' -f1)"
 expect_refused "agent can't write its config.yaml" compose exec -T agent-default sh -c 'echo changed >> /opt/data/config.yaml'
-# .env is mounted read-only over the agent's home, so the agent can neither edit nor replace it.
 expect_refused "agent can't write its .env" compose exec -T agent-default sh -c 'echo X=1 >> /opt/data/.env'
 expect_refused "agent can't replace its .env" compose exec -T agent-default sh -c 'rm /opt/data/.env'
 expect "hermes/config.yaml's _config_version is the Hermes image's" \
@@ -550,15 +569,12 @@ expect "hermes/config.yaml's _config_version is the Hermes image's" \
   "$(sed -n 's/^_config_version: *//p' "$root/hermes/config.yaml")"
 expect "Hermes started without a config migration warning" "0" \
   "$(log_count_fixed agent-default "docker_config_migrate.py failed")"
-# Builds belong in the sandbox: the agent's terminal blocks build and package-manager commands, in
-# any part of a command, and still runs everything else.
-expect "the agent's terminal blocks build tools (approvals.deny)" \
-  "mvn * */mvnw* */mvnw* yarn * npx * node * npm * None None None" \
-  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-default python -c '
-from tools.approval_floors import _match_user_deny_rule
-for command in ["mvn -B verify", "cd x && ./mvnw verify", "sh ./mvnw verify", "yarn install", "npx turbo build",
-                "node build.js", "sh -c \"npm ci\"", "git status", "gh pr diff 7", "grep -rn yarn ."]:
-    print(_match_user_deny_rule(command))' 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+# Hermes' own tools, called as the agent would, all run in the workspace and can't see the agent's
+# files.
+expect "Hermes' terminal, file tools, and execute_code run in the workspace" \
+  "terminal=20000@$(compose exec -T workspace-default hostname) write_file=written agent_file_visible=False execute_code=20000" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-default python - < "$root/tests/hermes_workspace_tools.py" 2>/dev/null |
+    tail -n 1)"
 expect "Hermes caps runs at 50 model calls, warning at 80%" "50 0.8" \
   "$(compose exec -T agent-default sh -c 'echo $(hermes config get agent.max_turns) $(hermes config get agent.budget_warning_ratio)' 2>&1)"
 soul_marker="$(head -c 60 "$soul_file")"
@@ -580,8 +596,6 @@ expect "Hermes needed no routes outside the agent key's allow-list" "$denied_bef
   "$(log_count litellm "not allowed to call this route")"
 expect_no_plugin_errors "Hermes end to end"
 
-# The agent's environment and its whole Hermes home must not contain any LiteLLM, master, or
-# Postgres secret.
 secrets="$(cat "$root/tests/fixtures/litellm.env" "$root/tests/fixtures/master.env" "$root/tests/fixtures/postgres.env" |
   grep -v -E '^(#|$|LLM_MODEL_)' | cut -d= -f2-)"
 scan="$(printf '%s\n' "$secrets" | compose exec -T agent-default sh -c '
@@ -591,7 +605,7 @@ scan="$(printf '%s\n' "$secrets" | compose exec -T agent-default sh -c '
     if grep -rqF -- "$s" /tmp/agent-env /opt/data; then leaked=$((leaked + 1)); fi
   done
   rm /tmp/agent-env; echo "$checked $leaked"' || true)"
-# Comparing the count of checked secrets keeps a failed exec from passing as "nothing leaked".
+# Comparing the checked count keeps a failed exec from passing as "nothing leaked".
 expect "agent environment and data hold no LiteLLM, master, or Postgres secrets (checked, leaked)" \
   "$(printf '%s\n' "$secrets" | wc -l | tr -d ' ') 0" "$scan"
 if compose exec -T agent-default python3 -c 'import socket; socket.create_connection(("postgres", 5432), timeout=3)' \
@@ -600,7 +614,7 @@ if compose exec -T agent-default python3 -c 'import socket; socket.create_connec
 else
   pass "agent can't reach Postgres"
 fi
-# admin replaces .env with a new file, which the read-only mount picks up when the agent restarts.
+# admin replaces .env with a new file, which the agent's mount only picks up on restart.
 expect_ok "slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' slack default --from-stdin
 compose restart agent-default >/dev/null
 expect "the agent sees admin's .env changes after a restart" "SLACK_HOME_CHANNEL=C0TEST" \
@@ -651,8 +665,8 @@ expect "No TypeSafe key: Jev skipped with a warning" "1" "$(log_count litellm "s
 expect_no_plugin_errors "no TypeSafe key"
 unset TEST_TYPESAFE_API_KEY
 
-# An MCP server with an empty credential still loads, but LiteLLM can't use it: the admin tool must
-# refuse to grant it. A server that's only down upstream is granted, with a warning.
+# A server with an empty credential loads but is unusable, so admin must refuse it. One that's only
+# down upstream is granted with a warning.
 export TEST_ROVO_JIRA_WRITE_API_KEY=""
 restart_litellm
 expect "servers marks a server with an empty credential" "rovo_jira_write  (unusable: check its credential)" \
@@ -682,32 +696,37 @@ for tier in fast balanced strong; do
 done
 
 echo "== 9. GitHub"
-compose up -d --no-deps agent-default >/dev/null
+compose up -d --wait --wait-timeout 180 workspace-default >/dev/null && compose up -d --no-deps agent-default >/dev/null
+# Runs a command in the agent's workspace as Hermes does: SSH from the agent container, as the
+# Hermes user, with its key and the pinned host key.
+ws() {
+  compose exec -T -u "${HERMES_UID:-10000}" agent-default \
+    ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-default "$1"
+}
 expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_test_write: configured" \
   "$(compose exec -T github-token python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/healthz").read().decode())' 2>&1 |
     tr '\n' ' ' | sed 's/ *$//')"
-expect "agent gh is the pinned version" "2.103.3" \
-  "$(compose exec -T agent-default gh --version 2>&1 | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
-expect "agent gh gets a github_read token" "ghs_test_1" "$(compose exec -T agent-default gh auth token 2>&1)"
-expect "github-token reuses an unexpired token" "ghs_test_1" "$(compose exec -T agent-default gh auth token 2>&1)"
+expect "workspace gh is the pinned version" "2.103.3" \
+  "$(ws 'gh --version' 2>&1 | sed -n 's/^gh version \([0-9.]*\).*/\1/p')"
+expect "workspace gh gets a github_read token" "ghs_test_1" "$(ws 'gh auth token' 2>&1)"
+expect "github-token reuses an unexpired token" "ghs_test_1" "$(ws 'gh auth token' 2>&1)"
 git_credential() {
-  printf 'protocol=https\nhost=github.com\n\n' |
-    compose exec -T -e GIT_TERMINAL_PROMPT=0 "$@" agent-default git credential fill 2>&1 | sed -n 's/^password=//p'
+  ws "printf 'protocol=https\nhost=github.com\n\n' | ${1:-} git credential fill" 2>&1 | sed -n 's/^password=//p'
 }
-expect "agent git gets GitHub credentials through gh" "ghs_test_1" "$(git_credential)"
-expect "agent git gets no credentials for a level it wasn't granted" "" "$(git_credential -e GH_LEVEL=github_test_write)"
-expect "agent commits are authored and committed as the bot" \
+expect "workspace git gets GitHub credentials through gh" "ghs_test_1" "$(git_credential)"
+expect "workspace git gets no credentials for a level it wasn't granted" "" "$(git_credential GH_LEVEL=github_test_write)"
+expect "workspace commits are authored and committed as the bot" \
   "$GIT_BOT_NAME <$GIT_BOT_EMAIL> $GIT_BOT_NAME <$GIT_BOT_EMAIL>" \
-  "$(compose exec -T agent-default sh -c 'echo $(git var GIT_AUTHOR_IDENT | sed "s/>.*/>/") $(git var GIT_COMMITTER_IDENT | sed "s/>.*/>/")' 2>&1)"
+  "$(ws 'echo $(git var GIT_AUTHOR_IDENT | sed "s/>.*/>/") $(git var GIT_COMMITTER_IDENT | sed "s/>.*/>/")' 2>&1)"
 expect "github_read token: valid App JWT, levels.json permissions, no repository limit" "1" \
   "$(log_count_fixed fake-github "mint path_ok=True jwt_ok=True permissions=$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["github_read"]["permissions"], sort_keys=True, separators=(",", ":")))' "$root/github-token/levels.json") repositories=null")"
-if compose exec -T -e GH_LEVEL=github_test_write agent-default gh auth token >"$TEST_WORK/out" 2>&1; then
-  fail "agent gh refused a level it wasn't granted (got a token)"
+if ws 'GH_LEVEL=github_test_write gh auth token' >"$TEST_WORK/out" 2>&1; then
+  fail "workspace gh refused a level it wasn't granted (got a token)"
 else
-  expect "agent gh refused a level it wasn't granted" "1" "$(grep -c "not been granted github_test_write" "$TEST_WORK/out")"
+  expect "workspace gh refused a level it wasn't granted" "1" "$(grep -c "not been granted github_test_write" "$TEST_WORK/out")"
 fi
 
-# Direct requests to github-token, from the agent's network, with other agents' keys.
+# Requests github-token directly from the agent's network, with any key.
 token_request() {
   compose exec -T -e KEY="$1" -e LEVEL="$2" agent-default sh -c '
     url="http://github-token:8080/token/$LEVEL"
@@ -721,14 +740,15 @@ token_request() {
 expect "a granted write level gets a token" "200" "$(token_request "$writer_key" github_test_write)"
 expect "write token: write permissions, limited to the level's repositories" "1" \
   "$(log_count_fixed fake-github 'permissions={"contents":"write","metadata":"read","pull_requests":"write"} repositories=["openmrs-test-repo"]')"
+expect "grant changes reach the workspace key" "200" "$(token_request "$(workspace_key writer)" github_test_write)"
 expect "a key without the grant is refused (403)" "403" "$(token_request "$writer_key" github_read)"
 expect "no key is refused (401)" "401" "$(token_request "" github_read)"
 expect "an unknown key is refused (401)" "401" "$(token_request "sk-not-a-key" github_read)"
 expect "a revoked key is refused even though it had the grant (401)" "401" "$(token_request "$new_nobody_key" github_read)"
 expect "an unknown level is refused (404)" "404" "$(token_request "$reader_key" github_admin)"
 expect "github-token asked GitHub for exactly two tokens" "2" "$(log_count fake-github "^mint ")"
-# One line of the PEM and a stretch of its base64 form (as in github-app.env), both from the middle,
-# where they're unique to this key.
+# A line of the PEM and a stretch of its base64 form, from the middle where they're unique to
+# this key.
 github_key_markers="$(sed -n 5p "$TEST_WORK/github-app.pem")
 $(printf '%s' "$github_key_base64" | cut -c 400-460)"
 expect "agent environment and data hold no GitHub App key (markers, files)" "2 0" \
@@ -736,92 +756,98 @@ expect "agent environment and data hold no GitHub App key (markers, files)" "2 0
     cat > /tmp/markers; env > /tmp/agent-env
     echo "$(grep -c . /tmp/markers) $(grep -rlF -f /tmp/markers /tmp/agent-env /opt/data | wc -l | tr -d " ")"
     rm /tmp/markers /tmp/agent-env' || echo error)"
+expect "workspace environment and files hold no GitHub App key (markers, files)" "2 0" \
+  "$(printf '%s\n' "$github_key_markers" | compose exec -T workspace-default sh -c '
+    cat > /tmp/markers; env > /tmp/workspace-env
+    echo "$(grep -c . /tmp/markers) $(grep -rlF -f /tmp/markers /tmp/workspace-env /config /run /work | wc -l | tr -d " ")"
+    rm /tmp/markers /tmp/workspace-env' || echo error)"
+
+echo "== 10. Workspaces"
+expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \
+  "$(ws 'id -u; touch /etc/x 2>/dev/null || echo read-only' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace has each JDK, 21 by default, and Maven and Node" "21.0 1.8 11.0 17.0 21.0 ok" \
+  "$(ws 'java -version 2>&1 | head -n 1 | cut -d\" -f2 | cut -d. -f1-2
+    for v in 8 11 17 21; do /opt/java/$v/bin/java -version 2>&1 | head -n 1 | cut -d\" -f2 | cut -d. -f1-2; done
+    mvn -v >/dev/null && node --version >/dev/null && echo ok' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace clones a branch and a pull request's head" "main pr $(git_test rev-parse pr)" \
+  "$(ws 'git clone -q -b main --filter=blob:none git://fake-git:8005/test-repo repo && cd repo && cat marker &&
+    git fetch -q origin pull/7/head && git -c advice.detachedHead=false checkout -q FETCH_HEAD && cat marker &&
+    git rev-parse HEAD' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace user can't read its configuration or host key" "denied denied" \
+  "$(ws 'for f in /config/litellm_key /run/workspace/ssh_host_ed25519_key; do
+    cat $f >/dev/null 2>&1 && echo readable || echo denied; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace can't reach LiteLLM or Postgres" "unreachable unreachable" \
+  "$(ws 'for target in litellm:4000 postgres:5432; do
+    python3 -c "import socket, sys; h, p = sys.argv[1].split(\":\"); socket.create_connection((h, int(p)), timeout=3)" \
+      $target 2>/dev/null && echo reachable || echo unreachable; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "workspace holds none of the agent's secrets" "0" \
+  "$(printf '%s\n' "$reader_key" xoxb-test xapp-test | compose exec -T workspace-default sh -c '
+    cat > /tmp/markers; env > /tmp/workspace-env
+    grep -rlF -f /tmp/markers /tmp/workspace-env /config /run /work | wc -l | tr -d " "
+    rm /tmp/markers /tmp/workspace-env' || echo error)"
+expect_refused "workspace refuses any other SSH key" compose exec -T -u "${HERMES_UID:-10000}" agent-default sh -c '
+  ssh-keygen -q -t ed25519 -N "" -f /tmp/other &&
+    ssh -p 2222 -i /tmp/other -o IdentitiesOnly=yes -o BatchMode=yes workspace@workspace-default true
+  status=$?; rm -f /tmp/other /tmp/other.pub; exit $status'
+expect_refused "workspace refuses root logins" compose exec -T -u "${HERMES_UID:-10000}" agent-default \
+  ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes root@workspace-default true
+# Hermes connects with StrictHostKeyChecking=accept-new, which must still refuse a changed key.
+expect_refused "agent refuses a workspace whose host key isn't the pinned one" \
+  compose exec -T -u "${HERMES_UID:-10000}" agent-default sh -c '
+  ssh-keygen -q -t ed25519 -N "" -f /tmp/fake && echo "[workspace-default]:2222 $(cut -d" " -f1,2 /tmp/fake.pub)" > /tmp/kh &&
+    ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o GlobalKnownHostsFile=/tmp/kh \
+      -o StrictHostKeyChecking=accept-new workspace@workspace-default true
+  status=$?; rm -f /tmp/fake /tmp/fake.pub /tmp/kh; exit $status'
+# Leaves files, a background process, and a cache entry, then lets the idle limit (one minute in
+# tests/compose.test.yaml) pass with no one logged in.
+resets_before="$(log_count_fixed workspace-default "reset after going idle")"
+ws 'echo x > ~/left; echo x > /tmp/left; echo x > /dev/shm/left; touch /cache/m2/kept
+  (setsid sleep 600 >/dev/null 2>&1 &)' >/dev/null 2>&1
 compose stop agent-default >/dev/null
-
-echo "== 10. Sandbox"
-expect_ok "create builder (sandbox)" admin create builder --mcp sandbox
-builder_key="$(agent_key builder)"
-request GET /v1/mcp/server "$master_key" >/dev/null
-sandbox_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "sandbox"))' "$TEST_WORK/body")"
-
-# Calls a sandbox tool through LiteLLM; prints the tool's text result, "denied", or
-# "error <status>: <body>".
-sandbox_tool() {
-  local key="$1" tool="$2" arguments="$3" status
-  status="$(request POST /mcp-rest/tools/call "$key" \
-    "{\"server_id\": \"$sandbox_id\", \"name\": \"$tool\", \"arguments\": $arguments}")"
-  python3 - "$TEST_WORK/body" "$status" <<'PYTHON'
-import json, sys
-body, status = open(sys.argv[1]).read(), sys.argv[2]
-try:
-    data = json.loads(body)
-except ValueError:
-    data = {}
-if isinstance(data, dict) and data.get("content"):
-    print(data["content"][0].get("text"))
-elif "access_denied" in body or "not allowed to access" in body:
-    print("denied")
-else:
-    print(f"error {status}: {body[:300]}")
-PYTHON
-}
-
-job_field() {
-  python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$TEST_WORK/job" "$1" 2>/dev/null
-}
-
-# Waits for a sandbox job to end, leaving its final job_status in $TEST_WORK/job.
-wait_for_job() {
-  for _ in $(seq 1 "${2:-60}"); do
-    sandbox_tool "$builder_key" job_status "{\"job_id\": \"$1\"}" > "$TEST_WORK/job"
-    [ "$(job_field state)" != "running" ] && return
-    sleep 2
+# Waits up to three minutes for a reset after $resets_before, and prints whether one happened. On a
+# timeout it prints the workspace's log, which shows its logins.
+wait_for_reset() {
+  for _ in $(seq 1 60); do
+    [ "$(log_count_fixed workspace-default "reset after going idle")" -gt "$resets_before" ] && { echo reset; return; }
+    sleep 3
   done
+  echo "no reset"
+  compose logs -t workspace-default 2>&1 | grep -v "Connection closed by 127" | tail -n 20 | sed 's/^/    /' >&2
 }
-
-# Starts a job with the builder's key and waits for it; prints its final state.
-sandbox_job() {
-  local job
-  job="$(sandbox_tool "$builder_key" run_build "$1" |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["job_id"])' 2>/dev/null)" || { echo "not started"; return; }
-  wait_for_job "$job"
-  job_field state
+expect "workspace resets after going idle, despite a leftover process" "reset" "$(wait_for_reset)"
+# Prints which of the leftover files still exist, and "leftover-process" if any process of the
+# workspace user is still running.
+leftovers() {
+  compose exec -T workspace-default sh -c '
+    for f in /work/home/left /tmp/left /dev/shm/left /cache/m2/kept; do [ -e $f ] && echo $f; done
+    grep -l "^Uid:[[:space:]]*20000" /proc/[0-9]*/status 2>/dev/null | sed "s/.*/leftover-process/" | sort -u
+    true' | tr '\n' ' ' | sed 's/ $//'
 }
+expect "a reset leaves no files or processes, only the caches" "/cache/m2/kept" "$(leftovers)"
 
-expect "a key without the sandbox grant is refused" "denied" "$(sandbox_tool "$reader_key" list_jobs '{}')"
-expect "sandbox builds main with JDK 8" "succeeded" \
-  "$(sandbox_job '{"repository": "test-repo", "ref": "main", "command": "cat marker; java -version", "java_version": 8}')"
-expect "main build: the checked-out file and JDK" "1 1" \
-  "$(job_field output_tail | grep -cx main) $(job_field output_tail | grep -c 'version "1.8.0')"
-expect "sandbox builds a pull request's head with JDK 21" "succeeded" \
-  "$(sandbox_job '{"repository": "test-repo", "ref": "pull/7", "command": "cat marker; java -version"}')"
-expect "pull request build: the checked-out file, commit, and JDK" "1 $(git_test rev-parse pr) 1" \
-  "$(job_field output_tail | grep -cx pr) $(job_field commit) $(job_field output_tail | grep -c 'version "21\.')"
-# The first job leaves files, a background process, and a cache entry; the second checks what's left.
-expect "a build with leftovers succeeds" "succeeded" \
-  "$(sandbox_job '{"repository": "test-repo", "ref": "main", "command": "id -u; touch /etc/x 2>/dev/null || echo read-only; echo x > /tmp/left; echo x > /dev/shm/left; touch /cache/m2/kept; (setsid sleep 600 >/dev/null 2>&1 &)"}')"
-expect "builds run as the unprivileged build user on a read-only root filesystem" "1 1" \
-  "$(job_field output_tail | grep -cx 20000) $(job_field output_tail | grep -cx read-only)"
-sandbox_job '{"repository": "test-repo", "ref": "main", "command": "for f in /tmp/left /dev/shm/left /cache/m2/kept; do [ -e $f ] && echo $f; done; for p in /proc/[0-9]*/cmdline; do [ \"$(head -c 6 $p 2>/dev/null | tr \"\\\\0\" \" \")\" = \"sleep \" ] && echo leftover-process; done; true"}' >/dev/null
-expect "a job leaves no files or processes for the next, only its caches" "/cache/m2/kept" \
-  "$(job_field output_tail | grep -E '^(/|leftover)' | tr '\n' ' ' | sed 's/ $//')"
-expect "sandbox refuses a repository outside the organization" "1" \
-  "$(sandbox_tool "$builder_key" run_build '{"repository": "../other", "ref": "main", "command": "true"}' | grep -c "must be a repository name")"
-job="$(sandbox_tool "$builder_key" run_build '{"repository": "test-repo", "ref": "main", "command": "sleep 600", "timeout_minutes": 1}' |
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["job_id"])')"
-expect "sandbox runs one job at a time" "1" \
-  "$(sandbox_tool "$builder_key" run_build '{"repository": "test-repo", "ref": "main", "command": "true"}' | grep -c "still running")"
-wait_for_job "$job" 45
-expect "sandbox kills a job at its timeout" "timed_out" "$(job_field state)"
-# GPG_KEY, from the python base image, is the fingerprint of the public CPython release key.
-expect "sandbox holds no secrets" "" \
-  "$(compose exec -T sandbox sh -c 'env | cut -d= -f1' | grep -E 'KEY|TOKEN|SECRET|PASS' | grep -vx GPG_KEY || true)"
-expect_ok "delete builder --purge" admin delete builder --purge --yes
+# With WORKSPACE_KEEP_FILES, a reset still kills processes but keeps /work, also across restarts.
+# The recreated workspace's only session lasts milliseconds, shorter than a poll, so this also
+# checks that every login counts as use.
+export TEST_WORKSPACE_KEEP_FILES=true
+compose up -d --wait --wait-timeout 180 --force-recreate --no-deps workspace-default >/dev/null
+compose up -d --no-deps agent-default >/dev/null
+resets_before="$(log_count_fixed workspace-default "reset after going idle")"
+ws 'echo x > ~/left; echo x > /tmp/left; echo x > /dev/shm/left; touch /cache/m2/kept
+  (setsid sleep 600 >/dev/null 2>&1 &)' >/dev/null 2>&1
+compose stop agent-default >/dev/null
+expect "WORKSPACE_KEEP_FILES: workspace resets after going idle" "reset" "$(wait_for_reset)"
+expect "WORKSPACE_KEEP_FILES: a reset kills processes but keeps /work" "/work/home/left /cache/m2/kept" \
+  "$(leftovers)"
+compose restart workspace-default >/dev/null
+expect "WORKSPACE_KEEP_FILES: /work survives a restart" "/work/home/left /cache/m2/kept" "$(leftovers)"
+unset TEST_WORKSPACE_KEEP_FILES
 
 # Files an agent copies from its image can carry that agent's own SELinux label; admin must still
 # be able to remove them.
 expect_ok "delete --purge an agent that has run" admin delete default --purge --yes
-expect "purge removes all of a run agent's data" "absent" "$(admin_sh 'test -e /agents/default && echo present || echo absent')"
+expect "purge removes all of a run agent's data and its workspace configuration" "absent absent" \
+  "$(admin_sh 'for p in /agents/default /workspaces/default; do test -e $p && echo present || echo absent; done' |
+    tr '\n' ' ' | sed 's/ $//')"
 
 echo
 if [ "$failures" -eq 0 ]; then

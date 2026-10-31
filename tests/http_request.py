@@ -2,8 +2,7 @@
 
 Usage: python3 http_request.py METHOD PATH KEY [JSON_BODY]
 
-Prints the HTTP status code on the first line and the response body after it. Running inside the
-container keeps the tests independent of the host port mapping.
+Prints the status code, then the body. Running in the container avoids depending on the host port.
 """
 
 import sys

@@ -1,8 +1,7 @@
 """Stand-in for TypeSafe's Jev `POST /v1/systemone` endpoint, used by tests/run.sh.
 
-Answers every tier question with the tier named in /tmp/mode (default SIMPLE), or returns HTTP 500
-when /tmp/mode contains "fail". Each request is logged as a "jev request" line, including whether
-it carried the expected test credential, so the test can count calls and check the key was sent.
+Answers with the tier in /tmp/mode (default SIMPLE), or HTTP 500 if it's "fail". Logs a
+"jev request" line per call, noting whether the test key was sent.
 """
 
 import json

@@ -1,28 +1,25 @@
-"""github-token: hands agents short-lived GitHub App installation tokens for the access levels they
-have been granted.
+"""Hands agents short-lived GitHub App installation tokens for the access levels they've been granted.
 
-Access levels are defined in levels.json (mounted at LEVELS_FILE). Each level names the token's
-permissions and, optionally, the repositories it is limited to. GitHub caps a token at what its
-App was granted, so each level normally has its own App (e.g. a read-only App installed org-wide,
-and a write App installed only on the repositories agents may change). A level's App credentials
-come from environment variables prefixed with the level's name in upper case:
+Levels are defined in LEVELS_FILE (levels.json): the token's permissions and, optionally, its
+repositories. GitHub caps a token at what its App was granted, so each level normally has its own
+App. Credentials come from environment variables prefixed with the upper-cased level name:
 
-  <LEVEL>_APP_ID                  the App's ID
-  <LEVEL>_INSTALLATION_ID         the installation's ID (e.g. on the openmrs org)
-  <LEVEL>_PRIVATE_KEY_BASE64      the App's private key (PEM), base64-encoded onto one line
+  <LEVEL>_APP_ID
+  <LEVEL>_INSTALLATION_ID
+  <LEVEL>_PRIVATE_KEY_BASE64      the App's PEM private key, base64-encoded onto one line
 
-Agents authenticate with their LiteLLM virtual key. The key is checked against LiteLLM's
-/key/info, and a token is issued only for a level listed in the key's `github_levels` metadata,
-which the admin tool manages. Keys LiteLLM rejects (revoked, expired, blocked) get nothing.
+Agents authenticate with their LiteLLM virtual key, checked against LiteLLM's /key/info. A token
+is issued only for a level in the key's `github_levels` metadata (set by the admin tool). Keys
+LiteLLM rejects (revoked, expired, blocked) get nothing.
 
   GET /token/<level>   Authorization: Bearer <LiteLLM key>; returns the token as plain text.
                        401 bad key, 403 level not granted, 404 unknown level, 503 level has no
                        App credentials, 502 GitHub or LiteLLM failed.
   GET /healthz         each level and whether it has App credentials, without calling GitHub.
 
-GitHub expires tokens after an hour; each level's token is reused until five minutes before
-that. Key checks are cached for a minute, so revoking a grant takes effect within a minute.
-JWTs are signed with the openssl CLI, keeping this service free of Python dependencies.
+Tokens last an hour and are reused until five minutes before expiry. Key checks are cached for a
+minute, so revoking a grant can take a minute. JWTs are signed with the openssl CLI to avoid
+Python dependencies.
 """
 
 import base64
@@ -153,7 +150,7 @@ def _mint(level: Level) -> tuple[str, float]:
 
 
 def _granted_levels(litellm_key: str) -> list[str]:
-    """The levels in the key's github_levels metadata, as reported by LiteLLM for the key itself."""
+    """The key's github_levels, from /key/info authenticated as the key itself."""
     request = urllib.request.Request(f"{LITELLM_URL}/key/info", headers={"Authorization": f"Bearer {litellm_key}"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:

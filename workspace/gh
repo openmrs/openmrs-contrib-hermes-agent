@@ -1,0 +1,25 @@
+#!/bin/sh
+# Runs the GitHub CLI with a short-lived GitHub App token, fetched per run from github-token (see
+# github-token/server.py) with the workspace's LiteLLM key, and never stored.
+#
+# GH_LEVEL picks the access level (default github_read), which the agent must be granted
+# (`admin grant <name> --github ...`). git uses this as its credential helper (see gitconfig), so
+# GH_LEVEL applies to `git push` too.
+if [ -z "${GH_TOKEN:-}" ]; then
+  key="$(cat /run/workspace/litellm_key 2>/dev/null)"
+  response="$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Authorization: Bearer $key" \
+    "http://github-token:8080/token/${GH_LEVEL:-github_read}")" || {
+    echo "gh: couldn't reach the github-token service" >&2
+    exit 1
+  }
+  status="$(printf '%s\n' "$response" | tail -n 1)"
+  body="$(printf '%s\n' "$response" | sed '$d')"
+  if [ "$status" != "200" ]; then
+    echo "gh: no GitHub token (${GH_LEVEL:-github_read}): $body" >&2
+    exit 1
+  fi
+  GH_TOKEN="$body"
+  export GH_TOKEN
+fi
+export GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1
+exec /usr/local/lib/gh/gh "$@"

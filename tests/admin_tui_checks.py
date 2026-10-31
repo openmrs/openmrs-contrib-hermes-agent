@@ -1,9 +1,7 @@
 """Headless checks of the hermes-admin interactive interface, used by tests/run.sh.
 
-Runs inside the admin container against the test LiteLLM. Drives the Textual app with its test
-pilot: the agent table loads, an agent can be created through the dialog with MCP and GitHub
-grants and a budget, its access and budget can be changed (and an invalid budget is refused), and it
-can be deleted (with the type-to-confirm purge). Cleans up the agent it creates.
+Runs in the admin container against the test LiteLLM, driving the Textual app with its test pilot.
+Cleans up the agent it creates.
 """
 
 import asyncio

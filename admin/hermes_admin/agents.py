@@ -1,20 +1,22 @@
-"""Agent provisioning: LiteLLM virtual keys, MCP and GitHub grants, and each agent's Hermes data
-directory.
+"""Agent provisioning: LiteLLM virtual keys, MCP and GitHub grants, and each agent's Hermes home.
 
-LiteLLM is the source of truth for which agents exist and what they may access. An agent is the set
-of virtual keys whose metadata has `managed_by: hermes-admin` and `hermes_agent: <name>`; keys
-without that marker are never listed or changed. MCP grants are the key's object_permission; GitHub
-grants are the access levels (from github-token/levels.json) in its `github_levels` metadata, which
-the github-token service checks. Normally there is one key per agent; more than one
-means a rotation was interrupted, and `rotate` or `delete` cleans the extras up.
+LiteLLM is the source of truth. An agent is the set of keys whose metadata has
+`managed_by: hermes-admin` and `hermes_agent: <name>`; other keys are never touched. MCP grants are
+the key's object_permission; GitHub grants are levels (from github-token/levels.json) in its
+`github_levels` metadata, checked by github-token. More than one key per agent means an interrupted
+rotation, which `rotate` or `delete` cleans up.
 
-Each agent's monthly budget is set on its LiteLLM user (`hermes-agent-<name>`, shared by all its
-keys) rather than on a key, so spend carries over when `rotate` issues a new key. LiteLLM refuses
-the agent's requests once the month's spend reaches the budget, and resets spend on the 1st.
+Each agent also has a workspace key (`hermes_role: workspace`) so `gh` in its workspace can get
+GitHub tokens. It has the same `github_levels` but may only call /key/info, so code run in the
+workspace can't spend the agent's budget or use its MCP grants.
 
-Each agent's Hermes home lives at `<agents_dir>/<name>`, a subdirectory of the shared agents-data
-volume that only that agent mounts (as /opt/data). Its `.env` holds the agent's LiteLLM key and
-Slack tokens; Hermes loads it at startup, so changes need an agent restart to take effect.
+The monthly budget is on the agent's LiteLLM user (`hermes-agent-<name>`), not a key, so spend
+survives `rotate`.
+
+`<agents_dir>/<name>` is the agent's Hermes home (/opt/data), mounted only by that agent. Its `.env`
+holds the LiteLLM key and Slack tokens; `ssh/` holds the agent's SSH key and the workspace's host
+key. `<workspaces_dir>/<name>` holds the workspace's authorized key, host key, and workspace key,
+root-only and mounted only by that workspace. Both are read at startup, so changes need a restart.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -36,12 +39,9 @@ MANAGED_BY = "hermes-admin"
 # Model names from litellm/config.yaml that agents may request.
 AGENT_MODELS = ["auto", "fast", "balanced", "strong"]
 
-# Chat completions and model listing (what Hermes uses), plus LiteLLM's MCP inference group. Kept
-# explicit because LiteLLM's `llm_api_routes` group also allows raw provider passthroughs
-# (/anthropic/*, /openai/*, ...), which would bypass the `auto` router.
-# /key/info lets the github-token service check a key's GitHub grants using the key itself. LiteLLM
-# answers a non-admin key about itself, or about keys with the same user_id; each agent's keys get
-# their own user_id (see _user_id), so an agent can't read another agent's key info.
+# Explicit rather than LiteLLM's `llm_api_routes` group, which also allows raw provider passthroughs
+# (/anthropic/*, ...) that bypass the `auto` router. /key/info lets github-token check a key's grants
+# with the key itself; a non-admin key can only read keys with its own user_id (see _user_id).
 ALLOWED_ROUTES = [
     "/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "mcp_inference_routes", "/key/info",
 ]
@@ -49,8 +49,15 @@ ALLOWED_ROUTES = [
 # LiteLLM's sentinel for "no MCP servers"; an empty list would mean "inherit".
 NO_MCP_SERVERS = "no-mcp-servers"
 
-# Tokens are masked when entered. An agent's Slack setup is complete once SLACK_REQUIRED_VARS are
-# set; SLACK_HOME_CHANNEL (a channel ID) is optional.
+# Workspace keys only need github-token's grant check. "no-default-models" is LiteLLM's sentinel for
+# no models; an empty list means all.
+WORKSPACE_ROLE = "workspace"
+WORKSPACE_ROUTES = ["/key/info"]
+WORKSPACE_MODELS = ["no-default-models"]
+# Where agents reach their workspace's sshd (see workspace/supervisor.py and hermes/config.yaml).
+WORKSPACE_SSH_PORT = 2222
+
+# SLACK_TOKEN_VARS are masked when entered. Slack setup is complete once SLACK_REQUIRED_VARS are set.
 SLACK_TOKEN_VARS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
 SLACK_REQUIRED_VARS = (*SLACK_TOKEN_VARS, "SLACK_ALLOWED_USERS")
 SLACK_VARS = (*SLACK_REQUIRED_VARS, "SLACK_HOME_CHANNEL")
@@ -73,6 +80,7 @@ class Settings:
     litellm_url: str
     master_key: str
     agents_dir: Path
+    workspaces_dir: Path
     github_levels_file: Path
     uid: int
     gid: int
@@ -83,6 +91,7 @@ class Settings:
             litellm_url=os.environ.get("LITELLM_URL", "http://litellm:4000"),
             master_key=os.environ.get("LITELLM_MASTER_KEY", ""),
             agents_dir=Path(os.environ.get("AGENTS_DIR", "/agents")),
+            workspaces_dir=Path(os.environ.get("WORKSPACES_DIR", "/workspaces")),
             github_levels_file=Path(os.environ.get("GITHUB_LEVELS_FILE", "/templates/github-levels.json")),
             uid=int(os.environ.get("HERMES_UID", "10000")),
             gid=int(os.environ.get("HERMES_GID", "10000")),
@@ -93,12 +102,14 @@ class Settings:
 class Agent:
     name: str
     key_hashes: list[str] = field(default_factory=list)
+    workspace_key_hashes: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
     github_levels: list[str] = field(default_factory=list)
     budget: float | None = None
     spend: float = 0.0
     budget_resets: str | None = None
     has_data: bool = False
+    has_workspace: bool = False
     env_set: dict[str, bool] = field(default_factory=dict)
 
     @property
@@ -144,8 +155,7 @@ class Agents:
     def __init__(self, settings: Settings, api: LiteLLM | None = None) -> None:
         self.settings = settings
         self.api = api or LiteLLM(settings.litellm_url, settings.master_key)
-        # Problems the last create or grant went ahead despite (e.g. an MCP server it couldn't
-        # check), for the caller to show the operator.
+        # Non-fatal problems from the last create or grant, for the operator.
         self.warnings: list[str] = []
 
     # -- queries -------------------------------------------------------------------------------
@@ -154,8 +164,8 @@ class Agents:
         return sorted(self.api.mcp_server_ids())
 
     def unusable_mcp_servers(self) -> dict[str, str]:
-        """Configured MCP servers LiteLLM can't use (e.g. an empty credential), with LiteLLM's fault.
-        Checks each server upstream, so it's slow; servers that are down aren't included."""
+        """Configured MCP servers LiteLLM can't use (e.g. an empty credential). Slow: checks each
+        server upstream. Servers that are only down aren't included."""
         return {name: fault for name, fault in self._server_faults(self.api.mcp_server_ids()).items()
                 if fault == "internal"}
 
@@ -173,6 +183,9 @@ class Agents:
             if metadata.get("managed_by") != MANAGED_BY or not metadata.get("hermes_agent"):
                 continue
             agent = agents.setdefault(metadata["hermes_agent"], Agent(metadata["hermes_agent"]))
+            if metadata.get("hermes_role") == WORKSPACE_ROLE:
+                agent.workspace_key_hashes.append(key["token"])
+                continue
             agent.key_hashes.append(key["token"])
             servers = (key.get("object_permission") or {}).get("mcp_servers") or []
             agent.mcp_servers = sorted(s for s in servers if s != NO_MCP_SERVERS)
@@ -202,6 +215,8 @@ class Agents:
     def _add_local_state(self, agent: Agent) -> None:
         home = self._home(agent.name)
         agent.has_data = home.is_dir()
+        agent.has_workspace = ((self._workspace_config(agent.name) / "litellm_key").exists()
+                               and (home / "ssh" / "id_ed25519").exists())
         values = env_values(home / ".env")
         agent.env_set = {var: bool(values.get(var)) for var in SECRET_VARS}
 
@@ -211,11 +226,10 @@ class Agents:
         self, name: str, mcp: list[str], slack: dict[str, str] | None = None, github: list[str] | None = None,
         budget: float = DEFAULT_BUDGET,
     ) -> Agent:
-        """Issue a key with the given MCP and GitHub grants and monthly budget (USD), and prepare
-        the agent's Hermes home.
+        """Issue the agent's and its workspace's keys and prepare their homes. `budget` is monthly USD.
 
-        Refuses if the agent already has a key. An existing data directory (e.g. after `delete`)
-        is reused, keeping its sessions and memories, as is this month's spend.
+        Refuses if the agent already has a key. Existing data (e.g. after `delete`) and this month's
+        spend are kept.
         """
         validate_name(name)
         validate_budget(budget)
@@ -226,11 +240,13 @@ class Agents:
         levels = self._checked_levels(github or [])
         self._set_budget(name, budget)
         key, key_hash = self._issue_key(name, servers, levels)
+        workspace_key, workspace_key_hash = self._issue_workspace_key(name, levels)
         try:
             self._prepare_home(name)
             self._write_env(name, {KEY_VAR: key, **(slack or {})})
+            self._write_workspace(name, workspace_key)
         except Exception:
-            self.api.delete_keys([key_hash])
+            self.api.delete_keys([key_hash, workspace_key_hash])
             raise
         return self.get(name)
 
@@ -253,25 +269,31 @@ class Agents:
         if mcp is not None:
             changes["object_permission"] = {"mcp_servers": self._checked_servers(mcp) or [NO_MCP_SERVERS]}
         levels = agent.github_levels if github is None else self._checked_levels(github)
-        # Metadata is replaced as a whole. user_id and allowed_routes are refreshed too, so keys
-        # issued by older versions of this tool pick up the current ones.
+        # Metadata is replaced whole. user_id and allowed_routes are reset so older keys get current values.
         changes["metadata"] = self._metadata(name, levels)
         changes["user_id"] = self._user_id(name)
         changes["allowed_routes"] = ALLOWED_ROUTES
         for key_hash in agent.key_hashes:
             self.api.update_key(key_hash, changes)
+        workspace_changes = {"metadata": self._metadata(name, levels, WORKSPACE_ROLE), "user_id": self._user_id(name),
+                             "allowed_routes": WORKSPACE_ROUTES}
+        for key_hash in agent.workspace_key_hashes:
+            self.api.update_key(key_hash, workspace_changes)
         return self.get(name)
 
     def rotate(self, name: str) -> Agent:
-        """Issue a new key with the same grants, write it to the agent, then revoke the old key(s)."""
+        """Issue new LiteLLM and SSH keys for the agent and its workspace, then revoke the old ones.
+        Also creates a missing workspace key."""
         agent = self._existing(name)
         key, key_hash = self._issue_key(name, agent.mcp_servers, agent.github_levels)
+        workspace_key, workspace_key_hash = self._issue_workspace_key(name, agent.github_levels)
         try:
             self._write_env(name, {KEY_VAR: key})
+            self._write_workspace(name, workspace_key)
         except Exception:
-            self.api.delete_keys([key_hash])
+            self.api.delete_keys([key_hash, workspace_key_hash])
             raise
-        self.api.delete_keys(agent.key_hashes)
+        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes)
         return self.get(name)
 
     def set_slack(self, name: str, values: dict[str, str]) -> Agent:
@@ -283,16 +305,19 @@ class Agents:
         return self.get(name)
 
     def delete(self, name: str, purge: bool = False) -> None:
-        """Revoke the agent's keys and remove its secrets from .env. `purge` also deletes its data
-        and its LiteLLM user (budget and this month's spend); otherwise both are kept for `create`."""
+        """Revoke the agent's and its workspace's keys and remove their secrets. `purge` also deletes
+        its data and LiteLLM user (budget and spend); otherwise both are kept for `create`."""
         agent = self.get(name)
-        self.api.delete_keys(agent.key_hashes)
+        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes)
         home = self._home(name)
+        shutil.rmtree(self._workspace_config(name), ignore_errors=True)
         if purge:
             if self.api.user_info(self._user_id(name)) is not None:
                 self.api.delete_user(self._user_id(name))
             shutil.rmtree(home, ignore_errors=True)
-        elif (home / ".env").exists():
+            return
+        shutil.rmtree(home / "ssh", ignore_errors=True)
+        if (home / ".env").exists():
             self._write_env(name, {var: None for var in SECRET_VARS})
 
     # -- helpers -------------------------------------------------------------------------------
@@ -304,8 +329,7 @@ class Agents:
         return agent
 
     def _checked_servers(self, mcp: list[str]) -> list[str]:
-        """Refuses servers that aren't configured, or that LiteLLM can't use. A server that's only
-        down upstream is allowed, with a warning."""
+        """Refuses unknown servers and ones LiteLLM can't use; ones only down upstream get a warning."""
         servers = sorted({s.strip() for s in mcp if s.strip()})
         ids = self.api.mcp_server_ids()
         unknown = [s for s in servers if s not in ids]
@@ -336,8 +360,9 @@ class Agents:
         return f"hermes-agent-{name}"
 
     @staticmethod
-    def _metadata(name: str, github_levels: list[str]) -> dict:
-        return {"managed_by": MANAGED_BY, "hermes_agent": name, "github_levels": github_levels}
+    def _metadata(name: str, github_levels: list[str], role: str | None = None) -> dict:
+        metadata = {"managed_by": MANAGED_BY, "hermes_agent": name, "github_levels": github_levels}
+        return {**metadata, "hermes_role": role} if role else metadata
 
     def _set_budget(self, name: str, budget: float) -> None:
         user_id = self._user_id(name)
@@ -360,8 +385,61 @@ class Agents:
         })
         return response["key"], response["token"]
 
+    def _issue_workspace_key(self, name: str, github_levels: list[str]) -> tuple[str, str]:
+        """Returns the new workspace key and its hash."""
+        response = self.api.generate_key({
+            "key_alias": f"hermes-{name}-workspace-{time.strftime('%Y%m%d%H%M%S')}",
+            "user_id": self._user_id(name),
+            "models": WORKSPACE_MODELS,
+            "allowed_routes": WORKSPACE_ROUTES,
+            "object_permission": {"mcp_servers": [NO_MCP_SERVERS]},
+            "metadata": self._metadata(name, github_levels, WORKSPACE_ROLE),
+        })
+        return response["key"], response["token"]
+
     def _home(self, name: str) -> Path:
         return self.settings.agents_dir / name
+
+    def _workspace_config(self, name: str) -> Path:
+        return self.settings.workspaces_dir / name
+
+    def _write_workspace(self, name: str, workspace_key: str) -> None:
+        """Generate SSH keys for the agent and its workspace. The agent's private key and the
+        workspace's host key (as known_hosts) go to the agent's home; the rest, with the workspace
+        key, to the root-only workspace configuration."""
+        if "\n" in workspace_key or "\r" in workspace_key:
+            raise AgentError("the workspace key must be a single line")
+        with tempfile.TemporaryDirectory() as tmp:
+            for key_file, comment in (("client", f"hermes-{name}"), ("host", f"workspace-{name}")):
+                subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", f"{tmp}/{key_file}"],
+                               check=True, capture_output=True)
+            client_key, client_public = Path(tmp, "client").read_text(), Path(tmp, "client.pub").read_text()
+            host_key, host_public = Path(tmp, "host").read_text(), Path(tmp, "host.pub").read_text()
+        config = self._workspace_config(name)
+        config.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(config, 0, 0)
+        os.chmod(config, 0o700)
+        self._write_file(config / "authorized_keys", client_public, 0o600, 0, 0)
+        self._write_file(config / "ssh_host_ed25519_key", host_key, 0o600, 0, 0)
+        self._write_file(config / "litellm_key", workspace_key + "\n", 0o600, 0, 0)
+        ssh = self._home(name) / "ssh"
+        ssh.mkdir(mode=0o700, exist_ok=True)
+        uid, gid = self.settings.uid, self.settings.gid
+        os.chown(ssh, uid, gid)
+        self._write_file(ssh / "id_ed25519", client_key, 0o600, uid, gid)
+        # Drop the comment, which known_hosts would read as a marker or host name.
+        host_entry = " ".join(host_public.split()[:2])
+        self._write_file(ssh / "known_hosts", f"[workspace-{name}]:{WORKSPACE_SSH_PORT} {host_entry}\n", 0o644, uid, gid)
+
+    @staticmethod
+    def _write_file(path: Path, content: str, mode: int, uid: int, gid: int) -> None:
+        """Atomically replace `path`, setting mode and owner before it becomes visible."""
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.chown(tmp, uid, gid)
+        os.replace(tmp, path)
 
     def _prepare_home(self, name: str) -> None:
         home = self._home(name)
@@ -384,9 +462,4 @@ class Agents:
             else:
                 lines.append(line)
         lines.extend(f"{var}={value}" for var, value in pending.items() if value is not None)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".env.")
-        with os.fdopen(fd, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        os.chmod(tmp, 0o600)
-        os.chown(tmp, self.settings.uid, self.settings.gid)
-        os.replace(tmp, path)
+        self._write_file(path, "\n".join(lines) + "\n", 0o600, self.settings.uid, self.settings.gid)

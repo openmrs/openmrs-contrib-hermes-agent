@@ -17,12 +17,22 @@ from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLAC
 from .litellm import LiteLLMError
 
 RESTART_HINT = "Restart the agent to apply: docker compose restart agent-{name}"
+ROTATE_HINT = "Restart the agent and its workspace to apply: docker compose restart workspace-{name} agent-{name}"
 
-# The agent-<name> service for compose.yaml. tests/run.sh checks that agent-default in compose.yaml
-# matches this output and that the output passes the compose isolation checks.
+# The agent-<name> and workspace-<name> services for compose.yaml. tests/run.sh checks that
+# compose.yaml has this output for `default` and that the output passes the compose isolation checks.
 COMPOSE_SERVICE = """\
   agent-{name}:
     <<: *hermes-agent
+    environment:
+      <<: *hermes-agent-environment
+      TERMINAL_SSH_HOST: workspace-{name}
+    depends_on:
+      litellm:
+        condition: service_healthy
+      workspace-{name}:
+        condition: service_healthy
+        restart: true
     volumes:
       - type: volume
         source: agents-data
@@ -37,11 +47,28 @@ COMPOSE_SERVICE = """\
           subpath: {name}/.env
       - ./hermes/souls/{name}.md:/opt/data/SOUL.md:ro
       - ./hermes/config.yaml:/opt/data/config.yaml:ro
+
+  workspace-{name}:
+    <<: *workspace
+    environment:
+      <<: *workspace-environment
+      WORKSPACE_IDLE_MINUTES: "180"
+      WORKSPACE_KEEP_FILES: "false"
+    volumes:
+      - type: volume
+        source: workspace-config
+        target: /config
+        read_only: true
+        volume:
+          subpath: {name}
+      - workspace-cache:/cache
+      # Emptied whenever the workspace resets.
+      - /work
 """
 
 COMPOSE_STEPS = """\
 Next steps:
-  1. Add the block above under `services:` in compose.yaml.
+  1. Add the blocks above under `services:` in compose.yaml.
   2. Write the agent's identity in hermes/souls/{name}.md.
   3. docker compose run --rm admin create {name} ...  (if not done yet)
   4. docker compose up -d agent-{name}"""
@@ -56,12 +83,14 @@ def _agent_json(agent: Agent) -> dict:
         "name": agent.name,
         "provisioned": agent.provisioned,
         "keys": len(agent.key_hashes),
+        "workspace_keys": len(agent.workspace_key_hashes),
         "mcp_servers": agent.mcp_servers,
         "github_levels": agent.github_levels,
         "budget": agent.budget,
         "spend": agent.spend,
         "budget_resets": agent.budget_resets,
         "has_data": agent.has_data,
+        "has_workspace": agent.has_workspace,
         "env_set": agent.env_set,
     }
 
@@ -70,6 +99,9 @@ def _describe(agent: Agent) -> str:
     status = "active" if agent.provisioned else "no key"
     if len(agent.key_hashes) > 1:
         status += f" ({len(agent.key_hashes)} keys: interrupted rotation, run `rotate` to clean up)"
+    workspace = "ready" if agent.has_workspace and len(agent.workspace_key_hashes) == 1 else (
+        f"{len(agent.workspace_key_hashes)} keys: run `rotate` to clean up" if agent.workspace_key_hashes
+        else "no key: run `rotate`" if agent.provisioned else "none")
     slack = "set" if all(agent.env_set.get(var) for var in SLACK_REQUIRED_VARS) else "incomplete" if any(
         agent.env_set.get(var) for var in SLACK_VARS) else "not set"
     return "\n".join([
@@ -78,6 +110,7 @@ def _describe(agent: Agent) -> str:
         f"  mcp servers: {', '.join(agent.mcp_servers) or 'none'}",
         f"  github:      {', '.join(agent.github_levels) or 'none'}",
         f"  budget:      {agent.describe_budget()}",
+        f"  workspace:   {workspace}",
         f"  slack:       {slack}",
         f"  data:        {'present' if agent.has_data else 'none'}",
     ])
@@ -213,8 +246,8 @@ def run(args: argparse.Namespace, agents: Agents) -> int:
         print(RESTART_HINT.format(name=args.name))
     elif args.command == "rotate":
         agents.rotate(args.name)
-        print(f"Issued a new key for {args.name} and revoked the old one.")
-        print(RESTART_HINT.format(name=args.name))
+        print(f"Issued new keys for {args.name} and its workspace and revoked the old ones.")
+        print(ROTATE_HINT.format(name=args.name))
     elif args.command == "compose":
         print(COMPOSE_SERVICE.format(name=validate_name(args.name)), end="")
         print(COMPOSE_STEPS.format(name=args.name), file=sys.stderr)

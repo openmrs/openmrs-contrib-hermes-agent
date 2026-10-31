@@ -5,22 +5,21 @@ Usage:
   python3 tests/compose_isolation.py write-secrets DIR/secrets
   docker compose --project-directory DIR -f compose.yaml config --format json | python3 tests/compose_isolation.py
 
-Compose 2.x always merges env files into `environment` and drops `env_file` from `config` output,
-so secret files can't be checked by path. Instead, `write-secrets` writes placeholder secret files
-that each set one marker variable, and the checks look for those markers in each service's
-environment. Run `config` against a project directory holding only those placeholders: a required
-env file that isn't one of them makes `config` fail.
+Compose 2.x merges env files into `environment` and drops `env_file` from `config` output, so
+secret files can't be checked by path. `write-secrets` writes placeholder secret files that each set
+one marker variable, and the checks look for markers in each service's environment. Run `config` in
+a directory holding only those placeholders, so any other required env file makes it fail.
 
-Checks every `agent-*` service (so newly added agents are covered), plus admin, litellm, postgres,
-github-token, and sandbox.
+Every `agent-*` and `workspace-*` service is checked, so newly added agents are covered.
 """
 
 import json
 import os
 import sys
 
-AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
-                     "GIT_COMMITTER_EMAIL"}
+AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT", "TERMINAL_SSH_HOST"}
+WORKSPACE_ENV_ALLOWED = {"WORKSPACE_IDLE_MINUTES", "WORKSPACE_KEEP_FILES", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                         "GIT_COMMITTER_EMAIL"}
 # Secret files and the only services allowed to receive them.
 SECRET_FILES = {
     "litellm.env": {"litellm"},
@@ -77,7 +76,12 @@ for name, service in sorted(agents.items()):
     # Also catches env files, whose variables are merged into the environment.
     extra = set((service.get("environment") or {}).keys()) - AGENT_ENV_ALLOWED
     check(f"{name}: no extra environment variables", not extra, sorted(extra))
-    check(f"{name}: only on the agents network", network_names(service) == {"agents"}, sorted(network_names(service)))
+    check(f"{name}: only on the agents and workspaces networks", network_names(service) == {"agents", "workspaces"},
+          sorted(network_names(service)))
+    check(f"{name}: runs commands in workspace-{expected_subpath}",
+          (service.get("environment") or {}).get("TERMINAL_SSH_HOST") == f"workspace-{expected_subpath}"
+          and f"workspace-{expected_subpath}" in services,
+          (service.get("environment") or {}).get("TERMINAL_SSH_HOST"))
     service_mounts = mounts(service)
     agents_data = [m for m in service_mounts if m.get("source") == "agents-data"]
     data = [m for m in agents_data if m.get("target") == "/opt/data"]
@@ -109,6 +113,34 @@ for name, service in sorted(agents.items()):
               f"{subpath!r} also used by {subpaths.get(subpath)}")
         subpaths[subpath] = name
 
+workspaces = {name: s for name, s in services.items() if name.startswith("workspace-")}
+check("one workspace per agent", sorted(workspaces) == sorted(f"workspace-{a[len('agent-'):]}" for a in agents),
+      sorted(workspaces))
+config_subpaths = {}
+for name, service in sorted(workspaces.items()):
+    expected_subpath = name[len("workspace-"):]
+    extra = set((service.get("environment") or {}).keys()) - WORKSPACE_ENV_ALLOWED
+    check(f"{name}: no extra environment variables", not extra, sorted(extra))
+    check(f"{name}: only on the workspaces and workspace-egress networks",
+          network_names(service) == {"workspaces", "workspace-egress"}, sorted(network_names(service)))
+    check(f"{name}: no published ports", not service.get("ports"), service.get("ports"))
+    check(f"{name}: read-only root filesystem", service.get("read_only") is True, service.get("read_only"))
+    service_mounts = mounts(service)
+    configs = [m for m in service_mounts if m.get("source") == "workspace-config"]
+    caches = [m for m in service_mounts if m.get("source") == "workspace-cache" and m.get("target") == "/cache"]
+    work = [m for m in service_mounts if m.get("target") == "/work" and not m.get("source")]
+    check(f"{name}: mounts only its own workspace-config subdirectory, the cache, and an anonymous /work",
+          len(service_mounts) == 3 and len(configs) == 1 and len(caches) == 1 and len(work) == 1, service_mounts)
+    check(f"{name}: workspace-config subdirectory is {expected_subpath!r}, read-only",
+          len(configs) == 1 and configs[0].get("type") == "volume" and configs[0].get("read_only") is True
+          and configs[0].get("target") == "/config"
+          and (configs[0].get("volume") or {}).get("subpath") == expected_subpath, configs)
+    for m in configs:
+        subpath = (m.get("volume") or {}).get("subpath")
+        check(f"{name}: workspace-config subpath not shared", subpath not in config_subpaths,
+              f"{subpath!r} also used by {config_subpaths.get(subpath)}")
+        config_subpaths[subpath] = name
+
 for name, service in services.items():
     check(f"{name}: no-new-privileges", "no-new-privileges:true" in (service.get("security_opt") or []),
           service.get("security_opt"))
@@ -117,6 +149,8 @@ for name, service in services.items():
     for m in mounts(service):
         if m.get("source") == "agents-data" and not (m.get("volume") or {}).get("subpath"):
             check(f"{name}: whole agents-data volume mounted only by admin", name == "admin", m)
+        if m.get("source") == "workspace-config" and not (m.get("volume") or {}).get("subpath"):
+            check(f"{name}: whole workspace-config volume mounted only by admin", name == "admin", m)
         if str(m.get("source", "")).endswith("docker.sock"):
             check(f"{name}: no Docker socket", False, m)
     for secret in secrets(service):
@@ -138,7 +172,7 @@ check("postgres: no published ports", not postgres.get("ports"), postgres.get("p
 check("github-token service exists", bool(github_token))
 check("github-token: only secrets/github-app.env",
       secrets(github_token) == ["github-app.env"], secrets(github_token))
-check("github-token: only on the agents network", network_names(github_token) == {"agents"},
+check("github-token: only on the agents and workspaces networks", network_names(github_token) == {"agents", "workspaces"},
       sorted(network_names(github_token)))
 check("github-token: no published ports", not github_token.get("ports"), github_token.get("ports"))
 github_mounts = mounts(github_token)
@@ -146,16 +180,13 @@ check("github-token: only mounts github-token/levels.json, read-only",
       len(github_mounts) == 1 and github_mounts[0].get("read_only") is True
       and str(github_mounts[0].get("source", "")).replace("\\", "/").endswith("/github-token/levels.json"),
       github_mounts)
-sandbox = services.get("sandbox", {})
-check("sandbox service exists", bool(sandbox))
-check("sandbox: no environment or env files", not sandbox.get("environment"), sandbox.get("environment"))
-check("sandbox: only on the sandbox network", network_names(sandbox) == {"sandbox"}, sorted(network_names(sandbox)))
-check("sandbox: no published ports", not sandbox.get("ports"), sandbox.get("ports"))
-check("sandbox: read-only root filesystem", sandbox.get("read_only") is True, sandbox.get("read_only"))
-check("sandbox: only its own work and cache volumes",
-      sorted(m.get("source") for m in mounts(sandbox)) == ["sandbox-cache", "sandbox-work"], mounts(sandbox))
-check("sandbox network: only litellm and sandbox",
-      sorted(name for name, s in services.items() if "sandbox" in network_names(s)) == ["litellm", "sandbox"])
+check("workspaces network is internal", networks.get("workspaces", {}).get("internal") is True,
+      networks.get("workspaces"))
+check("workspaces network: only agents, workspaces, and github-token",
+      all(name.startswith(("agent-", "workspace-")) or name == "github-token"
+          for name, s in services.items() if "workspaces" in network_names(s)))
+check("workspace-egress network: only workspaces",
+      all(name.startswith("workspace-") for name, s in services.items() if "workspace-egress" in network_names(s)))
 check("litellm-db network is internal", networks.get("litellm-db", {}).get("internal") is True, networks.get("litellm-db"))
 
 sys.exit(1 if failures else 0)

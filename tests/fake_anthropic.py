@@ -1,7 +1,7 @@
-"""Stand-in for Anthropic's Messages API, used by tests/run.sh to see what LiteLLM sends upstream.
+"""Stand-in for Anthropic's Messages API, so tests/run.sh can see what LiteLLM sends upstream.
 
-Logs one "anthropic request" line per call recording where cache_control markers were placed:
-on the system prompt, and on the final message. Replies with a fixed text message.
+Logs an "anthropic request" line per call saying whether the system prompt and the final message
+carry cache_control.
 """
 
 import json

@@ -1,9 +1,8 @@
 """Stand-in for the Atlassian Rovo MCP server, used by tests/run.sh.
 
-A minimal MCP streamable-HTTP endpoint (JSON responses, no streaming) with one tool, `whoami`,
-which reports which test service-account key LiteLLM injected: "read", "jira-write",
-"confluence-write", or "none". The key
-itself is never echoed.
+A minimal MCP streamable-HTTP endpoint (JSON responses, no streaming) whose one tool, `whoami`,
+reports which test key LiteLLM injected ("read", "jira-write", "confluence-write", or "none")
+without echoing it.
 """
 
 import json

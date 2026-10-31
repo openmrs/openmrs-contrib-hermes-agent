@@ -313,11 +313,12 @@ class AdminApp(App):
         def confirmed(ok: bool | None) -> None:
             if ok:
                 self._run("Rotate", lambda: self.agents.rotate(agent.name),
-                          f"New key issued. Restart it with: docker compose restart agent-{agent.name}")
+                          f"New keys issued. Restart with: docker compose restart workspace-{agent.name} agent-{agent.name}")
 
         self.push_screen(ConfirmDialog(
             f"Rotate {agent.name}'s key?",
-            "A new key is issued and the old one revoked. The agent stops working until it is restarted.",
+            "New keys are issued for the agent and its workspace, and the old ones revoked. The agent stops "
+            "working until both are restarted.",
             "Rotate"), confirmed)
 
     def action_delete(self) -> None:

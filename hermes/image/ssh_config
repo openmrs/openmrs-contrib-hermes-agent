@@ -1,0 +1,4 @@
+# Trust only the workspace host key the admin tool writes. Hermes' StrictHostKeyChecking=accept-new
+# still refuses a differing key, and /dev/null keeps it from remembering any other.
+GlobalKnownHostsFile /opt/data/ssh/known_hosts
+UserKnownHostsFile /dev/null

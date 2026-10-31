@@ -1,8 +1,7 @@
-"""Checks that every Hermes side task (auxiliary task) is routed to LiteLLM's `fast` model.
+"""Checks that every Hermes side task (auxiliary task) routes to LiteLLM's `fast` model.
 
-Runs inside the Hermes image with HERMES_HOME pointing at a directory holding hermes/config.yaml.
-Task names come from Hermes' built-in defaults, plugin registrations, and literal `task="..."`
-arguments in its source, then each is resolved with Hermes' own route resolver.
+Runs in the Hermes image with HERMES_HOME holding hermes/config.yaml. Tasks come from Hermes'
+defaults, plugin registrations, and literal `task="..."` arguments in its source.
 """
 
 import pathlib
@@ -47,9 +46,8 @@ base_url = str(getattr(client, "base_url", "")).rstrip("/")
 if base_url != EXPECTED_BASE_URL:
     failures.append(f"provider {EXPECTED_PROVIDER!r} resolves to base_url {base_url!r}, expected {EXPECTED_BASE_URL!r}")
 
-# Some tasks don't use the auxiliary resolver above: they build a full runtime with
-# resolve_runtime_provider, and quietly fall back to the main model (`auto`) if that fails.
-# Check them through their own entry points.
+# Some tasks build a full runtime with resolve_runtime_provider instead, silently falling back to
+# the main model (`auto`) if it fails, so check them through their own entry points.
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
 
 runtime = resolve_runtime_provider(requested=EXPECTED_PROVIDER, target_model=EXPECTED_MODEL)

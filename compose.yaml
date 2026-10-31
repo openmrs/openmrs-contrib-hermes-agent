@@ -1,21 +1,20 @@
 # Hermes agents behind a LiteLLM gateway.
 #
-# Secret boundary: provider API keys, Atlassian (Rovo) keys, and the database password exist only
-# in the litellm and postgres containers. The LiteLLM master key exists only in litellm and the
-# on-demand admin container. GitHub App private keys exist only in github-token, which hands agents
-# short-lived tokens for the access levels they've been granted. Each agent holds just its own
-# LiteLLM virtual key and Slack tokens, in its own subdirectory of the agents-data volume. Builds
-# (including of untrusted pull requests) run in the sandbox, which holds no secrets. See README.md
-# for the threat model.
+# Secret boundary (threat model in README.md):
+#   - provider and Rovo keys, database password: litellm and postgres only
+#   - LiteLLM master key: litellm and the on-demand admin container only
+#   - GitHub App private keys: github-token only; agents get short-lived tokens for granted levels
+#   - each agent: only its own LiteLLM virtual key and Slack tokens
+#   - workspaces, where agents run everything (including untrusted PR builds): no agent secrets
 #
 # Networks:
-#   agents      - agents <-> litellm and github-token. Not internal, so agents (and litellm and
-#                 github-token) have internet egress.
+#   agents      - agents <-> litellm and github-token. Not internal: everything on it has egress.
 #   litellm-db  - litellm <-> postgres only. Internal: no egress and agents are not attached.
 #   admin       - admin <-> litellm only. Internal: the admin container can't reach agents,
 #                 Postgres, or the internet.
-#   sandbox     - sandbox <-> litellm only. Not internal, since builds download dependencies;
-#                 agents reach the sandbox only through LiteLLM's MCP gateway.
+#   workspaces  - agents <-> their workspaces (SSH), and workspaces <-> github-token. Internal.
+#                 Workspaces can't reach LiteLLM or Postgres.
+#   workspace-egress - workspaces' internet access, for dependencies and GitHub. Not internal.
 
 name: hermes
 
@@ -31,8 +30,8 @@ x-logging: &logging
 x-hermes-agent: &hermes-agent
   # Before changing the Hermes version, run tests/run.sh and follow the side-task checklist in
   # hermes/config.yaml (new Hermes versions can add side tasks that would bypass `fast`).
-  # The image is Hermes plus the GitHub CLI (hermes/image). Keep the version in `image` in step
-  # with HERMES_IMAGE, so a new version gets a fresh build.
+  # hermes/image is Hermes plus SSH settings for the workspace. Keep the `image` tag in step with
+  # HERMES_IMAGE so a new version gets a fresh build.
   build:
     context: ./hermes/image
     args:
@@ -40,24 +39,54 @@ x-hermes-agent: &hermes-agent
   image: hermes-agent:v0.22.5-local
   restart: unless-stopped
   logging: *logging
-  # The container starts as root only to set up the agent's home, then drops to the Hermes user.
-  # no-new-privileges stops anything the agent runs from regaining root through setuid binaries.
+  # Starts as root only to set up the agent's home, then drops to the Hermes user. no-new-privileges
+  # blocks regaining root through setuid binaries.
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID]
   command: ["gateway", "run"]
-  networks: [agents]
-  depends_on:
-    litellm:
-      condition: service_healthy
-  environment:
+  networks: [agents, workspaces]
+  environment: &hermes-agent-environment
     HERMES_UID: ${HERMES_UID:-10000}
     HERMES_GID: ${HERMES_GID:-10000}
+    # Hermes' file tools only write under this path; they run in the workspace, hence its /work.
+    HERMES_WRITE_SAFE_ROOT: /work
+
+# Each agent's workspace, where all its commands run (see workspace/supervisor.py). Its only secret
+# is a LiteLLM key that can get GitHub tokens for the agent's granted levels.
+x-workspace: &workspace
+  build: ./workspace
+  image: hermes-workspace:local
+  restart: unless-stopped
+  logging: *logging
+  # An init process reaps the processes the supervisor kills.
+  init: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  # Root only for sshd (SYS_CHROOT is for its privilege separation) and to kill and clean up after
+  # the workspace user.
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID, SYS_CHROOT]
+  read_only: true
+  tmpfs: ["/tmp:size=2g", "/run"]
+  networks: [workspaces, workspace-egress]
+  environment: &workspace-environment
+    # Resets after this many minutes with no one logged in: kills the workspace user's processes and,
+    # unless WORKSPACE_KEEP_FILES is "true", deletes /work.
+    WORKSPACE_IDLE_MINUTES: "180"
+    WORKSPACE_KEEP_FILES: "false"
     # The github_pr App's bot account, from ./.env; commits fail until both are set (see README.md).
     GIT_AUTHOR_NAME: ${GIT_BOT_NAME:-}
     GIT_AUTHOR_EMAIL: ${GIT_BOT_EMAIL:-}
     GIT_COMMITTER_NAME: ${GIT_BOT_NAME:-}
     GIT_COMMITTER_EMAIL: ${GIT_BOT_EMAIL:-}
+  mem_limit: 4g
+  cpus: 2
+  pids_limit: 4096
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 2222), timeout=3)"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
 
 services:
   postgres:
@@ -72,8 +101,7 @@ services:
     environment:
       POSTGRES_USER: litellm
       POSTGRES_DB: litellm
-    # Postgres 18+ images keep data in a versioned subdirectory (PGDATA=/var/lib/postgresql/18/docker),
-    # so the volume mounts at the parent to allow future pg_upgrade --link between major versions.
+    # Mounted at the parent of the versioned PGDATA (18/docker) so pg_upgrade --link works later.
     volumes:
       - postgres-data:/var/lib/postgresql
     healthcheck:
@@ -89,7 +117,7 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     command: ["--config", "/app/config.yaml", "--port", "4000"]
-    networks: [agents, litellm-db, admin, sandbox]
+    networks: [agents, litellm-db, admin]
     env_file: [secrets/litellm.env, secrets/master.env]
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
@@ -107,10 +135,9 @@ services:
       retries: 30
       start_period: 30s
 
-  # Mints short-lived GitHub App installation tokens for agents' `gh`, for the access levels in
-  # github-token/levels.json that each agent's LiteLLM key has been granted. The Apps' private keys
-  # stay here. secrets/github-app.env is optional: a level without credentials answers 503, and the
-  # rest of the stack works as before.
+  # Mints short-lived GitHub App tokens for the levels in github-token/levels.json that an agent's
+  # LiteLLM key has been granted. The Apps' private keys stay here. secrets/github-app.env is
+  # optional: a level without credentials answers 503.
   github-token:
     build: ./github-token
     image: hermes-github-token:local
@@ -120,7 +147,7 @@ services:
     cap_drop: [ALL]
     read_only: true
     tmpfs: [/tmp]
-    networks: [agents]
+    networks: [agents, workspaces]
     env_file:
       - path: secrets/github-app.env
         required: false
@@ -132,48 +159,15 @@ services:
       timeout: 5s
       retries: 5
 
-  # Builds and tests openmrs repositories for agents, as the `sandbox` MCP server in LiteLLM (see
-  # sandbox/server.py). Builds run as an unprivileged user, and everything a job leaves outside
-  # /cache is removed when it ends. Holds no secrets and mounts no agent data.
-  sandbox:
-    build: ./sandbox
-    image: hermes-sandbox:local
-    restart: unless-stopped
-    logging: *logging
-    # An init process reaps the build processes the server kills.
-    init: true
-    security_opt: [no-new-privileges:true]
-    cap_drop: [ALL]
-    # Runs as root only to start builds as the build user, and to kill and clean up after them.
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID]
-    read_only: true
-    tmpfs: ["/tmp:size=2g"]
-    networks: [sandbox]
-    volumes:
-      # Job directories, emptied after every job.
-      - sandbox-work:/work
-      # Maven, npm, Yarn, pnpm, and Corepack caches, kept between jobs.
-      - sandbox-cache:/cache
-    mem_limit: 8g
-    cpus: 4
-    pids_limit: 4096
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Manages agents' keys, MCP and GitHub access, and Slack settings. Not started by
-  # `docker compose up`; run it with `docker compose run --rm admin` (interactive) or
-  # `... admin <command>`.
+  # Manages agents' keys, MCP and GitHub access, and Slack settings. Not started by `up`; use
+  # bin/admin.
   admin:
     build: ./admin
     image: hermes-admin:local
     profiles: [admin]
-    # Runs as root to create agents' directories and hand them to the Hermes user, and to read
-    # their .env files (mode 600, owned by that user).
-    # label=disable: on SELinux hosts, files an agent copies from its image keep that agent's own
-    # SELinux label, which would stop admin reading or purging them.
+    # Root to create agents' directories for the Hermes user and read their mode-600 .env files.
+    # label=disable: on SELinux hosts, files an agent copies from its image keep the agent's label,
+    # which would stop admin reading or purging them.
     security_opt: [no-new-privileges:true, label=disable]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
@@ -187,21 +181,32 @@ services:
       HERMES_GID: ${HERMES_GID:-10000}
     volumes:
       - agents-data:/agents
+      - workspace-config:/workspaces
       - ./github-token/levels.json:/templates/github-levels.json:ro
     depends_on:
       litellm:
         condition: service_healthy
 
-  # One service per agent, named agent-<name>, mounting only its own agents-data subdirectory,
-  # its own SOUL.md (Hermes' identity prompt), and the shared hermes/config.yaml. Both files are
-  # read-only so the agent can't rewrite its instructions or where its requests go. The agent's
-  # .env (its key and Slack settings) is mounted read-only over its own copy for the same reason;
-  # admin still writes it through the whole volume, and changes apply when the agent restarts.
-  # To add an agent, print its block with `docker compose run --rm admin compose <name>` and add
-  # it here, write hermes/souls/<name>.md, then run `docker compose run --rm admin create <name>`;
-  # the agent can't start until that has run.
+  # Two services per agent:
+  #   agent-<name>      its own agents-data subdirectory, SOUL.md (identity prompt), and the shared
+  #                     hermes/config.yaml
+  #   workspace-<name>  its own workspace-config subdirectory and the shared caches
+  # SOUL.md, config.yaml, and .env are read-only so the agent can't rewrite its instructions, where
+  # its requests go, or its key. admin writes .env through the whole volume; changes apply on agent
+  # restart. Restarting a workspace restarts its agent, so it forgets directories the reset removed.
+  # To add an agent: append `bin/admin compose <name>` output here, write hermes/souls/<name>.md,
+  # then run `bin/admin create <name>` (required before the agent can start).
   agent-default:
     <<: *hermes-agent
+    environment:
+      <<: *hermes-agent-environment
+      TERMINAL_SSH_HOST: workspace-default
+    depends_on:
+      litellm:
+        condition: service_healthy
+      workspace-default:
+        condition: service_healthy
+        restart: true
     volumes:
       - type: volume
         source: agents-data
@@ -217,18 +222,39 @@ services:
       - ./hermes/souls/default.md:/opt/data/SOUL.md:ro
       - ./hermes/config.yaml:/opt/data/config.yaml:ro
 
+  workspace-default:
+    <<: *workspace
+    environment:
+      <<: *workspace-environment
+      WORKSPACE_IDLE_MINUTES: "180"
+      WORKSPACE_KEEP_FILES: "false"
+    volumes:
+      - type: volume
+        source: workspace-config
+        target: /config
+        read_only: true
+        volume:
+          subpath: default
+      - workspace-cache:/cache
+      # Emptied whenever the workspace resets.
+      - /work
+
 networks:
   agents: {}
   litellm-db:
     internal: true
   admin:
     internal: true
-  sandbox: {}
+  workspaces:
+    internal: true
+  workspace-egress: {}
 
 volumes:
   postgres-data: {}
-  sandbox-work: {}
-  sandbox-cache: {}
-  # One subdirectory per agent (its Hermes home, including .env). Only the admin container mounts
-  # the whole volume.
+  # Maven, npm, Yarn, pnpm, and Corepack caches, shared by every workspace and kept across resets.
+  workspace-cache: {}
+  # Per agent: its workspace's SSH keys and LiteLLM key, written by admin. Each workspace mounts
+  # only its own; agents mount none of it.
+  workspace-config: {}
+  # Per agent: its Hermes home, including .env. Only admin mounts the whole volume.
   agents-data: {}

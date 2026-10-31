@@ -1,12 +1,12 @@
 """Checks for litellm/tier_classifier.py that need LiteLLM itself, used by tests/run.sh.
 
-Runs inside the litellm container (where tier_classifier.py is at /app) against real LiteLLM
-Router objects built here, not the proxy's running router:
+Runs in the litellm container (tier_classifier.py is at /app) against Routers built here, not the
+proxy's:
   - the LLM classifier refuses a router model (`auto`), an alias to one, and an unknown model;
-  - the Jev classifier is skipped without a `jev-router` model or a TypeSafe key, and otherwise
-    calls `jev-router` through the Router;
+  - Jev is skipped without a `jev-router` model or a TypeSafe key, and otherwise calls
+    `jev-router` through the Router;
   - delegates are rebuilt when the proxy replaces its Router, and reused otherwise;
-  - classify() declines immediately when re-entered from its own classifier call.
+  - classify() declines when re-entered from its own classifier call.
 """
 
 import asyncio

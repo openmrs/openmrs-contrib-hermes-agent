@@ -1,8 +1,6 @@
-# Compose override used by tests/run.sh. Replaces every secret with tests/fixtures values, swaps in
-# the generated mock LiteLLM config, and adds fake Jev, Rovo MCP, Anthropic, and GitHub endpoints, and
-# a git server standing in for GitHub for the sandbox.
-# TEST_WORK is a temporary directory created by run.sh, which also generates the GitHub App key pair
-# there. Agent data lives in this project's own agents-data volume.
+# Compose override for tests/run.sh: tests/fixtures secrets, the generated mock LiteLLM config,
+# fake Jev, Rovo, Anthropic, and GitHub endpoints, and a git server standing in for GitHub for the
+# workspace. TEST_WORK is run.sh's temporary directory.
 
 services:
   postgres:
@@ -35,16 +33,19 @@ services:
     volumes:
       - ${TEST_WORK}/github-levels.json:/app/levels.json:ro
 
-  sandbox:
+  # A short idle limit, so run.sh can watch a reset.
+  workspace-default:
     environment:
-      SANDBOX_GIT_BASE: git://fake-git:8005
+      WORKSPACE_IDLE_MINUTES: "1"
+      WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
+      WORKSPACE_POLL_SECONDS: "2"
 
-  # Serves the test repository run.sh creates with git daemon, from the sandbox image (which has
-  # git). Like GitHub, it speaks git's smart protocol, which the sandbox's partial clones need.
+  # Serves the test repository run.sh creates with git daemon, from the workspace image (which has
+  # git). Like GitHub, it speaks git's smart protocol, which partial clones need.
   # safe.directory: the repository belongs to the host user, not the container's.
   fake-git:
-    image: hermes-sandbox:local
-    networks: [sandbox]
+    image: hermes-workspace:local
+    networks: [workspaces]
     volumes:
       - ${TEST_WORK}/git:/srv:ro
     entrypoint: ["git", "-c", "safe.directory=*", "daemon", "--export-all", "--base-path=/srv", "--port=8005", "--reuseaddr"]

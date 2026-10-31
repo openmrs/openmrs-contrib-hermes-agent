@@ -1,18 +1,16 @@
-"""Derives the LiteLLM config used by tests/run.sh from litellm/config.yaml.
+"""Derives tests/run.sh's LiteLLM config from litellm/config.yaml.
 
 Usage: python3 tests/make_litellm_config.py <litellm/config.yaml> <output.yaml>
 
-The real config is kept as-is apart from five test changes:
-  - fast / balanced / strong get a mock_response naming the model, so a reply shows which tier
-    model the `auto` router chose, and no provider is called.
-  - `classifier-mock` (always classifies as REASONING) and `classifier-mock-invalid` (returns
-    text that isn't a classification) are added for the LLM classifier.
-  - the Rovo MCP URLs point at tests/fake_rovo.py, so no requests go to Atlassian.
-  - each tier entry is copied, unmocked, as `cache-check-<tier>` pointing at
-    tests/fake_anthropic.py, so the test can see the request LiteLLM actually sends upstream
-    (e.g. the prompt-cache markers).
-  - prompts are stored in the spend logs, so the test can check what reached the model (e.g.
-    SOUL.md).
+Changes from the real config:
+  - fast / balanced / strong get a mock_response naming the tier, so a reply shows which model
+    `auto` chose and no provider is called.
+  - `classifier-mock` (always REASONING) and `classifier-mock-invalid` (not a classification)
+    are added for the LLM classifier.
+  - Rovo MCP URLs point at tests/fake_rovo.py.
+  - each tier is copied, unmocked, as `cache-check-<tier>` against tests/fake_anthropic.py, to see
+    what LiteLLM sends upstream.
+  - prompts are stored in spend logs, so the test can check what reached the model.
 """
 
 import sys

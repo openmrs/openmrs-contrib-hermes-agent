@@ -1,9 +1,8 @@
 """Stand-in for GitHub's "create an installation access token" endpoint, used by tests/run.sh.
 
-Verifies the App JWT the way GitHub would (RS256 signature against /app/public.pem, issuer, and a
-lifetime of at most 10 minutes). Logs one "mint" line per request with the results and the
-requested permissions and repositories (as compact JSON), and answers with a numbered token that
-expires in an hour.
+Verifies the App JWT as GitHub would (RS256 against /app/public.pem, issuer, lifetime of at most 10
+minutes), logs a "mint" line with the results and the requested permissions and repositories, and
+answers with a numbered token.
 """
 
 import base64

@@ -1,0 +1,4 @@
+# Authenticate through the gh wrapper: a short-lived token for GH_LEVEL (e.g.
+# `GH_LEVEL=github_pr git push`), never stored.
+[credential "https://github.com"]
+	helper = !/usr/local/bin/gh auth git-credential

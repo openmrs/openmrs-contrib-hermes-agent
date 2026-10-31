@@ -1,4 +1,0 @@
-# git authenticates to GitHub through the gh wrapper, so pushes use a short-lived token for the
-# level in GH_LEVEL (e.g. `GH_LEVEL=github_pr git push`) and no credential is stored.
-[credential "https://github.com"]
-	helper = !/usr/local/bin/gh auth git-credential

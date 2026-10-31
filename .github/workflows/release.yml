@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The shared OpenMRS release scripts, pinned.
+  # Shared OpenMRS release scripts.
   GHA_WORKFLOWS_REPO: openmrs/openmrs-contrib-gha-workflows
   GHA_WORKFLOWS_SHA: d1ccdf0e943770b36bcd2f0c8c8275ffe8413c7c
 
@@ -99,8 +99,8 @@ jobs:
             exit 1
           fi
 
-      # Base for the release notes (the latest stable release older than this one), and whether this
-      # release is the newest stable one, which decides the :latest image tag and the Latest badge.
+      # Release-notes base (latest older stable release), and whether this is the newest stable
+      # release (decides :latest and the Latest badge).
       - name: Resolve previous release tag
         id: prev
         env:
@@ -146,8 +146,7 @@ jobs:
             exit 1
           fi
 
-      # github.token deliberately: a Release created with it raises no `release` event, so it can't
-      # set off other workflows.
+      # github.token deliberately: its Releases raise no `release` event, so trigger no workflows.
       - name: Create release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
