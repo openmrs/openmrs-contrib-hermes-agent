@@ -394,7 +394,7 @@ expect_ok "grant writer no servers" admin grant writer --no-mcp
 expect "--no-mcp removes access" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
 expect_ok "grant writer atlassian_confluence_write" admin grant writer --mcp atlassian_confluence_write
 expect "writer -> atlassian_confluence_write uses the Confluence write account" "confluence-write" \
-  "$(atlassian_call "$writer_key" "$atlassian_confluence_write_id")"
+  "$(atlassian_call "$writer_key" "$atlassian_confluence_write_id" confluence_update_page)"
 expect "writer -> atlassian_jira_write denied after regrant" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
 expect_ok "grant writer back to atlassian_jira_write" admin grant writer --mcp atlassian_jira_write
 expect "restored grant works" "jira-write" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"

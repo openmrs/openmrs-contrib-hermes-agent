@@ -210,11 +210,21 @@ Keys are scoped when created and can't be changed, so create each with all of it
 operation accepts either its classic scope or every one of its granular scopes; `mcp-atlassian` uses
 both kinds (Confluence's v2 API takes only granular scopes).
 
-| Key | Scopes |
+Each write server only has its own product's tools (an agent that needs both products' writes gets
+both write servers), so each write key only needs its product's scopes:
+
+| Scope set | Scopes |
 |---|---|
-| All three | Classic: `read:jira-work`, `read:jira-user`, `read:confluence-content.all`, `read:confluence-content.summary`, `read:confluence-space.summary`, `read:confluence-props`, `read:confluence-user`, `search:confluence`. Granular: `read:space:confluence`, `read:page:confluence`, `read:hierarchical-content:confluence`, `read:comment:confluence`, `read:attachment:confluence` |
-| `ATLASSIAN_JIRA_WRITE_API_KEY` adds | Granular: `write:issue:jira`, `write:issue.property:jira`, `write:comment:jira`, `write:comment.property:jira`, `write:attachment:jira`, `write:issue-link:jira`, `write:issue.remote-link:jira`, `read:issue.remote-link:jira`, `read:issue:jira`, `read:comment:jira`, `read:comment.property:jira`, `read:group:jira`, `read:project:jira`, `read:project-role:jira`, `read:user:jira`, `read:avatar:jira` |
-| `ATLASSIAN_CONFLUENCE_WRITE_API_KEY` adds | Granular: `write:page:confluence`, `write:comment:confluence`. Classic: `write:confluence-content`, `write:confluence-props` |
+| Jira read | Classic: `read:jira-work`, `read:jira-user` |
+| Confluence read | Classic: `read:confluence-content.all`, `read:confluence-content.summary`, `read:confluence-space.summary`, `read:confluence-props`, `read:confluence-user`, `search:confluence`. Granular: `read:space:confluence`, `read:page:confluence`, `read:hierarchical-content:confluence`, `read:comment:confluence`, `read:attachment:confluence` |
+| Jira write | Granular: `write:issue:jira`, `write:issue.property:jira`, `write:comment:jira`, `write:comment.property:jira`, `write:attachment:jira`, `write:issue-link:jira`, `write:issue.remote-link:jira`, `read:issue.remote-link:jira`, `read:issue:jira`, `read:comment:jira`, `read:comment.property:jira`, `read:group:jira`, `read:project:jira`, `read:project-role:jira`, `read:user:jira`, `read:avatar:jira` |
+| Confluence write | Granular: `write:page:confluence`, `write:comment:confluence`. Classic: `write:confluence-content`, `write:confluence-props` |
+
+| Key | Scope sets |
+|---|---|
+| `ATLASSIAN_READ_API_KEY` | Jira read, Confluence read |
+| `ATLASSIAN_JIRA_WRITE_API_KEY` | Jira read, Jira write |
+| `ATLASSIAN_CONFLUENCE_WRITE_API_KEY` | Confluence read, Confluence write |
 
 - **Never `write:jira-work`.** That classic scope also allows deleting issues; the granular Jira
   write scopes above don't, so the Jira write key can't delete whatever the account may do.

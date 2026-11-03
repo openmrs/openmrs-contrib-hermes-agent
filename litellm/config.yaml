@@ -95,7 +95,7 @@ mcp_servers:
     transport: http
     auth_type: bearer_token
     auth_value: os.environ/ATLASSIAN_JIRA_WRITE_API_KEY
-    # Read tools plus Jira comments, edits, transitions, new issues, and links.
+    # Jira only: read tools plus comments, edits, transitions, new issues, and links.
     allowed_tools:
       - jira_get_issue
       - jira_search
@@ -123,7 +123,7 @@ mcp_servers:
     transport: http
     auth_type: bearer_token
     auth_value: os.environ/ATLASSIAN_CONFLUENCE_WRITE_API_KEY
-    # Read tools plus Confluence pages, comments, and labels.
+    # Confluence only: read tools plus pages, comments, and labels.
     allowed_tools:
       - confluence_search
       - confluence_get_page
