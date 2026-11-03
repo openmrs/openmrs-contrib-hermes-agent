@@ -52,7 +52,7 @@ async def main():
         await pilot.press("n")
         await pilot.pause()
         app.screen.query_one("#name", Input).value = NAME
-        app.screen.query_one("#mcp", SelectionList).select("rovo_read")
+        app.screen.query_one("#mcp", SelectionList).select("atlassian_read")
         app.screen.query_one("#github", SelectionList).select("github_read")
         app.screen.query_one("#budget", Input).value = "25"
         # The dialog is taller than the test terminal, so this also checks it scrolls to its buttons.
@@ -62,7 +62,7 @@ async def main():
         await settle(app, pilot)
         created = {a.name: a for a in agents.list()}.get(NAME)
         check("create dialog issues a key with the chosen grants",
-              created is not None and created.provisioned and created.mcp_servers == ["rovo_read"]
+              created is not None and created.provisioned and created.mcp_servers == ["atlassian_read"]
               and created.github_levels == ["github_read"] and created.budget == 25,
               created)
         check("table shows the new agent", NAME in table_names(app), table_names(app))
@@ -71,8 +71,8 @@ async def main():
         await pilot.press("g")
         await pilot.pause()
         selection = app.screen.query_one("#mcp", SelectionList)
-        selection.deselect("rovo_read")
-        selection.select("rovo_jira_write")
+        selection.deselect("atlassian_read")
+        selection.select("atlassian_jira_write")
         app.screen.query_one("#github", SelectionList).deselect("github_read")
         budget = app.screen.query_one("#budget", Input)
         check("grant dialog shows the current budget", budget.value == "25", budget.value)
@@ -91,7 +91,7 @@ async def main():
         await settle(app, pilot)
         granted = agents.get(NAME)
         check("grant dialog replaces MCP and GitHub access and the budget",
-              granted.mcp_servers == ["rovo_jira_write"] and granted.github_levels == [] and granted.budget == 30,
+              granted.mcp_servers == ["atlassian_jira_write"] and granted.github_levels == [] and granted.budget == 30,
               (granted.mcp_servers, granted.github_levels, granted.budget))
 
         select_row(app, NAME)

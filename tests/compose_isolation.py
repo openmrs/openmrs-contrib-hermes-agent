@@ -26,7 +26,12 @@ SECRET_FILES = {
     "master.env": {"litellm", "admin"},
     "postgres.env": {"postgres"},
     "github-app.env": {"github-token"},
+    "atlassian.env": {"mcp-atlassian"},
 }
+# mcp-atlassian takes each caller's key per request; any credential variable here (e.g.
+# JIRA_API_TOKEN, ATLASSIAN_OAUTH_ACCESS_TOKEN, ALLOW_GLOBAL_CRED_FALLBACK) would let callers act
+# without one.
+MCP_ATLASSIAN_ENV_ALLOWED = {"ATLASSIAN_OAUTH_ENABLE", "TOOLSETS", "ENABLED_TOOLS"}
 
 
 def marker(secret):
@@ -185,6 +190,19 @@ check("workspaces network: only agents, workspaces, and github-token",
           for name, s in services.items() if "workspaces" in network_names(s)))
 check("workspace-egress network: only workspaces",
       all(name.startswith("workspace-") for name, s in services.items() if "workspace-egress" in network_names(s)))
+mcp_atlassian = services.get("mcp-atlassian", {})
+check("mcp-atlassian service exists", bool(mcp_atlassian))
+check("mcp-atlassian: only secrets/atlassian.env", secrets(mcp_atlassian) == ["atlassian.env"], secrets(mcp_atlassian))
+extra = set((mcp_atlassian.get("environment") or {}).keys()) - MCP_ATLASSIAN_ENV_ALLOWED - {marker("atlassian.env")}
+check("mcp-atlassian: no credentials or other extra environment variables", not extra, sorted(extra))
+check("mcp-atlassian: only on the atlassian network", network_names(mcp_atlassian) == {"atlassian"},
+      sorted(network_names(mcp_atlassian)))
+check("mcp-atlassian: no published ports", not mcp_atlassian.get("ports"), mcp_atlassian.get("ports"))
+check("mcp-atlassian: read-only root filesystem", mcp_atlassian.get("read_only") is True, mcp_atlassian.get("read_only"))
+check("mcp-atlassian: no mounts", not mounts(mcp_atlassian), mounts(mcp_atlassian))
+check("atlassian network: only litellm and mcp-atlassian",
+      sorted(name for name, s in services.items() if "atlassian" in network_names(s)) == ["litellm", "mcp-atlassian"],
+      sorted(name for name, s in services.items() if "atlassian" in network_names(s)))
 check("litellm-db network is internal", networks.get("litellm-db", {}).get("internal") is True, networks.get("litellm-db"))
 
 sys.exit(1 if failures else 0)

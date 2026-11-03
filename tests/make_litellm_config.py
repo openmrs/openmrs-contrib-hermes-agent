@@ -7,7 +7,7 @@ Changes from the real config:
     `auto` chose and no provider is called.
   - `classifier-mock` (always REASONING) and `classifier-mock-invalid` (not a classification)
     are added for the LLM classifier.
-  - Rovo MCP URLs point at tests/fake_rovo.py.
+  - atlassian_* MCP servers point at tests/fake_atlassian.py instead of mcp-atlassian.
   - each tier is copied, unmocked, as `cache-check-<tier>` against tests/fake_anthropic.py, to see
     what LiteLLM sends upstream.
   - prompts are stored in spend logs, so the test can check what reached the model.
@@ -16,7 +16,7 @@ Changes from the real config:
 import sys
 
 TIER_MODELS = ("FAST", "BALANCED", "STRONG")
-ROVO_URL = "url: https://mcp.atlassian.com/v2/mcp"
+ATLASSIAN_URL = "url: http://mcp-atlassian:9000/mcp"
 FAKE_ANTHROPIC = "http://fake-anthropic:8003"
 GENERAL_SETTINGS = "general_settings:\n"
 
@@ -65,9 +65,9 @@ def main(source: str, dest: str) -> None:
         sys.exit(f"{source}: expected exactly one 'model_list:' line")
     config = config.replace("model_list:\n", CLASSIFIER_MOCK + cache_checks, 1)
 
-    if ROVO_URL not in config:
-        sys.exit(f"{source}: expected Rovo MCP servers with '{ROVO_URL}'")
-    config = config.replace(ROVO_URL, "url: http://fake-rovo:8002/mcp")
+    if ATLASSIAN_URL not in config:
+        sys.exit(f"{source}: expected Atlassian MCP servers with '{ATLASSIAN_URL}'")
+    config = config.replace(ATLASSIAN_URL, "url: http://fake-atlassian:8002/mcp")
 
     if config.count(GENERAL_SETTINGS) != 1:
         sys.exit(f"{source}: expected exactly one 'general_settings:' line")

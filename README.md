@@ -2,7 +2,7 @@
 
 Docker Compose stack that runs [Hermes Agent](https://github.com/NousResearch/hermes-agent) behind a
 local [LiteLLM](https://github.com/BerriAI/litellm) gateway. LiteLLM holds every real credential (LLM
-providers and MCP integrations such as Atlassian Rovo); each agent holds only a LiteLLM virtual key
+providers and MCP integrations such as Jira and Confluence); each agent holds only a LiteLLM virtual key
 and its own Slack tokens. Everything an agent runs (its terminal, file tools, and code execution)
 runs in its own workspace container, which holds none of those. A `github-token` service hands out
 short-lived GitHub App tokens, and an on-demand admin container manages agents.
@@ -13,7 +13,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
  │ agent-<name>  │ ──────────────────────▶ │  litellm  │
  │ LiteLLM key   │   MCP: /mcp/<server>    │ all real  │ ──▶ MCP servers (credentials
  │ Slack tokens  │ ──────────────────────▶ │  secrets  │     injected here)
- └───────┬───────┘                         └──┬─────┬──┘
+ └───────┬───────┘                         └──┬─────┬──┘ ── atlassian network ──▶ mcp-atlassian
+         │                                    │     │      (no credentials) ──▶ Jira, Confluence
          │ SSH (workspaces       litellm-db   │     │ admin network
          │ network, internal)    (internal)   │     │ (internal)
          ▼                              ┌─────┴───┐ ┌┴─────────────────┐
@@ -31,6 +32,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
   - `secrets/postgres.env` → `postgres`.
   - `secrets/master.env` (LiteLLM master key) → `litellm` and `admin`.
   - `secrets/github-app.env` (GitHub App private keys) → `github-token`.
+  - `secrets/atlassian.env` (the Atlassian site) → `mcp-atlassian`, which holds no credentials:
+    LiteLLM sends the granted server's Atlassian key with each request.
   - An agent's LiteLLM key and Slack tokens → its `.env` in its own `agents-data` subdirectory,
     which only it (and `admin`) mounts.
 - **Agents run nothing themselves.** Hermes' `ssh` terminal backend sends the terminal, file tools,
@@ -67,9 +70,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
     pass secrets to build steps. Never give the App the Workflows permission.
 - **MCP access is per server.** Each server in `litellm/config.yaml` has its own credential, and
   each key lists the servers it may use. Name servers `<integration>_<level>` with a separately
-  scoped service account each (e.g. `rovo_read`, `rovo_jira_write`, `rovo_confluence_write`); the
-  provider-side scopes are the real boundary.
-- **Jira and Confluence writes need approval.** The Rovo write servers are `trust: untrusted` in
+  scoped key each (e.g. `atlassian_read`, `atlassian_jira_write`, `atlassian_confluence_write`). 
+- **Jira and Confluence writes need approval.** The Atlassian write servers are `trust: untrusted` in
   `hermes/config.yaml`, so Hermes asks in Slack before any tool not annotated read-only. Hermes
   enforces this, not LiteLLM, which is why workspaces don't get the agent's key.
 - **Minimal privileges.** Every service has `no-new-privileges` and drops all capabilities, adding
@@ -84,9 +86,7 @@ SSH as an unprivileged user. It has JDKs 8, 11, 17, and 21, Maven, Node with Yar
 and `gh`.
 
 - **No agent secrets.** It holds its own SSH host key and a *workspace key*: a LiteLLM key that
-  may only call `/key/info` (no models, no MCP servers) and carries the agent's GitHub grants. Code
-  in the workspace can therefore get GitHub tokens for those levels, but can't spend the agent's
-  budget or use its MCP servers.
+  may only call `/key/info` (no models, no MCP servers) and carries the agent's GitHub grants.
 - **Pinned and private.** The agent trusts only the host key admin wrote to its `ssh/known_hosts`,
   and the workspace accepts only the agent's key. The workspace's config is root-only.
 - **Networks.** `workspaces` (internal: agents, workspaces, `github-token`) and `workspace-egress`
@@ -94,8 +94,7 @@ and `gh`.
 - **Reset when idle.** After `WORKSPACE_IDLE_MINUTES` (default 180, set per agent in
   `compose.yaml`) with no SSH session, the workspace kills all its user's processes and deletes
   their files. Only logged-in sessions count as activity, so a leftover process can't keep it
-  alive. The Maven, npm, Yarn, and pnpm caches are shared by all workspaces and kept: a malicious
-  build could poison them to skew later builds, but there's nothing in them to steal.
+  alive. The Maven, npm, Yarn, and pnpm caches are shared by all workspaces and kept.
 - **Permanent files.** With `WORKSPACE_KEEP_FILES: "true"` (per agent), a reset still kills
   processes but keeps `/work` (home, clones), including across restarts, though not when the
   container is recreated. Anything a malicious build planted there, such as a git hook, stays until
@@ -111,8 +110,7 @@ and `gh`.
   replies.
 - **Hermes** deletes a session (every message and tool call) 30 days after its last activity, but
   only once the session has ended (`sessions` in `hermes/config.yaml`). Slack sessions don't end
-  when idle or when the agent restarts, so most are kept indefinitely. `MEMORY.md` notes are kept
-  until removed; `SOUL.md` limits what goes in them.
+  when idle or when the agent restarts, so most are kept indefinitely.
 - **Container logs** are capped at 30 MB per container.
 
 ## Prerequisites
@@ -126,20 +124,22 @@ whichever is available.
 
 ## Setup
 
-1. **MCP service accounts:** an Atlassian org admin enables API-token authentication for the Rovo
-   MCP server (Atlassian Administration → Rovo → Rovo MCP server → Authentication). Create one
-   service account and API key per level: read both products; read both, write Jira; read both,
-   write Confluence.
+1. **Atlassian keys:** create an Atlassian service account with access to Jira and Confluence, and
+   one API key on it per level (see [Atlassian keys](#atlassian-keys) for the scopes). Give the
+   account only the Jira and Confluence permissions agents should have: keys can't be narrower than
+   it in practice, and the account, not the key, decides which projects and spaces it can see and
+   edit.
 2. **Secrets:**
    ```sh
    cp secrets/litellm.env.example secrets/litellm.env
    cp secrets/postgres.env.example secrets/postgres.env
    cp secrets/master.env.example secrets/master.env
+   cp secrets/atlassian.env.example secrets/atlassian.env
    chmod 600 secrets/*.env
-   # Fill in all three. The Postgres password must match in DATABASE_URL and POSTGRES_PASSWORD.
+   # Fill in all four. The Postgres password must match in DATABASE_URL and POSTGRES_PASSWORD.
    ```
-   `TYPESAFE_API_KEY` is optional. Each `ROVO_*_API_KEY` is only needed if an agent will be granted
-   that server; admin refuses to grant one without it.
+   `TYPESAFE_API_KEY` is optional. Each `ATLASSIAN_*_API_KEY` is only needed if an agent will be
+   granted that server; admin refuses to grant one without it.
 3. **Models:** set `LLM_MODEL_FAST`, `LLM_MODEL_BALANCED`, `LLM_MODEL_STRONG`, and the provider's
    key in `secrets/litellm.env`. Agents use `auto`, which picks a tier per request:
 
@@ -179,7 +179,7 @@ whichever is available.
    with the ID from `gh api 'users/<app-slug>[bot]' --jq .id`.
 5. **Create the agent:**
    ```sh
-   bin/admin create default --mcp rovo_jira_write,rovo_confluence_write --github github_read
+   bin/admin create default --mcp atlassian_jira_write,atlassian_confluence_write --github github_read
    ```
    This starts LiteLLM and Postgres if needed. Add `github_pr` to `--github` to let it open pull
    requests.
@@ -203,6 +203,27 @@ whichever is available.
 7. **Start:** `docker compose up -d`
 
 LiteLLM's admin UI is at http://127.0.0.1:4000/ui (host-only); log in with the master key.
+
+### Atlassian keys
+
+Keys are scoped when created and can't be changed, so create each with all of its scopes. An
+operation accepts either its classic scope or every one of its granular scopes; `mcp-atlassian` uses
+both kinds (Confluence's v2 API takes only granular scopes).
+
+| Key | Scopes |
+|---|---|
+| All three | Classic: `read:jira-work`, `read:jira-user`, `read:confluence-content.all`, `read:confluence-content.summary`, `read:confluence-space.summary`, `read:confluence-props`, `read:confluence-user`, `search:confluence`. Granular: `read:space:confluence`, `read:page:confluence`, `read:hierarchical-content:confluence`, `read:comment:confluence`, `read:attachment:confluence` |
+| `ATLASSIAN_JIRA_WRITE_API_KEY` adds | Granular: `write:issue:jira`, `write:issue.property:jira`, `write:comment:jira`, `write:comment.property:jira`, `write:attachment:jira`, `write:issue-link:jira`, `write:issue.remote-link:jira`, `read:issue.remote-link:jira`, `read:issue:jira`, `read:comment:jira`, `read:comment.property:jira`, `read:group:jira`, `read:project:jira`, `read:project-role:jira`, `read:user:jira`, `read:avatar:jira` |
+| `ATLASSIAN_CONFLUENCE_WRITE_API_KEY` adds | Granular: `write:page:confluence`, `write:comment:confluence`. Classic: `write:confluence-content`, `write:confluence-props` |
+
+- **Never `write:jira-work`.** That classic scope also allows deleting issues; the granular Jira
+  write scopes above don't, so the Jira write key can't delete whatever the account may do.
+- **Never `delete:*` or `manage:*` scopes**, or any `*:agent-interface` scope (those are for
+  Atlassian's own Rovo MCP server, which this stack doesn't use).
+- **Check a key** with the public endpoints: `myself` should name the service account, not answer
+  401, e.g.
+  `curl -H "Authorization: Bearer $KEY" https://api.atlassian.com/ex/jira/<cloud ID>/rest/api/3/myself`.
+  An invalid key reads public content as an anonymous user, so a successful read proves nothing.
 
 ### Host settings
 
@@ -276,6 +297,7 @@ digest of the tag's multi-platform index (`docker buildx imagetools inspect <ima
   `hermes/config.yaml`: new side tasks must be routed to `fast`, and `_config_version` must match
   the image, because agents can't write their `config.yaml`.
 - **LiteLLM:** the `litellm` image. `litellm/tier_classifier.py` depends on its internals (tested).
+- **mcp-atlassian:** the `mcp-atlassian` image.
 - **Python:** the base image in the `admin/`, `github-token/`, and `workspace/` Dockerfiles.
 - **Workspace toolchain:** the JDK, Node, Maven, and GitHub CLI pins in `workspace/Dockerfile`.
 - **Postgres:** a major version also needs `pg_upgrade` or a dump and restore; the volume is
@@ -303,7 +325,7 @@ GitHub Actions publishes images for `linux/amd64` and `linux/arm64` to Docker Hu
 # Only LITELLM_API_KEY and SLACK_* should be listed
 docker compose exec agent-default sh -c 'cut -d= -f1 /opt/data/.env; env | cut -d= -f1' | grep -E "KEY|TOKEN|SECRET|PASS"
 # Lists the server's tools if granted, fails otherwise
-bin/agent default mcp test rovo_read
+bin/agent default mcp test atlassian_read
 # Should fail with "Virtual key is not allowed to call this route"
 docker compose exec agent-default sh -c \
   '. /opt/data/.env; curl -s -X POST -H "Authorization: Bearer $LITELLM_API_KEY" http://litellm:4000/key/generate'
@@ -320,6 +342,6 @@ tests/run.sh                          # uses "docker compose"
 COMPOSE=docker-compose tests/run.sh   # e.g. with Podman
 ```
 
-It uses fake credentials and fake model, Jev, Rovo, Anthropic, and GitHub endpoints, runs as a
+It uses fake credentials and fake model, Jev, Atlassian, Anthropic, and GitHub endpoints, runs as a
 separate Compose project that cleans up after itself, and takes about 5 minutes. CI runs it on every
 pull request and push to `main` that changes more than `README.md`.

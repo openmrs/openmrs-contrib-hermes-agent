@@ -1,5 +1,5 @@
 # Compose override for tests/run.sh: tests/fixtures secrets, the generated mock LiteLLM config,
-# fake Jev, Rovo, Anthropic, and GitHub endpoints, and a git server standing in for GitHub for the
+# fake Jev, Atlassian, Anthropic, and GitHub endpoints, and a git server standing in for GitHub for the
 # workspace. TEST_WORK is run.sh's temporary directory.
 
 services:
@@ -18,7 +18,10 @@ services:
       ROUTER_CLASSIFIERS: ${TEST_ROUTER_CLASSIFIERS:-jev,llm}
       ROUTER_CLASSIFIER_MODEL: ${TEST_ROUTER_CLASSIFIER_MODEL:-classifier-mock}
       TYPESAFE_API_KEY: ${TEST_TYPESAFE_API_KEY-test-typesafe-key}
-      ROVO_JIRA_WRITE_API_KEY: ${TEST_ROVO_JIRA_WRITE_API_KEY-test-rovo-jira-write-key}
+      ATLASSIAN_JIRA_WRITE_API_KEY: ${TEST_ATLASSIAN_JIRA_WRITE_API_KEY-test-atlassian-jira-write-key}
+
+  mcp-atlassian:
+    env_file: !override [tests/fixtures/atlassian.env]
 
   admin:
     env_file: !override [tests/fixtures/master.env]
@@ -57,12 +60,13 @@ services:
       - ./tests/fake_jev.py:/app/fake_jev.py:ro
     command: ["python", "-u", "/app/fake_jev.py"]
 
-  fake-rovo:
+  # Behind LiteLLM in place of mcp-atlassian, on the same network.
+  fake-atlassian:
     image: python:3.12-slim
-    networks: [agents]
+    networks: [atlassian]
     volumes:
-      - ./tests/fake_rovo.py:/app/fake_rovo.py:ro
-    command: ["python", "-u", "/app/fake_rovo.py"]
+      - ./tests/fake_atlassian.py:/app/fake_atlassian.py:ro
+    command: ["python", "-u", "/app/fake_atlassian.py"]
 
   fake-anthropic:
     image: python:3.12-slim

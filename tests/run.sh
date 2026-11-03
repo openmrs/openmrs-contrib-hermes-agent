@@ -6,7 +6,7 @@
 #
 # Usage: tests/run.sh
 #
-# Uses fake credentials, mock models, and fake Jev, Rovo, Anthropic, and GitHub endpoints, so
+# Uses fake credentials, mock models, and fake Jev, Atlassian, Anthropic, and GitHub endpoints, so
 # nothing reaches a real provider. Runs as its own Compose project ("hermes-test") and removes its
 # containers and volumes on exit, so a running stack is untouched. Needs Docker Compose 2.24.4+
 # (for !override) and python3, openssl, shasum, base64, and git on the host.
@@ -16,8 +16,9 @@
 #      and only the capabilities it needs (static).
 #   2. Admin tool: create/grant/rotate/slack/delete; key lockdown (no management API, no provider
 #      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
-#      rotation; per-key MCP access with the right credential; root-only workspace configuration;
-#      the interactive interface.
+#      rotation; per-key MCP access with the right credential and only that server's tools;
+#      mcp-atlassian serves exactly the allowed tools and refuses requests without a key; root-only
+#      workspace configuration; the interactive interface.
 #   3. Every Hermes side task, including background review and curator, uses LiteLLM's `fast`.
 #   4. `auto` classifier chain: Jev decides; if Jev fails, the LLM classifier does.
 #   5. Hermes end to end: `auto` context length is 768000; chat goes through the router; titles
@@ -182,12 +183,13 @@ expect_route_denied() {
   fi
 }
 
-# Calls fake Rovo's `whoami` on one MCP server; prints the account LiteLLM used
-# (read/jira-write/confluence-write/none), "denied", or "error <status>: <body>".
-rovo_whoami() {
-  local key="$1" server_id="$2" status
+# Calls a tool on tests/fake_atlassian.py through one MCP server; prints the account LiteLLM used
+# (read/jira-write/confluence-write/none), "denied" (key not granted the server), or
+# "error <status>: <body>" (including a tool the server doesn't allow).
+atlassian_call() {
+  local key="$1" server_id="$2" tool="${3:-jira_get_issue}" status
   status="$(request POST /mcp-rest/tools/call "$key" \
-    "{\"server_id\": \"$server_id\", \"name\": \"whoami\", \"arguments\": {}}")"
+    "{\"server_id\": \"$server_id\", \"name\": \"$tool\", \"arguments\": {}}")"
   python3 - "$TEST_WORK/body" "$status" <<'EOF'
 import json, sys
 body, status = open(sys.argv[1]).read(), sys.argv[2]
@@ -195,13 +197,19 @@ try:
     data = json.loads(body)
 except ValueError:
     data = {}
-if isinstance(data, dict) and data.get("content"):
+if isinstance(data, dict) and data.get("content") and not data.get("isError"):
     print(data["content"][0].get("text"))
 elif "access_denied" in body or "not allowed to access" in body:
     print("denied")
 else:
     print(f"error {status}: {body[:150]}")
 EOF
+}
+
+# How many calls to a tool have reached tests/fake_atlassian.py, to check a refused call never got
+# upstream.
+fake_atlassian_calls() {
+  log_count_fixed fake-atlassian "atlassian call tool=$1 "
 }
 
 # Prints a field of one agent from `admin show --json`.
@@ -256,19 +264,20 @@ fi
 
 echo "== Starting LiteLLM"
 compose --profile admin build admin agent-default workspace-default github-token >/dev/null
-compose up -d --wait --wait-timeout 180 postgres litellm github-token fake-jev fake-rovo fake-anthropic \
+compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-token fake-jev fake-atlassian \
+  fake-anthropic \
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
-expect "servers lists the configured MCP servers" '["rovo_confluence_write", "rovo_jira_write", "rovo_read"]' "$(admin servers --json)"
+expect "servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read"]' "$(admin servers --json)"
 expect "levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin levels --json)"
-expect_ok "create default (rovo_read, github_read, with Slack)" admin_stdin \
+expect_ok "create default (atlassian_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
-  create default --mcp rovo_read --github github_read --slack-from-stdin
-expect_ok "create writer (rovo_jira_write, \$50 budget)" admin create writer --mcp rovo_jira_write --budget 50
+  create default --mcp atlassian_read --github github_read --slack-from-stdin
+expect_ok "create writer (atlassian_jira_write, \$50 budget)" admin create writer --mcp atlassian_jira_write --budget 50
 expect_ok "create nobody (no MCP)" admin create nobody
-expect_refused "create refuses an existing agent" admin create default --mcp rovo_read
-expect_refused "create refuses an unknown MCP server" admin create typo --mcp rovo_raed
+expect_refused "create refuses an existing agent" admin create default --mcp atlassian_read
+expect_refused "create refuses an unknown MCP server" admin create typo --mcp atlassian_raed
 expect "unknown MCP server: no agent created" "" "$(admin list --json | python3 -c 'import json, sys; print(",".join(a["name"] for a in json.load(sys.stdin) if a["name"] == "typo"))')"
 expect_refused "create refuses an unknown GitHub level" admin create typo --github github_raed
 expect_refused "create refuses an invalid name" admin create Bad_Name
@@ -276,7 +285,7 @@ expect_refused "create refuses a zero budget" admin create typo --budget 0
 expect_refused "create refuses a negative budget" admin create typo --budget -5
 expect "list shows the agents" "default nobody writer" \
   "$(admin list --json | python3 -c 'import json, sys; print(" ".join(a["name"] for a in json.load(sys.stdin)))')"
-expect "default's grants" "rovo_read" "$(agent_field default mcp_servers)"
+expect "default's grants" "atlassian_read" "$(agent_field default mcp_servers)"
 expect "nobody's grants" "" "$(agent_field nobody mcp_servers)"
 expect "default's GitHub grants" "github_read" "$(agent_field default github_levels)"
 expect "nobody's GitHub grants" "" "$(agent_field nobody github_levels)"
@@ -344,35 +353,58 @@ else
 fi
 
 request GET /v1/mcp/server "$master_key" >/dev/null
-rovo_read_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "rovo_read"))' "$TEST_WORK/body")"
+atlassian_read_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "atlassian_read"))' "$TEST_WORK/body")"
 request GET /v1/mcp/server "$master_key" >/dev/null
-rovo_jira_write_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "rovo_jira_write"))' "$TEST_WORK/body")"
-rovo_confluence_write_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "rovo_confluence_write"))' "$TEST_WORK/body")"
-expect "reader -> rovo_read uses the read account" "read" "$(rovo_whoami "$reader_key" "$rovo_read_id")"
-expect "reader -> rovo_jira_write denied" "denied" "$(rovo_whoami "$reader_key" "$rovo_jira_write_id")"
-expect "writer -> rovo_jira_write uses the Jira write account" "jira-write" "$(rovo_whoami "$writer_key" "$rovo_jira_write_id")"
-expect "writer -> rovo_read denied" "denied" "$(rovo_whoami "$writer_key" "$rovo_read_id")"
-expect "writer -> rovo_confluence_write denied" "denied" "$(rovo_whoami "$writer_key" "$rovo_confluence_write_id")"
-expect "nobody -> rovo_read denied" "denied" "$(rovo_whoami "$nobody_key" "$rovo_read_id")"
-expect "nobody -> rovo_jira_write denied" "denied" "$(rovo_whoami "$nobody_key" "$rovo_jira_write_id")"
+atlassian_jira_write_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "atlassian_jira_write"))' "$TEST_WORK/body")"
+atlassian_confluence_write_id="$(python3 -c 'import json, sys; print(next(s["server_id"] for s in json.load(open(sys.argv[1])) if s["server_name"] == "atlassian_confluence_write"))' "$TEST_WORK/body")"
+expect "reader -> atlassian_read uses the read account" "read" "$(atlassian_call "$reader_key" "$atlassian_read_id")"
+expect "reader -> atlassian_jira_write denied" "denied" "$(atlassian_call "$reader_key" "$atlassian_jira_write_id")"
+expect "writer -> atlassian_jira_write uses the Jira write account" "jira-write" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
+expect "writer -> atlassian_read denied" "denied" "$(atlassian_call "$writer_key" "$atlassian_read_id")"
+expect "writer -> atlassian_confluence_write denied" "denied" "$(atlassian_call "$writer_key" "$atlassian_confluence_write_id")"
+expect "nobody -> atlassian_read denied" "denied" "$(atlassian_call "$nobody_key" "$atlassian_read_id")"
+expect "nobody -> atlassian_jira_write denied" "denied" "$(atlassian_call "$nobody_key" "$atlassian_jira_write_id")"
 
-expect_ok "grant writer both servers" admin grant writer --mcp rovo_read,rovo_jira_write
-expect "grant takes effect without a new key" "read" "$(rovo_whoami "$writer_key" "$rovo_read_id")"
+# Each server allows only its level's tools, refused at LiteLLM so the call never reaches upstream.
+# reader has atlassian_read; writer has atlassian_jira_write.
+for check in "reader atlassian_read jira_add_comment" "reader atlassian_read confluence_update_page" \
+  "writer atlassian_jira_write confluence_update_page" "writer atlassian_jira_write jira_delete_issue"; do
+  set -- $check
+  key_var="${1}_key" server_var="${2}_id"
+  before="$(fake_atlassian_calls "$3")"
+  result="$(atlassian_call "${!key_var}" "${!server_var}" "$3")"
+  case "$result" in
+    error*) expect "$1 -> $2 can't call $3" "$before" "$(fake_atlassian_calls "$3")" ;;
+    *) fail "$1 -> $2 can't call $3 (got: $result)" ;;
+  esac
+done
+expect "writer -> atlassian_jira_write can call jira_add_comment" "jira-write" \
+  "$(atlassian_call "$writer_key" "$atlassian_jira_write_id" jira_add_comment)"
+
+# The real mcp-atlassian container (see tests/mcp_atlassian_checks.py).
+compose exec -T litellm python3 /tests/mcp_atlassian_checks.py /app/config.yaml > "$TEST_WORK/mcp-atlassian" 2>&1
+mcp_atlassian_check() { sed -n "s/^$1: //p" "$TEST_WORK/mcp-atlassian"; }
+expect "mcp-atlassian serves exactly the tools the atlassian_* servers allow" "match" "$(mcp_atlassian_check tools)"
+expect "mcp-atlassian marks exactly atlassian_read's tools read-only" "ok" "$(mcp_atlassian_check read-only)"
+expect "mcp-atlassian refuses requests without a key" "401" "$(mcp_atlassian_check no-key)"
+
+expect_ok "grant writer both servers" admin grant writer --mcp atlassian_read,atlassian_jira_write
+expect "grant takes effect without a new key" "read" "$(atlassian_call "$writer_key" "$atlassian_read_id")"
 expect_ok "grant writer no servers" admin grant writer --no-mcp
-expect "--no-mcp removes access" "denied" "$(rovo_whoami "$writer_key" "$rovo_jira_write_id")"
-expect_ok "grant writer rovo_confluence_write" admin grant writer --mcp rovo_confluence_write
-expect "writer -> rovo_confluence_write uses the Confluence write account" "confluence-write" \
-  "$(rovo_whoami "$writer_key" "$rovo_confluence_write_id")"
-expect "writer -> rovo_jira_write denied after regrant" "denied" "$(rovo_whoami "$writer_key" "$rovo_jira_write_id")"
-expect_ok "grant writer back to rovo_jira_write" admin grant writer --mcp rovo_jira_write
-expect "restored grant works" "jira-write" "$(rovo_whoami "$writer_key" "$rovo_jira_write_id")"
+expect "--no-mcp removes access" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
+expect_ok "grant writer atlassian_confluence_write" admin grant writer --mcp atlassian_confluence_write
+expect "writer -> atlassian_confluence_write uses the Confluence write account" "confluence-write" \
+  "$(atlassian_call "$writer_key" "$atlassian_confluence_write_id")"
+expect "writer -> atlassian_jira_write denied after regrant" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
+expect_ok "grant writer back to atlassian_jira_write" admin grant writer --mcp atlassian_jira_write
+expect "restored grant works" "jira-write" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
 expect_ok "grant writer github_test_write" admin grant writer --github github_test_write
-expect "GitHub grant changes only GitHub levels" "github_test_write rovo_jira_write" \
+expect "GitHub grant changes only GitHub levels" "github_test_write atlassian_jira_write" \
   "$(agent_field writer github_levels) $(agent_field writer mcp_servers)"
 expect_refused "grant needs something to change" admin grant writer
 expect_ok "grant writer a \$75 budget" admin grant writer --budget 75
 expect "grant changes the budget" "75.0" "$(agent_field writer budget)"
-expect "budget grant leaves access unchanged" "github_test_write rovo_jira_write" \
+expect "budget grant leaves access unchanged" "github_test_write atlassian_jira_write" \
   "$(agent_field writer github_levels) $(agent_field writer mcp_servers)"
 expect_refused "grant refuses a zero budget" admin grant writer --budget 0
 # Agents from before budgets have a key but no LiteLLM user; their next grant adds one.
@@ -538,15 +570,15 @@ else
 fi
 expect "Hermes session title comes from fast" "fast-model-answered" \
   "$(printf '%s' "$chat" | sed -n 's/^Title:[[:space:]]*//p' | tail -n 1)"
-# hermes/config.yaml lists every Rovo server; the key only grants rovo_read.
-mcp="$(compose exec -T agent-default hermes mcp test rovo_read 2>&1 || true)"
-if printf '%s' "$mcp" | grep -q "whoami"; then
+# hermes/config.yaml lists every Atlassian server; the key only grants atlassian_read.
+mcp="$(compose exec -T agent-default hermes mcp test atlassian_read 2>&1 || true)"
+if printf '%s' "$mcp" | grep -q "jira_get_issue"; then
   pass "Hermes MCP reaches the granted server"
 else
   fail "Hermes MCP reaches the granted server (output: $(printf '%s' "$mcp" | tail -n 6))"
 fi
-mcp="$(compose exec -T agent-default hermes mcp test rovo_jira_write 2>&1 || true)"
-if printf '%s' "$mcp" | grep -q "whoami"; then
+mcp="$(compose exec -T agent-default hermes mcp test atlassian_jira_write 2>&1 || true)"
+if printf '%s' "$mcp" | grep -q "jira_get_issue"; then
   fail "Hermes MCP can't reach a server it wasn't granted (output: $(printf '%s' "$mcp" | tail -n 6))"
 else
   pass "Hermes MCP can't reach a server it wasn't granted"
@@ -672,20 +704,20 @@ unset TEST_TYPESAFE_API_KEY
 
 # A server with an empty credential loads but is unusable, so admin must refuse it. One that's only
 # down upstream is granted with a warning.
-export TEST_ROVO_JIRA_WRITE_API_KEY=""
+export TEST_ATLASSIAN_JIRA_WRITE_API_KEY=""
 restart_litellm
-expect "servers marks a server with an empty credential" "rovo_jira_write  (unusable: check its credential)" \
-  "$(admin servers 2>&1 | grep rovo_jira_write)"
-expect_refused "grant refuses a server with an empty credential" admin grant writer --mcp rovo_read,rovo_jira_write
-expect "a refused grant changes nothing" "rovo_jira_write" "$(agent_field writer mcp_servers)"
-compose stop fake-rovo >/dev/null
-expect_ok "grant allows a server that's down upstream" admin grant writer --mcp rovo_read
+expect "servers marks a server with an empty credential" "atlassian_jira_write  (unusable: check its credential)" \
+  "$(admin servers 2>&1 | grep atlassian_jira_write)"
+expect_refused "grant refuses a server with an empty credential" admin grant writer --mcp atlassian_read,atlassian_jira_write
+expect "a refused grant changes nothing" "atlassian_jira_write" "$(agent_field writer mcp_servers)"
+compose stop fake-atlassian >/dev/null
+expect_ok "grant allows a server that's down upstream" admin grant writer --mcp atlassian_read
 expect "grant warns about a server it couldn't check" "1" \
-  "$(grep -c "couldn't check MCP server 'rovo_read'" "$TEST_WORK/out")"
-compose start fake-rovo >/dev/null
-unset TEST_ROVO_JIRA_WRITE_API_KEY
+  "$(grep -c "couldn't check MCP server 'atlassian_read'" "$TEST_WORK/out")"
+compose start fake-atlassian >/dev/null
+unset TEST_ATLASSIAN_JIRA_WRITE_API_KEY
 restart_litellm
-expect_ok "grant writer back to rovo_jira_write" admin grant writer --mcp rovo_jira_write
+expect_ok "grant writer back to atlassian_jira_write" admin grant writer --mcp atlassian_jira_write
 
 echo "== 8. Prompt-cache markers"
 # cache-check-<tier> are unmocked copies of the tier entries, pointed at tests/fake_anthropic.py.
@@ -844,7 +876,7 @@ compose stop agent-default >/dev/null
 expect "WORKSPACE_KEEP_FILES: workspace resets after going idle" "reset" "$(wait_for_reset)"
 expect "WORKSPACE_KEEP_FILES: a reset kills processes but keeps /work" "/work/home/left /cache/m2/kept" \
   "$(leftovers)"
-compose restart workspace-default >/dev/null
+compose restart --no-deps workspace-default >/dev/null
 expect "WORKSPACE_KEEP_FILES: /work survives a restart" "/work/home/left /cache/m2/kept" "$(leftovers)"
 unset TEST_WORKSPACE_KEEP_FILES
 

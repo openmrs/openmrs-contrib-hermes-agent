@@ -152,6 +152,12 @@ def env_values(path: Path) -> dict[str, str]:
     return {name: line.split("=", 1)[1] for name, line in read_env(path) if name}
 
 
+def _ignore_missing(func, path, exc: BaseException) -> None:
+    """`shutil.rmtree` error handler that tolerates paths already gone and re-raises anything else."""
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
+
+
 class Agents:
     def __init__(self, settings: Settings, api: LiteLLM | None = None) -> None:
         self.settings = settings
@@ -315,7 +321,11 @@ class Agents:
         if purge:
             if self.api.user_info(self._user_id(name)) is not None:
                 self.api.delete_user(self._user_id(name))
-            shutil.rmtree(home, ignore_errors=True)
+            try:
+                shutil.rmtree(home, onexc=_ignore_missing)
+            except OSError as e:
+                raise AgentError(f"couldn't delete all of {name}'s data ({e}); stop agent-{name} and run "
+                                 "delete --purge again") from e
             return
         shutil.rmtree(home / "ssh", ignore_errors=True)
         if (home / ".env").exists():
