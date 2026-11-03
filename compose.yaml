@@ -166,7 +166,7 @@ services:
   # LiteLLM server it came through, which also limits the tools each server exposes. ENABLED_TOOLS
   # must list exactly the tools those servers allow between them (tests/run.sh checks).
   mcp-atlassian:
-    image: ghcr.io/sooperset/mcp-atlassian:0.23.1@sha256:4206f3a92e0a9036c51e63fa3898d9d539017b384441ecb96492b4088b6bc84d
+    image: ghcr.io/sooperset/mcp-atlassian:0.23.1@sha256:5b7c9b64d4eb3210cab74be8bf3e6aeea9ed14f3042dc59ba5c5287bd4dbe466
     restart: unless-stopped
     logging: *logging
     security_opt: [no-new-privileges:true]
