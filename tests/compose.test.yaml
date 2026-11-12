@@ -19,15 +19,25 @@ services:
       ROUTER_CLASSIFIER_MODEL: ${TEST_ROUTER_CLASSIFIER_MODEL:-classifier-mock}
       TYPESAFE_API_KEY: ${TEST_TYPESAFE_API_KEY-test-typesafe-key}
       ATLASSIAN_JIRA_WRITE_API_KEY: ${TEST_ATLASSIAN_JIRA_WRITE_API_KEY-test-atlassian-jira-write-key}
+      ONYX_SEARCH_PAT: ${TEST_ONYX_SEARCH_PAT-}
 
   mcp-atlassian:
     env_file: !override [tests/fixtures/atlassian.env]
 
   admin:
-    env_file: !override [tests/fixtures/master.env]
+    env_file: !override [tests/fixtures/master.env, tests/fixtures/onyx-admin.env]
     volumes:
       - ./tests:/tests:ro
       - ${TEST_WORK}/github-levels.json:/templates/github-levels.json:ro
+
+  onyx-api:
+    env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
+  onyx-background:
+    env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
+  onyx-mcp:
+    env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
+  onyx-db:
+    env_file: !override [tests/fixtures/onyx-db.env]
 
   github-token:
     env_file: !override [{path: "${TEST_WORK}/github-app.env"}]
@@ -82,3 +92,25 @@ services:
       - ./tests/fake_github.py:/app/fake_github.py:ro
       - ${TEST_WORK}/github-app.pub.pem:/app/public.pem:ro
     command: ["python", "-u", "/app/fake_github.py"]
+
+# Bridge names must be unique on the host (see compose.yaml), so the test project can't share the
+# stack's.
+networks:
+  agents:
+    driver_opts: {com.docker.network.bridge.name: ht-agents}
+  litellm-db:
+    driver_opts: {com.docker.network.bridge.name: ht-litellm-db}
+  admin:
+    driver_opts: {com.docker.network.bridge.name: ht-admin}
+  workspaces:
+    driver_opts: {com.docker.network.bridge.name: ht-workspaces}
+  workspace-egress:
+    driver_opts: {com.docker.network.bridge.name: ht-wsp-egress}
+  atlassian:
+    driver_opts: {com.docker.network.bridge.name: ht-atlassian}
+  onyx:
+    driver_opts: {com.docker.network.bridge.name: ht-onyx}
+  onyx-backend:
+    driver_opts: {com.docker.network.bridge.name: ht-onyx-backend}
+  onyx-egress:
+    driver_opts: {com.docker.network.bridge.name: ht-onyx-egress}

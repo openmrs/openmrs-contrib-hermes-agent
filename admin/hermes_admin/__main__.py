@@ -1,4 +1,4 @@
-"""hermes-admin: manage Hermes agents' LiteLLM keys, MCP and GitHub access, and Slack settings.
+"""hermes-admin: manage Hermes agents' LiteLLM keys, MCP and GitHub access, and Slack settings, and Onyx.
 
 Run with no arguments in a terminal for the interactive interface; subcommands are for scripts.
 Secrets are never taken as command-line arguments (they would be visible in the host's process
@@ -15,6 +15,8 @@ import sys
 from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
                      Settings, validate_name)
 from .litellm import LiteLLMError
+from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxSettings, SourceType,
+                   source_settings)
 
 RESTART_HINT = "Restart the agent to apply: docker compose restart agent-{name}"
 ROTATE_HINT = "Restart the agent and its workspace to apply: docker compose restart workspace-{name} agent-{name}"
@@ -194,7 +196,86 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--purge", action="store_true", help="also delete the agent's data (sessions, memories, skills)")
     p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+
+    p = sub.add_parser("onyx", help="configure Onyx, the search index behind the onyx_search MCP server")
+    onyx = p.add_subparsers(dest="onyx_command", required=True)
+    q = onyx.add_parser("setup", help="log in (registering the administrator on a new Onyx) and point Onyx at LiteLLM")
+    q.add_argument("--budget", type=float,
+                   help=f"Onyx's monthly LiteLLM spend limit in USD (default on first setup: {DEFAULT_ONYX_BUDGET:g})")
+    q.add_argument("--rotate-key", action="store_true", help="issue Onyx a new LiteLLM key and revoke the old one")
+    onyx.add_parser("token", help="print a new search token for ONYX_SEARCH_PAT, revoking the previous one")
+    q = onyx.add_parser("sources", help="list Onyx's sources and their indexing state")
+    q.add_argument("--json", action="store_true")
+    q = onyx.add_parser("add", help="add a source for Onyx to index, asking for its settings",
+                        description="Source types: " + "; ".join(f"{k}: {t.description}" for k, t in SOURCE_TYPES.items())
+                        + ". Onyx doesn't copy sources' permissions: everything the account can see becomes "
+                          "searchable by every caller.")
+    q.add_argument("type", choices=list(SOURCE_TYPES))
+    q.add_argument("name", help="a name for the source in Onyx, e.g. wiki")
+    q.add_argument("--refresh-hours", type=float, default=DEFAULT_REFRESH_HOURS,
+                   help=f"how often Onyx re-indexes it (default {DEFAULT_REFRESH_HOURS})")
+    q.add_argument("--from-stdin", action="store_true",
+                   help="read the settings as KEY=VALUE lines from stdin instead of asking (keys: see the prompts)")
+    q.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     return parser
+
+
+def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
+    if args.onyx_command == "setup":
+        print("\n".join(onyx.setup(args.budget, args.rotate_key)))
+    elif args.onyx_command == "token":
+        token = onyx.token()
+        print("Put this in secrets/litellm.env, then restart LiteLLM (docker compose restart litellm).",
+              file=sys.stderr)
+        print("The previous token, if any, is revoked: search fails until LiteLLM restarts.", file=sys.stderr)
+        print(f"ONYX_SEARCH_PAT={token}")
+    elif args.onyx_command == "sources":
+        sources = onyx.sources()
+        if args.json:
+            print(json.dumps(sources, indent=2))
+        else:
+            print("\n".join(f"{s['name']} ({s['source']}): {s['status']}, {s['documents']} documents, last index "
+                            f"{s['last_index'] or 'none'}" for s in sources) or "(no sources)")
+    elif args.onyx_command == "add":
+        source_type = SOURCE_TYPES[args.type]
+        values = _read_source_stdin(source_type) if args.from_stdin else _prompt_source(source_type)
+        source_settings(args.type, args.name, values, args.refresh_hours)
+        if not args.yes:
+            print(f"Add {args.name} ({args.type}), re-indexed every {args.refresh_hours:g} hours:")
+            for f in source_type.fields:
+                value = values.get(f.key, "")
+                shown = "(set)" if f.secret and value else value or ("(default)" if f.kind == "bool" else "(blank)")
+                print(f"  {f.label}: {shown}")
+            if not _confirm("Everything this account can see becomes searchable by every caller. Add it? [y/N]"):
+                print("Cancelled (use --yes to skip confirmation).")
+                return 1
+        print(onyx.add(args.type, args.name, values, args.refresh_hours))
+    return 0
+
+
+def _read_source_stdin(source_type: SourceType) -> dict[str, str]:
+    keys = {f.key for f in source_type.fields}
+    values = {}
+    for line in sys.stdin.read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition("=")
+        if name.strip() not in keys:
+            raise AgentError(f"unexpected line on stdin for {name.strip()!r}; expected {sorted(keys)}")
+        values[name.strip()] = value.strip()
+    return values
+
+
+def _prompt_source(source_type: SourceType) -> dict[str, str]:
+    values = {}
+    for f in source_type.fields:
+        if f.kind == "bool":
+            values[f.key] = input(f"{f.label} [{'Y/n' if f.default else 'y/N'}]: ").strip()
+        else:
+            ask = getpass.getpass if f.secret else input
+            values[f.key] = ask(f"{f.label}{' (input hidden)' if f.secret else ''}: ").strip()
+    return values
 
 
 def run(args: argparse.Namespace, agents: Agents) -> int:
@@ -270,13 +351,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         agents = Agents(Settings.from_env())
+        if args.command == "onyx":
+            return run_onyx(args, Onyx(OnyxSettings.from_env(), agents.api))
         if args.command is None:
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 parser.print_help()
                 return 2
             from .tui import AdminApp
 
-            AdminApp(agents).run()
+            AdminApp(agents, Onyx(OnyxSettings.from_env(), agents.api)).run()
             return 0
         return run(args, agents)
     except (AgentError, LiteLLMError) as e:

@@ -48,6 +48,14 @@ class LiteLLM:
         except urllib.error.URLError as e:
             raise LiteLLMError(f"cannot reach LiteLLM at {self._base_url}: {e.reason}") from None
 
+    def embedding_dimensions(self, model: str) -> int:
+        """The length of `model`'s embeddings, from embedding a short probe text."""
+        response = self._call("POST", "/v1/embeddings", {"model": model, "input": ["dimension probe"]})
+        try:
+            return len(response["data"][0]["embedding"])
+        except (KeyError, IndexError, TypeError):
+            raise LiteLLMError(f"LiteLLM's {model!r} model returned no embedding") from None
+
     def mcp_server_ids(self) -> dict[str, str]:
         """MCP server names and their LiteLLM server ids."""
         return {server["server_name"]: server["server_id"] for server in self._call("GET", "/v1/mcp/server")}

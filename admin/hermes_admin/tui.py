@@ -12,12 +12,13 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, SelectionList, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
 from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
                      validate_budget, validate_name)
 from .litellm import LiteLLMError
+from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, source_settings
 
 DIALOG_CSS = """
 ModalScreen { align: center middle; }
@@ -182,6 +183,124 @@ class ConfirmDialog(_Dialog):
         self.dismiss(True)
 
 
+class SourceTypeDialog(_Dialog):
+    """Chooses the kind of Onyx source to add; dismisses with its SOURCE_TYPES key."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Add an Onyx source", classes="title")
+            for kind, source_type in SOURCE_TYPES.items():
+                yield Button(f"{kind}: {source_type.description}", id=f"type-{kind}")
+            yield Horizontal(Button("Cancel", id="cancel"), classes="buttons")
+
+    @on(Button.Pressed)
+    def _on_type(self, event: Button.Pressed) -> None:
+        if event.button.id and event.button.id.startswith("type-"):
+            self.dismiss(event.button.id.removeprefix("type-"))
+
+
+class SourceDialog(_Dialog):
+    """A new Onyx source's name, settings, and refresh interval; dismisses with them once
+    source_settings accepts them."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        self._kind = kind
+        self._type = SOURCE_TYPES[kind]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Add a {self._kind} source", classes="title")
+            yield Label("Everything its account can see becomes searchable by every caller: use an account "
+                        "that sees only public content.")
+            yield Input(placeholder="name in Onyx, e.g. wiki", id="name")
+            for f in self._type.fields:
+                if f.kind == "bool":
+                    yield Checkbox(f.label, value=f.default, id=f.key)
+                else:
+                    yield Input(placeholder=f.label, password=f.secret, id=f.key)
+            yield Label("Re-index every (hours):")
+            yield Input(value=f"{DEFAULT_REFRESH_HOURS:g}", id="refresh-hours")
+            yield Static("", classes="error", id="error")
+            yield self._buttons("Add")
+
+    @on(Button.Pressed, "#confirm")
+    def _on_confirm(self) -> None:
+        values = {f.key: self.query_one(f"#{f.key}", Checkbox).value if f.kind == "bool"
+                  else self.query_one(f"#{f.key}", Input).value for f in self._type.fields}
+        name = self.query_one("#name", Input).value.strip()
+        try:
+            refresh_hours = float(self.query_one("#refresh-hours", Input).value.strip())
+            source_settings(self._kind, name, values, refresh_hours)
+        except ValueError:
+            self.query_one("#error", Static).update("Re-index interval must be a number of hours.")
+            return
+        except OnyxError as e:
+            self.query_one("#error", Static).update(str(e))
+            return
+        self.dismiss({"name": name, "values": values, "refresh_hours": refresh_hours})
+
+
+class OnyxScreen(Screen):
+    """Onyx's sources and their indexing state; adds sources through SourceTypeDialog and SourceDialog."""
+
+    BINDINGS = [
+        Binding("a", "add", "Add source"),
+        Binding("f5", "refresh", "Refresh"),
+        Binding("escape", "app.pop_screen", "Back"),
+    ]
+    COLUMNS = ("Source", "Type", "Status", "Documents", "Last index")
+
+    def __init__(self, onyx: Onyx) -> None:
+        super().__init__()
+        self.onyx = onyx
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="sources", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#sources", DataTable).add_columns(*self.COLUMNS)
+        self.action_refresh()
+
+    @work(thread=True, exclusive=True, group="onyx-refresh")
+    def action_refresh(self) -> None:
+        try:
+            sources = self.onyx.sources()
+        except (AgentError, LiteLLMError) as e:
+            self.app.call_from_thread(self.notify, str(e), title="Onyx refresh failed", severity="error")
+            return
+        self.app.call_from_thread(self._show, sources)
+
+    def _show(self, sources: list[dict]) -> None:
+        table = self.query_one("#sources", DataTable)
+        table.clear()
+        for s in sources:
+            table.add_row(s["name"], s["source"], s["status"] or "", str(s["documents"] or 0), s["last_index"] or "none",
+                          key=s["name"])
+
+    def action_add(self) -> None:
+        def chosen(kind: str | None) -> None:
+            if kind:
+                self.app.push_screen(SourceDialog(kind), lambda result: added(kind, result))
+
+        def added(kind: str, result: dict | None) -> None:
+            if result:
+                self.run_worker(lambda: self._add(kind, result), thread=True, group="onyx-change")
+
+        self.app.push_screen(SourceTypeDialog(), chosen)
+
+    def _add(self, kind: str, result: dict) -> None:
+        try:
+            done = self.onyx.add(kind, result["name"], result["values"], result["refresh_hours"])
+        except (AgentError, LiteLLMError) as e:
+            self.app.call_from_thread(self.notify, str(e), title="Add source failed", severity="error", timeout=10)
+            return
+        self.app.call_from_thread(self.notify, done, title="Add source", timeout=8)
+        self.app.call_from_thread(self.action_refresh)
+
+
 class AdminApp(App):
     TITLE = "Hermes admin"
     BINDINGS = [
@@ -190,14 +309,17 @@ class AdminApp(App):
         Binding("s", "slack", "Slack"),
         Binding("r", "rotate", "Rotate key"),
         Binding("d", "delete", "Delete"),
+        Binding("o", "onyx", "Onyx sources"),
         Binding("f5", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
     COLUMNS = ("Agent", "Status", "MCP servers", "GitHub", "Budget", "Slack", "Data")
+    AGENT_ACTIONS = {"create", "grant", "slack", "rotate", "delete", "refresh", "onyx"}
 
-    def __init__(self, agents: Agents) -> None:
+    def __init__(self, agents: Agents, onyx: Onyx | None = None) -> None:
         super().__init__()
         self.agents = agents
+        self.onyx = onyx
         self._listed: dict[str, Agent] = {}
         self._servers: list[str] = []
         self._levels: list[str] = []
@@ -320,6 +442,18 @@ class AdminApp(App):
             "New keys are issued for the agent and its workspace, and the old ones revoked. The agent stops "
             "working until both are restarted.",
             "Rotate"), confirmed)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # The agent actions act on the agent table, which isn't shown under the Onyx screen.
+        if action in self.AGENT_ACTIONS and any(isinstance(screen, OnyxScreen) for screen in self.screen_stack):
+            return False
+        return True
+
+    def action_onyx(self) -> None:
+        if self.onyx is None:
+            self.notify("Onyx isn't configured.", severity="warning")
+            return
+        self.push_screen(OnyxScreen(self.onyx))
 
     def action_delete(self) -> None:
         agent = self._selected()

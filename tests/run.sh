@@ -269,7 +269,7 @@ compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-to
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
-expect "servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read"]' "$(admin servers --json)"
+expect "servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read", "onyx_search"]' "$(admin servers --json)"
 expect "levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin levels --json)"
 expect_ok "create default (atlassian_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
@@ -500,6 +500,12 @@ else
   fail "compose output for a new agent passes the isolation checks"
 fi
 expect_refused "compose refuses an invalid name" admin compose Bad_Name
+# The tests don't run Onyx, so these pass only if admin refuses before calling it. Only the
+# first line is compared: Podman's compose wrapper adds its own line when a command fails.
+expect "onyx add refuses a source missing its token" "error: Token (fine-grained, read-only, public repositories) is required" \
+  "$(admin_stdin 'repo_owner=openmrs\n' onyx add github github --from-stdin --yes 2>&1 | head -n 1)"
+expect "onyx add refuses an unknown setting" "error: unexpected line on stdin for 'space'; expected ['base_url', 'categories', 'discourse_api_key', 'discourse_api_username']" \
+  "$(admin_stdin 'space=DEV\n' onyx add discourse talk --from-stdin --yes 2>&1 | head -n 1)"
 
 if compose run --rm -T --entrypoint python admin /tests/admin_tui_checks.py; then
   pass "interactive interface"

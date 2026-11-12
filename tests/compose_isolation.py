@@ -24,6 +24,9 @@ WORKSPACE_ENV_ALLOWED = {"WORKSPACE_IDLE_MINUTES", "WORKSPACE_KEEP_FILES", "GIT_
 SECRET_FILES = {
     "litellm.env": {"litellm"},
     "master.env": {"litellm", "admin"},
+    "onyx.env": {"onyx-api", "onyx-background", "onyx-mcp"},
+    "onyx-db.env": {"onyx-db", "onyx-api", "onyx-background", "onyx-mcp"},
+    "onyx-admin.env": {"admin"},
     "postgres.env": {"postgres"},
     "github-app.env": {"github-token"},
     "atlassian.env": {"mcp-atlassian"},
@@ -162,8 +165,10 @@ for name, service in services.items():
 admin, litellm, postgres = services.get("admin", {}), services["litellm"], services["postgres"]
 github_token = services.get("github-token", {})
 check("admin service exists", bool(admin))
-check("admin: only secrets/master.env", secrets(admin) == ["master.env"], secrets(admin))
-check("admin: only on the admin network", network_names(admin) == {"admin"}, sorted(network_names(admin)))
+check("admin: only secrets/master.env and secrets/onyx-admin.env", secrets(admin) == ["master.env", "onyx-admin.env"],
+      secrets(admin))
+check("admin: only on the admin and onyx networks", network_names(admin) == {"admin", "onyx"},
+      sorted(network_names(admin)))
 check("admin: not started by default (profile)", bool(admin.get("profiles")), admin.get("profiles"))
 check("admin network is internal", networks.get("admin", {}).get("internal") is True, networks.get("admin"))
 check("litellm: secrets/litellm.env and secrets/master.env",
@@ -203,6 +208,24 @@ check("mcp-atlassian: no mounts", not mounts(mcp_atlassian), mounts(mcp_atlassia
 check("atlassian network: only litellm and mcp-atlassian",
       sorted(name for name, s in services.items() if "atlassian" in network_names(s)) == ["litellm", "mcp-atlassian"],
       sorted(name for name, s in services.items() if "atlassian" in network_names(s)))
+
+
+def members(network):
+    return sorted(name for name, s in services.items() if network in network_names(s))
+
+
+onyx_services = sorted(name for name in services if name.startswith("onyx-"))
+check("onyx services exist", {"onyx-api", "onyx-background", "onyx-mcp", "onyx-db", "onyx-opensearch"} <= set(onyx_services),
+      onyx_services)
+for name in onyx_services:
+    check(f"{name}: no published ports", not services[name].get("ports"), services[name].get("ports"))
+for network in ("onyx", "onyx-backend"):
+    check(f"{network} network is internal", networks.get(network, {}).get("internal") is True, networks.get(network))
+check("onyx network: only litellm, admin, and the Onyx services that call models, serve MCP, or take configuration",
+      members("onyx") == ["admin", "litellm", "onyx-api", "onyx-background", "onyx-mcp"], members("onyx"))
+check("onyx-backend network: only Onyx services", members("onyx-backend") == onyx_services, members("onyx-backend"))
+check("onyx-egress network: only onyx-api and onyx-background",
+      members("onyx-egress") == ["onyx-api", "onyx-background"], members("onyx-egress"))
 check("litellm-db network is internal", networks.get("litellm-db", {}).get("internal") is True, networks.get("litellm-db"))
 
 sys.exit(1 if failures else 0)
