@@ -265,7 +265,7 @@ fi
 echo "== Starting LiteLLM"
 compose --profile admin build admin agent-default workspace-default github-token >/dev/null
 compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-token fake-jev fake-atlassian \
-  fake-anthropic \
+  fake-onyx fake-anthropic \
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
@@ -393,6 +393,34 @@ mcp_atlassian_check() { sed -n "s/^$1: //p" "$TEST_WORK/mcp-atlassian"; }
 expect "mcp-atlassian serves exactly the tools the atlassian_* servers allow" "match" "$(mcp_atlassian_check tools)"
 expect "mcp-atlassian marks exactly atlassian_read's tools read-only" "ok" "$(mcp_atlassian_check read-only)"
 expect "mcp-atlassian refuses requests without a key" "401" "$(mcp_atlassian_check no-key)"
+
+# onyx_search serves its pinned tool in place of Onyx's (tests/fake_onyx.py upstream) and refuses
+# the parameters it hides before they reach Onyx.
+expect_ok "agent edit nobody onyx_search" admin agent edit nobody --mcp onyx_search
+compose exec -T litellm python3 /tests/onyx_gateway_checks.py /app/config.yaml "$nobody_key" > "$TEST_WORK/onyx-gateway" 2>&1
+onyx_gateway_check() { sed -n "s/^$1: //p" "$TEST_WORK/onyx-gateway"; }
+expect "onyx_search serves the pinned description" "pinned" "$(onyx_gateway_check description)"
+expect "onyx_search serves only the pinned parameters" "query skip_query_expansion source_types time_cutoff" \
+  "$(onyx_gateway_check params)"
+expect "onyx_search passes the pinned parameters through" \
+  '{"query": "how do I configure O3?", "skip_query_expansion": true, "source_types": ["web"], "time_cutoff": "2026-01-01T00:00:00Z"}' \
+  "$(onyx_gateway_check call)"
+case "$(onyx_gateway_check hidden)" in
+  "error: "*"['agent'] are not allowed"*) pass "onyx_search refuses a hidden parameter" ;;
+  *) fail "onyx_search refuses a hidden parameter (got: $(onyx_gateway_check hidden))" ;;
+esac
+expect "a refused call never reaches Onyx" "1" "$(log_count_fixed fake-onyx "onyx call args=")"
+expect_ok "agent edit nobody no servers" admin agent edit nobody --no-mcp
+
+# The pinned parameters against the real Onyx's (see tests/onyx_tool_checks.py).
+admin_source_types="$(admin_sh "python -c 'from hermes_admin.onyx import SOURCE_TYPES; print(*SOURCE_TYPES)'")"
+# shellcheck disable=SC2086 # one argument per source type
+compose run --rm --no-deps -T --entrypoint python onyx-mcp /tests/onyx_tool_checks.py $admin_source_types \
+  < "$root/litellm/config.yaml" > "$TEST_WORK/onyx-tool" 2>&1
+onyx_tool_check() { sed -n "s/^$1: //p" "$TEST_WORK/onyx-tool"; }
+expect "Onyx's tool has the pinned parameters, with the same types" "ok" "$(onyx_tool_check params)"
+expect "Onyx's tool requires what the pinned one does" "ok" "$(onyx_tool_check required)"
+expect "pinned source_types are admin's source types, all Onyx sources" "ok" "$(onyx_tool_check source-types)"
 
 expect_ok "agent edit writer both servers" admin agent edit writer --mcp atlassian_read,atlassian_jira_write
 expect "agent edit takes effect without a new key" "read" "$(atlassian_call "$writer_key" "$atlassian_read_id")"

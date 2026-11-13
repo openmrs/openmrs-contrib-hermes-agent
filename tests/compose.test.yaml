@@ -19,7 +19,7 @@ services:
       ROUTER_CLASSIFIER_MODEL: ${TEST_ROUTER_CLASSIFIER_MODEL:-classifier-mock}
       TYPESAFE_API_KEY: ${TEST_TYPESAFE_API_KEY-test-typesafe-key}
       ATLASSIAN_JIRA_WRITE_API_KEY: ${TEST_ATLASSIAN_JIRA_WRITE_API_KEY-test-atlassian-jira-write-key}
-      ONYX_SEARCH_PAT: ${TEST_ONYX_SEARCH_PAT-}
+      ONYX_SEARCH_PAT: ${TEST_ONYX_SEARCH_PAT-test-onyx-search-pat}
 
   mcp-atlassian:
     env_file: !override [tests/fixtures/atlassian.env]
@@ -34,8 +34,11 @@ services:
     env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
   onyx-background:
     env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
+  # Runs tests/onyx_tool_checks.py; the tests don't start Onyx itself.
   onyx-mcp:
     env_file: !override [tests/fixtures/onyx.env, tests/fixtures/onyx-db.env]
+    volumes:
+      - ./tests:/tests:ro
   onyx-db:
     env_file: !override [tests/fixtures/onyx-db.env]
 
@@ -77,6 +80,14 @@ services:
     volumes:
       - ./tests/fake_atlassian.py:/app/fake_atlassian.py:ro
     command: ["python", "-u", "/app/fake_atlassian.py"]
+
+  # Behind LiteLLM in place of onyx-mcp, on the same network.
+  fake-onyx:
+    image: python:3.12-slim
+    networks: [onyx]
+    volumes:
+      - ./tests/fake_onyx.py:/app/fake_onyx.py:ro
+    command: ["python", "-u", "/app/fake_onyx.py"]
 
   fake-anthropic:
     image: python:3.12-slim

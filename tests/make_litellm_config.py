@@ -8,6 +8,7 @@ Changes from the real config:
   - `classifier-mock` (always REASONING) and `classifier-mock-invalid` (not a classification)
     are added for the LLM classifier.
   - atlassian_* MCP servers point at tests/fake_atlassian.py instead of mcp-atlassian.
+  - onyx_search points at tests/fake_onyx.py instead of onyx-mcp.
   - each tier is copied, unmocked, as `cache-check-<tier>` against tests/fake_anthropic.py, to see
     what LiteLLM sends upstream.
   - prompts are stored in spend logs, so the test can check what reached the model.
@@ -17,6 +18,7 @@ import sys
 
 TIER_MODELS = ("FAST", "BALANCED", "STRONG")
 ATLASSIAN_URL = "url: http://mcp-atlassian:9000/mcp"
+ONYX_URL = "url: http://onyx-mcp:8090/"
 FAKE_ANTHROPIC = "http://fake-anthropic:8003"
 GENERAL_SETTINGS = "general_settings:\n"
 
@@ -68,6 +70,10 @@ def main(source: str, dest: str) -> None:
     if ATLASSIAN_URL not in config:
         sys.exit(f"{source}: expected Atlassian MCP servers with '{ATLASSIAN_URL}'")
     config = config.replace(ATLASSIAN_URL, "url: http://fake-atlassian:8002/mcp")
+
+    if config.count(ONYX_URL) != 1:
+        sys.exit(f"{source}: expected an onyx_search MCP server with '{ONYX_URL}'")
+    config = config.replace(ONYX_URL, "url: http://fake-onyx:8006/")
 
     if config.count(GENERAL_SETTINGS) != 1:
         sys.exit(f"{source}: expected exactly one 'general_settings:' line")
