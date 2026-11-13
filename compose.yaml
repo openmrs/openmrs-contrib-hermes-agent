@@ -393,8 +393,8 @@ services:
   # SOUL.md, config.yaml, and .env are read-only so the agent can't rewrite its instructions, where
   # its requests go, or its key. admin writes .env through the whole volume; changes apply on agent
   # restart. Restarting a workspace restarts its agent, so it forgets directories the reset removed.
-  # To add an agent: append `bin/admin compose <name>` output here, write hermes/souls/<name>.md,
-  # then run `bin/admin create <name>` (required before the agent can start).
+  # To add an agent: append `bin/admin agent compose <name>` output here, write hermes/souls/<name>.md,
+  # then run `bin/admin agent add <name>` (required before the agent can start).
   agent-default:
     <<: *hermes-agent
     depends_on:

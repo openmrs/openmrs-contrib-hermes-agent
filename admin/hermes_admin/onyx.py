@@ -269,7 +269,7 @@ class Onyx:
         embedding_provider = self._embedding_provider()
         if budget is not None or self.api.user_info(ONYX_USER_ID) is None:
             self._set_budget(DEFAULT_ONYX_BUDGET if budget is None else budget)
-            done.append(f"Onyx's monthly LiteLLM budget: ${DEFAULT_ONYX_BUDGET if budget is None else budget:g}")
+            done.append(f"Onyx's monthly LiteLLM budget: ${DEFAULT_ONYX_BUDGET if budget is None else budget:g}.")
         if provider is None or embedding_provider is None or not old_keys or rotate_key:
             response = self.api.generate_key({
                 "key_alias": f"hermes-onyx-{time.strftime('%Y%m%d%H%M%S')}",
@@ -300,9 +300,9 @@ class Onyx:
                 "api_url": self._embeddings_url,
             })
             self.api.delete_keys(old_keys)
-            done.append("Issued Onyx a new LiteLLM key" + (" and revoked the old one" if old_keys else ""))
+            done.append("Issued Onyx a new LiteLLM key" + (" and revoked the old one." if old_keys else "."))
         self.client.call("POST", "/admin/llm/default", {"provider_id": provider["id"], "model_name": ONYX_MODEL})
-        done.append(f"Onyx uses LiteLLM's {ONYX_MODEL!r} model")
+        done.append(f"Onyx uses LiteLLM's {ONYX_MODEL!r} model.")
         done.append(self._use_embedding_model())
         return done
 
@@ -317,7 +317,7 @@ class Onyx:
         for path in ("/search-settings/get-secondary-search-settings", "/search-settings/get-current-search-settings"):
             settings = self.client.call("GET", path)
             if settings and settings.get("provider_type") == "litellm" and settings.get("model_name") == ONYX_EMBEDDING_MODEL:
-                return f"Onyx {'is switching to' if 'secondary' in path else 'uses'} LiteLLM's {ONYX_EMBEDDING_MODEL!r} model"
+                return f"Onyx {'is switching to' if 'secondary' in path else 'uses'} LiteLLM's {ONYX_EMBEDDING_MODEL!r} model."
         dimensions = self.api.embedding_dimensions(ONYX_EMBEDDING_MODEL)
         self.client.call("POST", "/search-settings/set-new-search-settings", {
             "model_name": ONYX_EMBEDDING_MODEL, "model_dim": dimensions, "normalize": True,
@@ -325,7 +325,7 @@ class Onyx:
             "index_name": None, "multipass_indexing": False, "enable_contextual_rag": False,
         })
         return (f"Onyx is switching to LiteLLM's {ONYX_EMBEDDING_MODEL!r} model ({dimensions} dimensions); "
-                "search uses it once Onyx has re-embedded what's indexed")
+                "search uses it once Onyx has re-embedded what's indexed.")
 
     # -- search token ----------------------------------------------------------------------------
 
@@ -361,7 +361,7 @@ class Onyx:
         for status in self.client.call("GET", "/manage/admin/connector/status") or []:
             if status["name"] == name:
                 return status
-        raise OnyxError(f"Onyx has no source named {name!r}")
+        raise OnyxError(f"no source named {name!r}")
 
     def source(self, name: str) -> tuple[str, dict[str, Any], float]:
         """A source's SOURCE_TYPES key, current non-secret field values (as `add` takes them), and
@@ -398,7 +398,7 @@ class Onyx:
             "prune_freq": connector.get("prune_freq"), "indexing_start": connector.get("indexing_start"),
             "access_type": status.get("access_type", "public"), "groups": status.get("groups") or [],
         })
-        return f"Updated {name}"
+        return f"Updated {name}."
 
     def delete(self, name: str, wait: float = DELETE_WAIT_SECONDS, poll: float = DELETE_POLL_SECONDS) -> str:
         """Deletes a source and its documents from the index, then its credential unless another
@@ -417,13 +417,13 @@ class Onyx:
                 raise OnyxError(f"Onyx couldn't delete {name}: {failed.splitlines()[0]}")
             if time.monotonic() >= deadline:
                 return (f"Still deleting {name}: Onyx removes its documents in the background. Run `onyx cleanup` "
-                        "once it's gone to delete its credential")
+                        "once it's gone to delete its credential.")
             time.sleep(poll)
         if credential_id == PUBLIC_CREDENTIAL_ID or any(
                 credential_id in (c.get("credential_ids") or []) for c in self.client.call("GET", "/manage/connector") or []):
-            return f"Deleted {name}"
+            return f"Deleted {name}."
         self.client.call("DELETE", f"/manage/admin/credential/{credential_id}")
-        return f"Deleted {name} and its credential"
+        return f"Deleted {name} and its credential."
 
     def add(self, kind: str, name: str, values: dict[str, Any], refresh_hours: float = DEFAULT_REFRESH_HOURS) -> str:
         """Creates a source of SOURCE_TYPES[kind] named `name` (see source_settings); Onyx starts
@@ -444,7 +444,7 @@ class Onyx:
         # Public: Onyx's free edition can't restrict documents by group anyway.
         self.client.call("PUT", f"/manage/connector/{connector['id']}/credential/{created['id']}",
                          {"name": name, "access_type": "public", "groups": []})
-        return f"Added {name} ({kind}); Onyx starts indexing it shortly"
+        return f"Added {name} ({kind}); Onyx starts indexing it shortly."
 
     def unused(self) -> tuple[list[dict], list[dict]]:
         """The connectors and credentials no source uses, e.g. left behind when Onyx refused an
@@ -460,8 +460,8 @@ class Onyx:
         lines = []
         for connector in connectors:
             self.client.call("DELETE", f"/manage/admin/connector/{connector['id']}")
-            lines.append(f"Deleted connector {connector['name']!r} ({connector['source']})")
+            lines.append(f"Deleted connector {connector['name']!r} ({connector['source']}).")
         for credential in credentials:
             self.client.call("DELETE", f"/manage/admin/credential/{credential['id']}")
-            lines.append(f"Deleted credential {credential['name']!r} ({credential['source']})")
+            lines.append(f"Deleted credential {credential['name']!r} ({credential['source']}).")
         return lines

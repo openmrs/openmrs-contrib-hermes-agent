@@ -50,7 +50,7 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
   inference, and `/key/info`; `models` is `auto`, `fast`, `balanced`, `strong`. So no management
   API (an agent can't mint a broader key) and no raw provider passthroughs (`/anthropic/*`, ...),
   which would bypass `auto`. Don't use LiteLLM's `llm_api_routes` group: it includes them.
-- **Monthly budgets** ($1000 default) are on each agent's LiteLLM user, not its key, so `rotate`
+- **Monthly budgets** ($1000 default) are on each agent's LiteLLM user, not its key, so `agent rotate`
   doesn't reset spend. Every request with the agent's key counts, including the router's classifier
   calls. Over budget, LiteLLM refuses requests until the 1st (UTC).
 - **GitHub access is per level, with short-lived tokens.** `github-token/levels.json` defines each
@@ -179,7 +179,7 @@ whichever is available.
    with the ID from `gh api 'users/<app-slug>[bot]' --jq .id`.
 5. **Create the agent:**
    ```sh
-   bin/admin create default --mcp atlassian_jira_write,atlassian_confluence_write --github github_read
+   bin/admin agent add default --mcp atlassian_jira_write,atlassian_confluence_write --github github_read
    ```
    This starts LiteLLM and Postgres if needed. Add `github_pr` to `--github` to let it open pull
    requests.
@@ -196,7 +196,7 @@ whichever is available.
    `message.groups`) or group DMs (`mpim:*`, `message.mpim`). Install it, copy the Bot User OAuth
    Token (`xoxb-...`), create an app-level token with `connections:write` (`xapp-...`), then:
    ```sh
-   bin/admin slack default
+   bin/admin agent slack default
    ```
    `SLACK_ALLOWED_USERS` is a comma-separated list of Slack member IDs, or `*` for everyone. Empty
    means no one.
@@ -254,38 +254,52 @@ Read from the environment or a `.env` file next to `compose.yaml` (git-ignored).
 They use `docker compose`, else `podman compose`, else `docker-compose`; set `COMPOSE` to override.
 
 ```sh
-bin/admin servers                         # grantable MCP servers, marking unusable ones
-bin/admin levels                          # grantable GitHub levels
-bin/admin list
-bin/admin show <name>
-bin/admin create <name> --mcp a,b [--github x,y] [--budget USD] [--slack]
-bin/admin grant <name> --mcp a,b          # or --no-mcp; immediate
-bin/admin grant <name> --github x,y       # or --no-github; within a minute
-bin/admin grant <name> --budget USD       # immediate
-bin/admin slack <name>                    # prompts; blank keeps current values
-bin/admin rotate <name>                   # new agent, workspace, and SSH keys; old keys revoked
-bin/admin delete <name> [--purge] [--yes]
-bin/admin compose <name>                  # agent-<name> and workspace-<name> blocks for compose.yaml
+bin/admin agent servers                         # grantable MCP servers, marking unusable ones
+bin/admin agent levels                          # grantable GitHub levels
+bin/admin agent list
+bin/admin agent show [<name>]
+bin/admin agent add <name> --mcp a,b [--github x,y] [--budget USD] [--slack]
+bin/admin agent edit [<name>] --mcp a,b         # or --no-mcp; immediate
+bin/admin agent edit [<name>] --github x,y      # or --no-github; within a minute
+bin/admin agent edit [<name>] --budget USD      # immediate
+bin/admin agent slack [<name>]                  # prompts; blank keeps current values
+bin/admin agent rotate [<name>] [--yes]         # new agent, workspace, and SSH keys; old keys revoked
+bin/admin agent delete [<name>] [--purge] [--yes]
+bin/admin agent compose <name>                  # agent-<name> and workspace-<name> blocks for compose.yaml
+
+bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
+bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
+bin/admin onyx list                             # sources and their indexing state
+bin/admin onyx add <type> <name> [--refresh-hours H] [--yes]
+bin/admin onyx edit [<name>] [--refresh-hours H] [--yes]
+bin/admin onyx delete [<name>] [--yes]
+bin/admin onyx cleanup [--yes]                  # connectors and credentials a failed add left behind
 ```
+
+- **Names are optional** where shown in brackets: without one, admin lists the agents or sources and
+  asks which.
+- **Changes ask for confirmation** where `--yes` is shown; `--yes` skips it, e.g. in scripts.
+- **`--json`** on `list`, `show`, `servers`, and `levels` prints machine-readable output.
 
 - **LiteLLM is the source of truth.** An agent is the set of keys tagged `managed_by: hermes-admin`;
   other keys are ignored. Budgets and spend are on the LiteLLM user `hermes-agent-<name>`.
 - **Unusable MCP servers are refused** (e.g. an empty credential). A server that's only down
   upstream is granted with a warning.
 - **Secrets never go on the command line.** Slack tokens come from masked prompts or, for scripts,
-  `SLACK_*=...` lines on stdin (`--slack-from-stdin`, `slack <name> --from-stdin`).
-- **Restarts:** Slack changes need `docker compose restart agent-<name>`; `rotate` needs
-  `docker compose restart workspace-<name> agent-<name>`. Admin has no Docker socket to do it.
-- **`delete`** revokes the keys and removes the agent's secrets (`.env` values, SSH key, workspace
-  config) but keeps its sessions, memories, skills, and spend, so `create` can bring it back.
+  `SLACK_*=...` lines on stdin (`agent add <name> --from-stdin`, `agent slack <name> --from-stdin`); Onyx
+  source settings likewise (`onyx add ... --from-stdin`, `onyx edit <name> --from-stdin`).
+- **Restarts:** Slack changes need `docker compose restart agent-<name>`; `agent rotate`
+  needs `docker compose restart workspace-<name> agent-<name>`. Admin has no Docker socket to do it.
+- **`agent delete`** revokes the keys and removes the agent's secrets (`.env` values, SSH key, workspace
+  config) but keeps its sessions, memories, skills, and spend, so `agent add` can bring it back.
   `--purge` also deletes its data and LiteLLM user.
 
-To add an agent: add the output of `bin/admin compose <name>` under `services:` in `compose.yaml`,
-write `hermes/souls/<name>.md`, run `bin/admin create <name> ...`, set up its Slack app (Setup
+To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`,
+write `hermes/souls/<name>.md`, run `bin/admin agent add <name> ...`, set up its Slack app (Setup
 step 6), then `docker compose up -d agent-<name>`.
 
 To remove one: delete its blocks from `compose.yaml`, run `docker compose up -d --remove-orphans`,
-then `bin/admin delete <name> --purge` (or without `--purge` to keep its data), and delete its
+then `bin/admin agent delete <name> --purge` (or without `--purge` to keep its data), and delete its
 `SOUL.md` and Slack app.
 
 To add an MCP server: add it to `litellm/config.yaml` (credential in `secrets/litellm.env`) and add

@@ -4,14 +4,14 @@ LiteLLM is the source of truth. An agent is the set of keys whose metadata has
 `managed_by: hermes-admin` and `hermes_agent: <name>`; other keys are never touched. MCP grants are
 the key's object_permission; GitHub grants are levels (from github-token/levels.json) in its
 `github_levels` metadata, checked by github-token. More than one key per agent means an interrupted
-rotation, which `rotate` or `delete` cleans up.
+rotation, which `agent rotate` or `agent delete` cleans up.
 
 Each agent also has a workspace key (`hermes_role: workspace`) so `gh` in its workspace can get
 GitHub tokens. It has the same `github_levels` but may only call /key/info, so code run in the
 workspace can't spend the agent's budget or use its MCP grants.
 
 The monthly budget is on the agent's LiteLLM user (`hermes-agent-<name>`), not a key, so spend
-survives `rotate`.
+survives `agent rotate`.
 
 `<agents_dir>/<name>` is the agent's Hermes home (/opt/data), mounted only by that agent. Its `.env`
 holds the LiteLLM key, Slack tokens, and workspace host name; `ssh/` holds the agent's SSH key and the workspace's host
@@ -117,9 +117,38 @@ class Agent:
     def provisioned(self) -> bool:
         return bool(self.key_hashes)
 
-    def describe_budget(self) -> str:
+    # The *_status properties are the words the CLI and the interactive interface both use.
+
+    @property
+    def key_status(self) -> str:
+        """`active`, `no key`, or `N keys` (an interrupted rotation)."""
+        keys = len(self.key_hashes)
+        return "active" if keys == 1 else f"{keys} keys" if keys else "no key"
+
+    @property
+    def workspace_status(self) -> str:
+        """`ready`, `none` (no agent key either), `no key`, or `N key(s)` when its files are missing
+        or a rotation was interrupted."""
+        keys = len(self.workspace_key_hashes)
+        if keys == 1 and self.has_workspace:
+            return "ready"
+        if keys:
+            return f"{keys} key{'s' if keys > 1 else ''}"
+        return "no key" if self.provisioned else "none"
+
+    @property
+    def slack_status(self) -> str:
+        """`set` once the required Slack settings are, `partial` if only some are, else `not set`."""
+        if all(self.env_set.get(var) for var in SLACK_REQUIRED_VARS):
+            return "set"
+        return "partial" if any(self.env_set.get(var) for var in SLACK_VARS) else "not set"
+
+    def describe_budget(self, short: bool = False) -> str:
+        """Spend against the monthly budget; `short` leaves out the period and reset date."""
         if self.budget is None:
             return "none"
+        if short:
+            return f"${self.spend:,.2f} of ${self.budget:,.2f}"
         resets = f", resets {self.budget_resets[:10]}" if self.budget_resets else ""
         return f"${self.spend:,.2f} of ${self.budget:,.2f} this month{resets}"
 
@@ -242,7 +271,7 @@ class Agents:
         validate_budget(budget)
         self.warnings = []
         if any(a.name == name and a.provisioned for a in self.list()):
-            raise AgentError(f"agent {name!r} already exists; use `grant` to change access or `rotate` for a new key")
+            raise AgentError(f"agent {name!r} already exists; use `agent edit` to change access or `agent rotate` for new keys")
         servers = self._checked_servers(mcp)
         levels = self._checked_levels(github or [])
         self._set_budget(name, budget)
@@ -313,7 +342,7 @@ class Agents:
 
     def delete(self, name: str, purge: bool = False) -> None:
         """Revoke the agent's and its workspace's keys and remove their secrets. `purge` also deletes
-        its data and LiteLLM user (budget and spend); otherwise both are kept for `create`."""
+        its data and LiteLLM user (budget and spend); otherwise both are kept for `agent add`."""
         agent = self.get(name)
         self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes)
         home = self._home(name)
@@ -325,7 +354,7 @@ class Agents:
                 shutil.rmtree(home, onexc=_ignore_missing)
             except OSError as e:
                 raise AgentError(f"couldn't delete all of {name}'s data ({e}); stop agent-{name} and run "
-                                 "delete --purge again") from e
+                                 "`agent delete --purge` again") from e
             return
         shutil.rmtree(home / "ssh", ignore_errors=True)
         if (home / ".env").exists():
@@ -336,7 +365,7 @@ class Agents:
     def _existing(self, name: str) -> Agent:
         agent = self.get(name)
         if not agent.provisioned:
-            raise AgentError(f"agent {name!r} has no key; use `create`")
+            raise AgentError(f"agent {name!r} has no key; use `agent add`")
         return agent
 
     def _checked_servers(self, mcp: list[str]) -> list[str]:

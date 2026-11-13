@@ -5,11 +5,13 @@ Cleans up the agent it creates. The tests don't run Onyx, so its screen talks to
 """
 
 import asyncio
+import io
 import sys
 
+from hermes_admin.__main__ import build_parser, run_onyx
 from hermes_admin.agents import Agents, Settings
 from hermes_admin.onyx import Onyx, OnyxError, OnyxSettings
-from hermes_admin.tui import AdminApp, GrantDialog, OnyxScreen, SourceDialog
+from hermes_admin.tui import AdminApp, ConfirmDialog, EditAgentDialog, OnyxScreen, SourceDialog
 from textual.widgets import DataTable, Input, SelectionList
 
 NAME = "tui-check"
@@ -49,6 +51,8 @@ class FakeOnyxClient:
         self.sources = [{"id": 100, "name": "o3-docs", "source": "web", "input_type": "load_state",
                          "connector_specific_config": {"base_url": "https://o3-docs.openmrs.org/",
                                                        "web_connector_type": "recursive"}, "refresh_freq": 86400}]
+        # Credentials no source uses, which cleanup deletes.
+        self.unused_credentials = []
         self.calls = []
 
     def call(self, method, path, body=None, form=None, ok=(200, 201, 204)):
@@ -60,6 +64,9 @@ class FakeOnyxClient:
                     "deletion_failure_message": None}
         if method == "GET" and path == "/manage/connector":
             return [{**s, "credential_ids": [s["id"] + 1]} for s in self.sources]
+        if method == "GET" and path == "/manage/admin/credential":
+            return [{"id": s["id"] + 1, "name": s["name"], "source": s["source"]} for s in self.sources] \
+                + self.unused_credentials
         self.calls.append((method, path, body))
         if path == "/manage/admin/connector":
             self.sources.append({**body, "id": len(self.calls)})
@@ -118,7 +125,7 @@ def onyx_delete_checks(agents):
     done = delete(client)
     check("onyx delete waits for Onyx, then deletes the credential",
           client.calls == [("POST", "/manage/admin/deletion-attempt"), ("DELETE", "/manage/admin/credential/8")]
-          and done == "Deleted o3-docs and its credential", (client.calls, done))
+          and done == "Deleted o3-docs and its credential.", (client.calls, done))
 
     client = ScriptedDeletion(polls=0, others=[8])
     delete(client)
@@ -157,7 +164,7 @@ async def onyx_checks(agents):
         table = app.screen.query_one("#sources", DataTable)
         check("onyx screen lists Onyx's sources", isinstance(app.screen, OnyxScreen) and table.row_count == 1,
               app.screen)
-        await pilot.press("n")
+        await pilot.press("s")
         await pilot.pause()
         check("agent shortcuts are off on the onyx screen", isinstance(app.screen, OnyxScreen), app.screen)
 
@@ -217,6 +224,36 @@ async def onyx_checks(agents):
             ("POST", "/manage/admin/deletion-attempt", {"connector_id": github["id"], "credential_id": github["id"] + 1}),
             ("DELETE", f"/manage/admin/credential/{github['id'] + 1}", None)], client.calls)
 
+        client.calls.clear()
+        await pilot.press("c")
+        await settle(app, pilot)
+        check("cleanup with nothing unused changes nothing", isinstance(app.screen, OnyxScreen) and not client.calls,
+              (app.screen, client.calls))
+        client.unused_credentials = [{"id": 900, "name": "stale", "source": "web"}]
+        await pilot.press("c")
+        await settle(app, pilot)
+        check("cleanup asks before deleting", isinstance(app.screen, ConfirmDialog) and not client.calls,
+              (app.screen, client.calls))
+        await pilot.click("#confirm")
+        await settle(app, pilot)
+        check("cleanup deletes the unused credential",
+              client.calls == [("DELETE", "/manage/admin/credential/900", None)], client.calls)
+
+
+def onyx_edit_cli_checks(agents):
+    client = FakeOnyxClient()
+    onyx = Onyx(OnyxSettings.from_env(), agents.api, client)
+    args = build_parser().parse_args(["onyx", "edit", "o3-docs", "--refresh-hours", "0", "--from-stdin", "--yes"])
+    stdin, sys.stdin = sys.stdin, io.StringIO("")
+    try:
+        run_onyx(args, onyx)
+        refused = False
+    except OnyxError:
+        refused = True
+    finally:
+        sys.stdin = stdin
+    check("onyx edit refuses a zero refresh interval", refused and not client.calls, client.calls)
+
 
 async def main():
     agents = Agents(Settings.from_env())
@@ -226,7 +263,7 @@ async def main():
         names = table_names(app)
         check("agent table lists existing agents", "default" in names, names)
 
-        await pilot.press("n")
+        await pilot.press("a")
         await pilot.pause()
         app.screen.query_one("#name", Input).value = NAME
         app.screen.query_one("#mcp", SelectionList).select("atlassian_read")
@@ -238,27 +275,27 @@ async def main():
         await pilot.click("#confirm")
         await settle(app, pilot)
         created = {a.name: a for a in agents.list()}.get(NAME)
-        check("create dialog issues a key with the chosen grants",
+        check("add dialog issues a key with the chosen grants",
               created is not None and created.provisioned and created.mcp_servers == ["atlassian_read"]
               and created.github_levels == ["github_read"] and created.budget == 25,
               created)
         check("table shows the new agent", NAME in table_names(app), table_names(app))
 
         select_row(app, NAME)
-        await pilot.press("g")
+        await pilot.press("e")
         await pilot.pause()
         selection = app.screen.query_one("#mcp", SelectionList)
         selection.deselect("atlassian_read")
         selection.select("atlassian_jira_write")
         app.screen.query_one("#github", SelectionList).deselect("github_read")
         budget = app.screen.query_one("#budget", Input)
-        check("grant dialog shows the current budget", budget.value == "25", budget.value)
+        check("edit dialog shows the current budget", budget.value == "25", budget.value)
         budget.value = "not money"
         app.screen.query_one("#confirm").scroll_visible(animate=False)
         await pilot.pause()
         await pilot.click("#confirm")
         await pilot.pause()
-        check("grant dialog refuses an invalid budget", isinstance(app.screen, GrantDialog), app.screen)
+        check("edit dialog refuses an invalid budget", isinstance(app.screen, EditAgentDialog), app.screen)
         budget.value = "30"
         # The error message pushes the buttons down, out of view again. A Textual button also
         # ignores clicks during its 0.2s press animation.
@@ -267,7 +304,7 @@ async def main():
         await pilot.click("#confirm")
         await settle(app, pilot)
         granted = agents.get(NAME)
-        check("grant dialog replaces MCP and GitHub access and the budget",
+        check("edit dialog replaces MCP and GitHub access and the budget",
               granted.mcp_servers == ["atlassian_jira_write"] and granted.github_levels == [] and granted.budget == 30,
               (granted.mcp_servers, granted.github_levels, granted.budget))
 
@@ -289,6 +326,7 @@ async def main():
     await onyx_checks(agents)
     onyx_cleanup_checks(agents)
     onyx_delete_checks(agents)
+    onyx_edit_cli_checks(agents)
 
 
 try:

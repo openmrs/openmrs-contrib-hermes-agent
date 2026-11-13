@@ -15,9 +15,11 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
-from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
-                     validate_budget, validate_name)
+from .agents import (DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, validate_budget,
+                     validate_name)
 from .litellm import LiteLLMError
+from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
+                       START_HINT)
 from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, source_settings
 
 DIALOG_CSS = """
@@ -57,7 +59,7 @@ class _Dialog(ModalScreen):
             return None
 
 
-class CreateDialog(_Dialog):
+class AddAgentDialog(_Dialog):
     """Name, MCP and GitHub grants, monthly budget, and optional Slack settings for a new agent."""
 
     def __init__(self, servers: list[str], levels: list[str]) -> None:
@@ -67,7 +69,7 @@ class CreateDialog(_Dialog):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Create agent", classes="title")
+            yield Label("Add agent", classes="title")
             yield Input(placeholder="agent name (lowercase letters, digits, dashes)", id="name")
             yield Label("MCP servers (space to toggle):")
             yield SelectionList[str](*[(s, s) for s in self._servers], id="mcp")
@@ -81,7 +83,7 @@ class CreateDialog(_Dialog):
             yield Input(placeholder="SLACK_ALLOWED_USERS (comma-separated member IDs)", id="SLACK_ALLOWED_USERS")
             yield Input(placeholder="SLACK_HOME_CHANNEL (channel ID)", id="SLACK_HOME_CHANNEL")
             yield Static("", classes="error", id="error")
-            yield self._buttons("Create")
+            yield self._buttons("Add")
 
     @on(Button.Pressed, "#confirm")
     def _on_confirm(self) -> None:
@@ -104,7 +106,9 @@ class CreateDialog(_Dialog):
         })
 
 
-class GrantDialog(_Dialog):
+class EditAgentDialog(_Dialog):
+    """An agent's MCP and GitHub grants and monthly budget."""
+
     def __init__(self, agent: Agent, servers: list[str], levels: list[str]) -> None:
         super().__init__()
         self._agent = agent
@@ -113,7 +117,7 @@ class GrantDialog(_Dialog):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label(f"Access for {self._agent.name}", classes="title")
+            yield Label(f"Edit {self._agent.name}", classes="title")
             yield Label("MCP servers (space to toggle; takes effect immediately):")
             yield SelectionList[str](*[(s, s, s in self._agent.mcp_servers) for s in self._servers], id="mcp")
             yield Label("GitHub access levels (takes effect within a minute):")
@@ -188,7 +192,7 @@ class SourceTypeDialog(_Dialog):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Add an Onyx source", classes="title")
+            yield Label("Add source", classes="title")
             for kind, source_type in SOURCE_TYPES.items():
                 yield Button(f"{kind}: {source_type.description}", id=f"type-{kind}")
             yield Horizontal(Button("Cancel", id="cancel"), classes="buttons")
@@ -250,12 +254,13 @@ class SourceDialog(_Dialog):
 
 class OnyxScreen(Screen):
     """Onyx's sources and their indexing state; adds and edits sources through SourceTypeDialog and
-    SourceDialog, and deletes the selected one."""
+    SourceDialog, deletes the selected one, and cleans up what failed adds left behind."""
 
     BINDINGS = [
-        Binding("a", "add", "Add source"),
+        Binding("a", "add", "Add"),
         Binding("e", "edit", "Edit"),
         Binding("d", "delete", "Delete"),
+        Binding("c", "cleanup", "Clean up"),
         Binding("f5", "refresh", "Refresh"),
         Binding("escape", "app.pop_screen", "Back"),
     ]
@@ -289,7 +294,7 @@ class OnyxScreen(Screen):
         selected = self._selected()
         table.clear()
         for s in sources:
-            table.add_row(s["name"], s["source"], s["status"] or "", str(s["documents"] or 0), s["last_index"] or "none",
+            table.add_row(s["name"], s["source"], s["status"] or "unknown", str(s["documents"] or 0), s["last_index"] or "none",
                           key=s["name"])
         if selected in {s["name"] for s in sources}:
             table.move_cursor(row=table.get_row_index(selected))
@@ -358,21 +363,45 @@ class OnyxScreen(Screen):
         self.app.push_screen(ConfirmDialog(f"Delete {name}?", "Removes its documents from the index; agents can't "
                                            "find them until it's added again.", "Delete"), confirmed)
 
+    def action_cleanup(self) -> None:
+        self.run_worker(self._load_unused, thread=True, group="onyx-change")
+
+    def _load_unused(self) -> None:
+        try:
+            connectors, credentials = self.onyx.unused()
+        except (AgentError, LiteLLMError) as e:
+            self.app.call_from_thread(self.notify, str(e), title="Clean up failed", severity="error", timeout=10)
+            return
+        if not connectors and not credentials:
+            self.app.call_from_thread(self.notify, "Nothing to clean up.", title="Clean up")
+            return
+        unused = "\n".join(f"  {kind} {item['name']!r} ({item['source']})"
+                           for kind, items in (("connector", connectors), ("credential", credentials))
+                           for item in items)
+
+        def confirmed(ok: bool | None) -> None:
+            if ok:
+                self.run_worker(lambda: self._change("Clean up", lambda: "\n".join(
+                    self.onyx.cleanup(connectors, credentials))), thread=True, group="onyx-change")
+
+        self.app.call_from_thread(self.app.push_screen, ConfirmDialog(
+            "Clean up Onyx?", f"Not used by any source:\n{unused}", "Delete them"), confirmed)
+
 
 class AdminApp(App):
     TITLE = "Hermes admin"
     BINDINGS = [
-        Binding("n", "create", "New"),
-        Binding("g", "grant", "Access"),
+        Binding("a", "add", "Add"),
+        Binding("e", "edit", "Edit"),
         Binding("s", "slack", "Slack"),
-        Binding("r", "rotate", "Rotate key"),
+        Binding("r", "rotate", "Rotate"),
         Binding("d", "delete", "Delete"),
-        Binding("o", "onyx", "Onyx sources"),
+        Binding("o", "onyx", "Onyx"),
         Binding("f5", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
-    COLUMNS = ("Agent", "Status", "MCP servers", "GitHub", "Budget", "Slack", "Data")
-    AGENT_ACTIONS = {"create", "grant", "slack", "rotate", "delete", "refresh", "onyx"}
+    COLUMNS = ("Agent", "Status", "MCP servers", "GitHub", "Budget", "Workspace", "Slack", "Data")
+    AGENT_ACTIONS = {"add", "edit", "slack", "rotate", "delete", "refresh", "onyx"}
 
     def __init__(self, agents: Agents, onyx: Onyx | None = None) -> None:
         super().__init__()
@@ -409,15 +438,14 @@ class AdminApp(App):
         table = self.query_one("#agents", DataTable)
         table.clear()
         for a in listed:
-            required_set = [a.env_set.get(var) for var in SLACK_REQUIRED_VARS]
-            any_set = any(a.env_set.get(var) for var in SLACK_VARS)
             table.add_row(
                 a.name,
-                "active" if len(a.key_hashes) == 1 else f"{len(a.key_hashes)} keys" if a.key_hashes else "no key",
+                a.key_status,
                 ", ".join(a.mcp_servers) or "none",
                 ", ".join(a.github_levels) or "none",
-                f"${a.spend:,.2f} / ${a.budget:,.0f}" if a.budget is not None else "none",
-                "set" if all(required_set) else "partial" if any_set else "not set",
+                a.describe_budget(short=True),
+                a.workspace_status,
+                a.slack_status,
                 "present" if a.has_data else "none",
                 key=a.name,
             )
@@ -449,29 +477,27 @@ class AdminApp(App):
 
     # -- actions -------------------------------------------------------------------------------
 
-    def action_create(self) -> None:
-        def created(result: dict | None) -> None:
+    def action_add(self) -> None:
+        def added(result: dict | None) -> None:
             if result:
-                self._run("Create", lambda: self.agents.create(
+                self._run("Add agent", lambda: self.agents.create(
                     result["name"], result["mcp"], result["slack"] or None, result["github"], result["budget"]),
-                          f"Created {result['name']}. Start it with: docker compose up -d agent-{result['name']}")
+                          f"Added {result['name']}. {START_HINT.format(name=result['name'])}")
 
-        self.push_screen(CreateDialog(self._servers, self._levels), created)
+        self.push_screen(AddAgentDialog(self._servers, self._levels), added)
 
-    def action_grant(self) -> None:
+    def action_edit(self) -> None:
         agent = self._selected()
         if not agent:
             return
 
-        def granted(result: dict | None) -> None:
+        def edited(result: dict | None) -> None:
             if result is not None:
-                self._run("Access", lambda: self.agents.grant(
+                self._run("Edit agent", lambda: self.agents.grant(
                     agent.name, result["mcp"], result["github"], result["budget"]),
-                          f"{agent.name}: MCP {', '.join(sorted(result['mcp'])) or 'none'}; "
-                          f"GitHub {', '.join(sorted(result['github'])) or 'none'}; "
-                          f"budget ${result['budget']:,.2f}/month.")
+                          f"Updated {agent.name}. {EDIT_HINT}")
 
-        self.push_screen(GrantDialog(agent, self._servers, self._levels), granted)
+        self.push_screen(EditAgentDialog(agent, self._servers, self._levels), edited)
 
     def action_slack(self) -> None:
         agent = self._selected()
@@ -481,7 +507,7 @@ class AdminApp(App):
         def saved(values: dict | None) -> None:
             if values:
                 self._run("Slack", lambda: self.agents.set_slack(agent.name, values),
-                          f"Saved. Restart it with: docker compose restart agent-{agent.name}")
+                          f"Updated {agent.name}'s Slack settings. {SLACK_HINT.format(name=agent.name)}")
 
         self.push_screen(SlackDialog(agent), saved)
 
@@ -493,12 +519,11 @@ class AdminApp(App):
         def confirmed(ok: bool | None) -> None:
             if ok:
                 self._run("Rotate", lambda: self.agents.rotate(agent.name),
-                          f"New keys issued. Restart with: docker compose restart workspace-{agent.name} agent-{agent.name}")
+                          f"{ROTATE_DONE.format(name=agent.name)} {ROTATE_HINT.format(name=agent.name)}")
 
         self.push_screen(ConfirmDialog(
-            f"Rotate {agent.name}'s key?",
-            "New keys are issued for the agent and its workspace, and the old ones revoked. The agent stops "
-            "working until both are restarted.",
+            f"Rotate {agent.name}'s keys?",
+            f"New keys are issued for the agent and its workspace, and the old ones revoked. {ROTATE_WARNING}",
             "Rotate"), confirmed)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -520,12 +545,12 @@ class AdminApp(App):
 
         def keep_data(ok: bool | None) -> None:
             if ok:
-                self._run("Delete", lambda: self.agents.delete(agent.name), f"Deleted {agent.name} (data kept).")
+                self._run("Delete agent", lambda: self.agents.delete(agent.name), DELETED.format(name=agent.name))
 
         def purge(ok: bool | None) -> None:
             if ok:
-                self._run("Delete", lambda: self.agents.delete(agent.name, purge=True),
-                          f"Deleted {agent.name} and its data.")
+                self._run("Delete agent", lambda: self.agents.delete(agent.name, purge=True),
+                          PURGED.format(name=agent.name))
 
         def chosen(choice: str | None) -> None:
             if choice == "keep":

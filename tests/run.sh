@@ -14,7 +14,7 @@
 # What it checks:
 #   1. compose.yaml separates secrets, volumes, and networks; every service has no-new-privileges
 #      and only the capabilities it needs (static).
-#   2. Admin tool: create/grant/rotate/slack/delete; key lockdown (no management API, no provider
+#   2. Admin tool: agent add/edit/rotate/slack/delete; key lockdown (no management API, no provider
 #      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
 #      rotation; per-key MCP access with the right credential and only that server's tools;
 #      mcp-atlassian serves exactly the allowed tools and refuses requests without a key; root-only
@@ -212,9 +212,9 @@ fake_atlassian_calls() {
   log_count_fixed fake-atlassian "atlassian call tool=$1 "
 }
 
-# Prints a field of one agent from `admin show --json`.
+# Prints a field of one agent from `admin agent show --json`.
 agent_field() {
-  admin show "$1" --json | python3 -c 'import json, sys; v = json.load(sys.stdin)[sys.argv[1]]; print(",".join(v) if isinstance(v, list) else v)' "$2"
+  admin agent show "$1" --json | python3 -c 'import json, sys; v = json.load(sys.stdin)[sys.argv[1]]; print(",".join(v) if isinstance(v, list) else v)' "$2"
 }
 
 echo "== Setup"
@@ -269,28 +269,34 @@ compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-to
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
-expect "servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read", "onyx_search"]' "$(admin servers --json)"
-expect "levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin levels --json)"
-expect_ok "create default (atlassian_read, github_read, with Slack)" admin_stdin \
+expect "agent servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read", "onyx_search"]' "$(admin agent servers --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
+expect "agent levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin agent levels --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
+expect_ok "agent add default (atlassian_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
-  create default --mcp atlassian_read --github github_read --slack-from-stdin
-expect_ok "create writer (atlassian_jira_write, \$50 budget)" admin create writer --mcp atlassian_jira_write --budget 50
-expect_ok "create nobody (no MCP)" admin create nobody
-expect_refused "create refuses an existing agent" admin create default --mcp atlassian_read
-expect_refused "create refuses an unknown MCP server" admin create typo --mcp atlassian_raed
-expect "unknown MCP server: no agent created" "" "$(admin list --json | python3 -c 'import json, sys; print(",".join(a["name"] for a in json.load(sys.stdin) if a["name"] == "typo"))')"
-expect_refused "create refuses an unknown GitHub level" admin create typo --github github_raed
-expect_refused "create refuses an invalid name" admin create Bad_Name
-expect_refused "create refuses a zero budget" admin create typo --budget 0
-expect_refused "create refuses a negative budget" admin create typo --budget -5
-expect "list shows the agents" "default nobody writer" \
-  "$(admin list --json | python3 -c 'import json, sys; print(" ".join(a["name"] for a in json.load(sys.stdin)))')"
+  agent add default --mcp atlassian_read --github github_read --from-stdin
+expect_ok "agent add writer (atlassian_jira_write, \$50 budget)" admin agent add writer --mcp atlassian_jira_write --budget 50
+expect_ok "agent add nobody (no MCP)" admin agent add nobody
+expect_refused "agent add refuses an existing agent" admin agent add default --mcp atlassian_read
+expect_refused "agent add refuses an unknown MCP server" admin agent add typo --mcp atlassian_raed
+expect "unknown MCP server: no agent created" "" "$(admin agent list --json | python3 -c 'import json, sys; print(",".join(a["name"] for a in json.load(sys.stdin) if a["name"] == "typo"))')"
+expect_refused "agent add refuses an unknown GitHub level" admin agent add typo --github github_raed
+expect_refused "agent add refuses an invalid name" admin agent add Bad_Name
+expect_refused "agent add refuses a zero budget" admin agent add typo --budget 0
+expect_refused "agent add refuses a negative budget" admin agent add typo --budget -5
+expect "agent list shows the agents" "default nobody writer" \
+  "$(admin agent list --json | python3 -c 'import json, sys; print(" ".join(a["name"] for a in json.load(sys.stdin)))')"
+# Without a terminal, input() doesn't end the prompt's line, so the shown agent's name follows it.
+expect "agent show without a name asks which agent" "writer" \
+  "$(admin_stdin '3\n' agent show | sed -n 's/^Which agent? \[1-3\] //p')"
+expect_refused "agent show refuses a choice that isn't listed" admin_stdin '9\n' agent show
+expect "agent slack --from-stdin needs a name" "error: give the agent's name: with --from-stdin, stdin holds the settings" \
+  "$(admin_stdin 'SLACK_ALLOWED_USERS=U3\n' agent slack --from-stdin 2>&1 | head -n 1)"
 expect "default's grants" "atlassian_read" "$(agent_field default mcp_servers)"
 expect "nobody's grants" "" "$(agent_field nobody mcp_servers)"
 expect "default's GitHub grants" "github_read" "$(agent_field default github_levels)"
 expect "nobody's GitHub grants" "" "$(agent_field nobody github_levels)"
-expect "create sets the default monthly budget" "1000.0" "$(agent_field default budget)"
-expect "create sets the given monthly budget" "50.0" "$(agent_field writer budget)"
+expect "agent add sets the default monthly budget" "1000.0" "$(agent_field default budget)"
+expect "agent add sets the given monthly budget" "50.0" "$(agent_field writer budget)"
 expect "budgets are on the agent's LiteLLM user, monthly" "50.0 1mo" \
   "$(request GET /user/info?user_id=hermes-agent-writer "$master_key" >/dev/null
      python3 -c 'import json, sys; u = json.load(open(sys.argv[1]))["user_info"]; print(u["max_budget"], u["budget_duration"])' \
@@ -299,7 +305,7 @@ expect "default's .env: mode 600, owned by the Hermes user" "600 10000" "$(admin
 expect "default's .env has key, Slack settings, and workspace host" \
   "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN TERMINAL_SSH_HOST" \
   "$(admin_sh 'cut -d= -f1 /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
-expect "create gives the agent a workspace key, not a second agent key" "1 1 True" \
+expect "agent add gives the agent a workspace key, not a second agent key" "1 1 True" \
   "$(agent_field default keys) $(agent_field default workspace_keys) $(agent_field default has_workspace)"
 expect "default's SSH key: mode 600, owned by the Hermes user; known_hosts pins workspace-default" \
   "600 10000 [workspace-default]:2222 ssh-ed25519" \
@@ -388,55 +394,57 @@ expect "mcp-atlassian serves exactly the tools the atlassian_* servers allow" "m
 expect "mcp-atlassian marks exactly atlassian_read's tools read-only" "ok" "$(mcp_atlassian_check read-only)"
 expect "mcp-atlassian refuses requests without a key" "401" "$(mcp_atlassian_check no-key)"
 
-expect_ok "grant writer both servers" admin grant writer --mcp atlassian_read,atlassian_jira_write
-expect "grant takes effect without a new key" "read" "$(atlassian_call "$writer_key" "$atlassian_read_id")"
-expect_ok "grant writer no servers" admin grant writer --no-mcp
+expect_ok "agent edit writer both servers" admin agent edit writer --mcp atlassian_read,atlassian_jira_write
+expect "agent edit takes effect without a new key" "read" "$(atlassian_call "$writer_key" "$atlassian_read_id")"
+expect_ok "agent edit writer no servers" admin agent edit writer --no-mcp
 expect "--no-mcp removes access" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
-expect_ok "grant writer atlassian_confluence_write" admin grant writer --mcp atlassian_confluence_write
+expect_ok "agent edit writer atlassian_confluence_write" admin agent edit writer --mcp atlassian_confluence_write
 expect "writer -> atlassian_confluence_write uses the Confluence write account" "confluence-write" \
   "$(atlassian_call "$writer_key" "$atlassian_confluence_write_id" confluence_update_page)"
 expect "writer -> atlassian_jira_write denied after regrant" "denied" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
-expect_ok "grant writer back to atlassian_jira_write" admin grant writer --mcp atlassian_jira_write
+expect_ok "agent edit writer back to atlassian_jira_write" admin agent edit writer --mcp atlassian_jira_write
 expect "restored grant works" "jira-write" "$(atlassian_call "$writer_key" "$atlassian_jira_write_id")"
-expect_ok "grant writer github_test_write" admin grant writer --github github_test_write
+expect_ok "agent edit writer github_test_write" admin agent edit writer --github github_test_write
 expect "GitHub grant changes only GitHub levels" "github_test_write atlassian_jira_write" \
   "$(agent_field writer github_levels) $(agent_field writer mcp_servers)"
-expect_refused "grant needs something to change" admin grant writer
-expect_ok "grant writer a \$75 budget" admin grant writer --budget 75
-expect "grant changes the budget" "75.0" "$(agent_field writer budget)"
+expect_refused "agent edit needs something to change" admin agent edit writer
+expect_ok "agent edit writer a \$75 budget" admin agent edit writer --budget 75
+expect "agent edit changes the budget" "75.0" "$(agent_field writer budget)"
 expect "budget grant leaves access unchanged" "github_test_write atlassian_jira_write" \
   "$(agent_field writer github_levels) $(agent_field writer mcp_servers)"
-expect_refused "grant refuses a zero budget" admin grant writer --budget 0
+expect_refused "agent edit refuses a zero budget" admin agent edit writer --budget 0
 # Agents from before budgets have a key but no LiteLLM user; their next grant adds one.
 request POST /key/generate "$master_key" '{"user_id": "hermes-agent-legacy",
   "metadata": {"managed_by": "hermes-admin", "hermes_agent": "legacy", "github_levels": []}}' >/dev/null
 expect "an agent without a LiteLLM user has no budget" "None" "$(agent_field legacy budget)"
-expect_ok "grant legacy without a budget" admin grant legacy --no-mcp
-expect "grant gives an agent without a budget the default" "1000.0" "$(agent_field legacy budget)"
-expect_ok "delete legacy --purge" admin delete legacy --purge --yes
+expect_ok "agent edit legacy without a budget" admin agent edit legacy --no-mcp
+expect "agent edit gives an agent without a budget the default" "1000.0" "$(agent_field legacy budget)"
+expect_ok "agent delete legacy --purge" admin agent delete legacy --purge --yes
 
-expect_ok "grant nobody github_read" admin grant nobody --github github_read
+expect_ok "agent edit nobody github_read" admin agent edit nobody --github github_read
 old_nobody_workspace_key="$(workspace_key nobody)"
 old_nobody_ssh_key="$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)"
 # Agents created before admin wrote the workspace host to .env get it from rotate.
 admin_sh 'grep -v ^TERMINAL_SSH_HOST= /agents/nobody/.env > /agents/nobody/.env.new && cat /agents/nobody/.env.new > /agents/nobody/.env && rm /agents/nobody/.env.new'
-expect_ok "rotate nobody" admin rotate nobody
-expect "rotate writes the workspace host to .env" "TERMINAL_SSH_HOST=workspace-nobody" \
+expect_refused "agent rotate needs confirmation without --yes" admin agent rotate nobody </dev/null
+expect "agent rotate without confirmation keeps the key" "$nobody_key" "$(agent_key nobody)"
+expect_ok "agent rotate nobody" admin agent rotate nobody --yes
+expect "agent rotate writes the workspace host to .env" "TERMINAL_SSH_HOST=workspace-nobody" \
   "$(admin_sh 'grep ^TERMINAL_SSH_HOST= /agents/nobody/.env')"
-expect "rotate revokes the old workspace key and leaves one" "401 1" \
+expect "agent rotate revokes the old workspace key and leaves one" "401 1" \
   "$(request GET /key/info "$old_nobody_workspace_key") $(agent_field nobody workspace_keys)"
-expect "rotate issues a new workspace key and SSH key" "new new" \
+expect "agent rotate issues a new workspace key and SSH key" "new new" \
   "$([ "$(workspace_key nobody)" != "$old_nobody_workspace_key" ] && echo new || echo same) $(
     [ "$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)" != "$old_nobody_ssh_key" ] && echo new || echo same)"
 new_nobody_key="$(agent_key nobody)"
-expect "rotate revokes the old key" "401" "$(request GET /v1/models "$nobody_key")"
+expect "agent rotate revokes the old key" "401" "$(request GET /v1/models "$nobody_key")"
 expect "rotate's new key works" "200" "$(request GET /v1/models "$new_nobody_key")"
-expect "rotate leaves one key" "1" "$(agent_field nobody keys)"
-expect "rotate keeps GitHub grants" "github_read" "$(agent_field nobody github_levels)"
+expect "agent rotate leaves one key" "1" "$(agent_field nobody keys)"
+expect "agent rotate keeps GitHub grants" "github_read" "$(agent_field nobody github_levels)"
 
 # The budget is on the agent's LiteLLM user, so rotating keys can't reset spend. LiteLLM answers
 # 422 once spend reaches it.
-expect_ok "grant nobody a tiny budget" admin grant nobody --budget 0.000001
+expect_ok "agent edit nobody a tiny budget" admin agent edit nobody --budget 0.000001
 expect "an agent under budget is answered" "200" \
   "$(request POST /v1/chat/completions "$new_nobody_key" '{"model": "fast", "messages": [{"role": "user", "content": "hi"}]}')"
 for _ in $(seq 1 30); do
@@ -446,50 +454,50 @@ for _ in $(seq 1 30); do
 done
 expect "an agent over budget is refused" "422 budget_exceeded" \
   "$status $(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["error"]["type"])' "$TEST_WORK/body" 2>/dev/null)"
-expect_ok "rotate nobody over budget" admin rotate nobody
+expect_ok "agent rotate nobody over budget" admin agent rotate nobody --yes
 over_budget_key="$(agent_key nobody)"
-expect "rotate doesn't reset spend" "422" \
+expect "agent rotate doesn't reset spend" "422" \
   "$(request POST /v1/chat/completions "$over_budget_key" '{"model": "fast", "messages": [{"role": "user", "content": "hi"}]}')"
-expect_ok "raise nobody's budget" admin grant nobody --budget 1000
+expect_ok "raise nobody's budget" admin agent edit nobody --budget 1000
 expect "raising the budget takes effect immediately" "200" \
   "$(request POST /v1/chat/completions "$over_budget_key" '{"model": "fast", "messages": [{"role": "user", "content": "hi"}]}')"
 new_nobody_key="$over_budget_key"
 
-expect_ok "slack updates one setting from stdin" admin_stdin 'SLACK_ALLOWED_USERS=U2\n' slack default --from-stdin
-expect "slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_TOKEN=xoxb-test" \
+expect_ok "agent slack updates one setting from stdin" admin_stdin 'SLACK_ALLOWED_USERS=U2\n' agent slack default --from-stdin
+expect "agent slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_TOKEN=xoxb-test" \
   "$(admin_sh 'grep -E "^SLACK_(ALLOWED_USERS|BOT_TOKEN)=" /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
-expect "slack keeps the agent's key" "$reader_key" "$(agent_key default)"
+expect "agent slack keeps the agent's key" "$reader_key" "$(agent_key default)"
 
-expect_refused "delete needs confirmation without --yes" admin delete nobody </dev/null
-expect_refused "delete refuses an answer other than y" admin_stdin 'n\n' delete nobody
+expect_refused "agent delete needs confirmation without --yes" admin agent delete nobody </dev/null
+expect_refused "agent delete refuses an answer other than y" admin_stdin 'n\n' agent delete nobody
 # Without a TTY (bin/admin passes -T when output is redirected), the answer still comes from stdin.
-expect_ok "delete nobody (keep data), confirmed on stdin" admin_stdin 'y\n' delete nobody
-expect "delete revokes the key" "401" "$(request GET /v1/models "$new_nobody_key")"
-expect "delete keeps the agent's data" "False True" "$(agent_field nobody provisioned) $(agent_field nobody has_data)"
-expect "delete keeps the agent's budget" "1000.0" "$(agent_field nobody budget)"
-expect "delete removes secrets from .env" "" "$(admin_sh 'grep -E "^(LITELLM_API_KEY|SLACK_)" /agents/nobody/.env || true')"
-expect "delete revokes the workspace key and removes the SSH key and workspace configuration" "0 absent absent" \
+expect_ok "agent delete nobody (keep data), confirmed on stdin" admin_stdin 'y\n' agent delete nobody
+expect "agent delete revokes the key" "401" "$(request GET /v1/models "$new_nobody_key")"
+expect "agent delete keeps the agent's data" "False True" "$(agent_field nobody provisioned) $(agent_field nobody has_data)"
+expect "agent delete keeps the agent's budget" "1000.0" "$(agent_field nobody budget)"
+expect "agent delete removes secrets from .env" "" "$(admin_sh 'grep -E "^(LITELLM_API_KEY|SLACK_)" /agents/nobody/.env || true')"
+expect "agent delete revokes the workspace key and removes the SSH key and workspace configuration" "0 absent absent" \
   "$(agent_field nobody workspace_keys) $(admin_sh 'for p in /agents/nobody/ssh /workspaces/nobody; do
     test -e $p && echo present || echo absent; done' | tr '\n' ' ' | sed 's/ $//')"
-expect_ok "re-create a deleted agent, reusing its data" admin create nobody
-expect_ok "delete nobody --purge" admin delete nobody --purge --yes
+expect_ok "agent add re-creates a deleted agent, reusing its data" admin agent add nobody
+expect_ok "agent delete nobody --purge" admin agent delete nobody --purge --yes
 expect "purge removes the agent's data" "absent" "$(admin_sh 'test -e /agents/nobody && echo present || echo absent')"
 expect "purge removes the agent's LiteLLM user" "404" "$(request GET /user/info?user_id=hermes-agent-nobody "$master_key")"
 expect "unmanaged key untouched" "200" "$(request GET /v1/models "$unmanaged_key")"
 
-# `admin compose` must match compose.yaml's agent-default block, and its block for a new agent
+# `admin agent compose` must match compose.yaml's agent-default block, and its block for a new agent
 # must pass the isolation checks.
-admin compose default > "$TEST_WORK/compose-default.yaml" 2>/dev/null || true
+admin agent compose default > "$TEST_WORK/compose-default.yaml" 2>/dev/null || true
 if [ -s "$TEST_WORK/compose-default.yaml" ] &&
   python3 -c 'import sys; sys.exit(open(sys.argv[2]).read() not in open(sys.argv[1]).read())' \
     "$root/compose.yaml" "$TEST_WORK/compose-default.yaml"; then
-  pass "compose prints the agent-default block in compose.yaml"
+  pass "agent compose prints the agent-default block in compose.yaml"
 else
-  fail "compose prints the agent-default block in compose.yaml (got: $(cat "$TEST_WORK/compose-default.yaml"))"
+  fail "agent compose prints the agent-default block in compose.yaml (got: $(cat "$TEST_WORK/compose-default.yaml"))"
 fi
 # The block uses compose.yaml's x-hermes-agent anchor, so it goes into a copy of compose.yaml, not
 # an override file.
-admin compose extra 2>/dev/null > "$TEST_WORK/compose-extra-block.yaml" || true
+admin agent compose extra 2>/dev/null > "$TEST_WORK/compose-extra-block.yaml" || true
 python3 -c 'import sys; c = open(sys.argv[1]).read(); b = open(sys.argv[2]).read(); print(c.replace("\nnetworks:\n", "\n" + b + "\nnetworks:\n", 1), end="")' \
   "$root/compose.yaml" "$TEST_WORK/compose-extra-block.yaml" > "$TEST_WORK/compose-extra.yaml"
 # shellcheck disable=SC2086
@@ -497,11 +505,11 @@ if $compose_cmd --profile '*' --project-directory "$TEST_WORK/compose-check" -f 
   config --format json 2>/dev/null > "$TEST_WORK/compose-extra.json" &&
   grep -q '"agent-extra"' "$TEST_WORK/compose-extra.json" &&
   python3 "$root/tests/compose_isolation.py" < "$TEST_WORK/compose-extra.json" >/dev/null; then
-  pass "compose output for a new agent passes the isolation checks"
+  pass "agent compose output for a new agent passes the isolation checks"
 else
-  fail "compose output for a new agent passes the isolation checks"
+  fail "agent compose output for a new agent passes the isolation checks"
 fi
-expect_refused "compose refuses an invalid name" admin compose Bad_Name
+expect_refused "agent compose refuses an invalid name" admin agent compose Bad_Name
 # The tests don't run Onyx, so these pass only if admin refuses before calling it. Only the
 # first line is compared: Podman's compose wrapper adds its own line when a command fails.
 expect "onyx add refuses a source missing its token" "error: Token (fine-grained, read-only, public repositories) is required" \
@@ -660,7 +668,7 @@ else
   pass "agent can't reach Postgres"
 fi
 # admin replaces .env with a new file, which the agent's mount only picks up on restart.
-expect_ok "slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' slack default --from-stdin
+expect_ok "agent slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' agent slack default --from-stdin
 compose restart agent-default >/dev/null
 expect "the agent sees admin's .env changes after a restart" "SLACK_HOME_CHANNEL=C0TEST" \
   "$(compose exec -T agent-default sh -c 'grep "^SLACK_HOME_CHANNEL=" /opt/data/.env' 2>&1)"
@@ -714,18 +722,18 @@ unset TEST_TYPESAFE_API_KEY
 # down upstream is granted with a warning.
 export TEST_ATLASSIAN_JIRA_WRITE_API_KEY=""
 restart_litellm
-expect "servers marks a server with an empty credential" "atlassian_jira_write  (unusable: check its credential)" \
-  "$(admin servers 2>&1 | grep atlassian_jira_write)"
-expect_refused "grant refuses a server with an empty credential" admin grant writer --mcp atlassian_read,atlassian_jira_write
+expect "agent servers marks a server with an empty credential" "atlassian_jira_write  (unusable: check its credential)" \
+  "$(admin agent servers 2>&1 | grep atlassian_jira_write)"
+expect_refused "agent edit refuses a server with an empty credential" admin agent edit writer --mcp atlassian_read,atlassian_jira_write
 expect "a refused grant changes nothing" "atlassian_jira_write" "$(agent_field writer mcp_servers)"
 compose stop fake-atlassian >/dev/null
-expect_ok "grant allows a server that's down upstream" admin grant writer --mcp atlassian_read
-expect "grant warns about a server it couldn't check" "1" \
+expect_ok "agent edit allows a server that's down upstream" admin agent edit writer --mcp atlassian_read
+expect "agent edit warns about a server it couldn't check" "1" \
   "$(grep -c "couldn't check MCP server 'atlassian_read'" "$TEST_WORK/out")"
 compose start fake-atlassian >/dev/null
 unset TEST_ATLASSIAN_JIRA_WRITE_API_KEY
 restart_litellm
-expect_ok "grant writer back to atlassian_jira_write" admin grant writer --mcp atlassian_jira_write
+expect_ok "agent edit writer back to atlassian_jira_write" admin agent edit writer --mcp atlassian_jira_write
 
 echo "== 8. Prompt-cache markers"
 # cache-check-<tier> are unmocked copies of the tier entries, pointed at tests/fake_anthropic.py.
@@ -785,7 +793,7 @@ token_request() {
 expect "a granted write level gets a token" "200" "$(token_request "$writer_key" github_test_write)"
 expect "write token: write permissions, limited to the level's repositories" "1" \
   "$(log_count_fixed fake-github 'permissions={"contents":"write","metadata":"read","pull_requests":"write"} repositories=["openmrs-test-repo"]')"
-expect "grant changes reach the workspace key" "200" "$(token_request "$(workspace_key writer)" github_test_write)"
+expect "agent edit changes reach the workspace key" "200" "$(token_request "$(workspace_key writer)" github_test_write)"
 expect "a key without the grant is refused (403)" "403" "$(token_request "$writer_key" github_read)"
 expect "no key is refused (401)" "401" "$(token_request "" github_read)"
 expect "an unknown key is refused (401)" "401" "$(token_request "sk-not-a-key" github_read)"
@@ -890,7 +898,7 @@ unset TEST_WORKSPACE_KEEP_FILES
 
 # Files an agent copies from its image can carry that agent's own SELinux label; admin must still
 # be able to remove them.
-expect_ok "delete --purge an agent that has run" admin delete default --purge --yes
+expect_ok "agent delete --purge an agent that has run" admin agent delete default --purge --yes
 expect "purge removes all of a run agent's data and its workspace configuration" "absent absent" \
   "$(admin_sh 'for p in /agents/default /workspaces/default; do test -e $p && echo present || echo absent; done' |
     tr '\n' ' ' | sed 's/ $//')"
