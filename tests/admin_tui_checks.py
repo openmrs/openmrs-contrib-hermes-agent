@@ -61,6 +61,27 @@ class FakeOnyxClient:
         return {"id": len(self.calls)}
 
 
+def onyx_cleanup_checks(agents):
+    client = FakeOnyxClient()
+    responses = {
+        "/manage/connector": [{"id": 1, "name": "o3-docs", "source": "web", "credential_ids": [1]},
+                              {"id": 2, "name": "wiki", "source": "confluence", "credential_ids": []}],
+        "/manage/admin/credential": [{"id": 0, "name": "", "source": "ingestion_api"},
+                                     {"id": 1, "name": "o3-docs", "source": "web"},
+                                     {"id": 2, "name": "wiki", "source": "confluence"}],
+    }
+    call = client.call
+    client.call = lambda method, path, *a, **k: responses[path] if method == "GET" and path in responses \
+        else call(method, path, *a, **k)
+    onyx = Onyx(OnyxSettings.from_env(), agents.api, client)
+    connectors, credentials = onyx.unused()
+    check("onyx cleanup finds only the unused connector and credential",
+          [c["id"] for c in connectors] == [2] and [c["id"] for c in credentials] == [2], (connectors, credentials))
+    onyx.cleanup(connectors, credentials)
+    check("onyx cleanup deletes them", client.calls == [("DELETE", "/manage/admin/connector/2", None),
+                                                        ("DELETE", "/manage/admin/credential/2", None)], client.calls)
+
+
 async def onyx_checks(agents):
     client = FakeOnyxClient()
     app = AdminApp(agents, Onyx(OnyxSettings.from_env(), agents.api, client))
@@ -174,6 +195,7 @@ async def main():
         check("purge removes the agent", NAME not in {a.name for a in agents.list()})
 
     await onyx_checks(agents)
+    onyx_cleanup_checks(agents)
 
 
 try:

@@ -39,6 +39,8 @@ DEFAULT_ONYX_BUDGET = 100.0
 PROVIDER_NAME = "litellm"
 SEARCH_TOKEN_NAME = "litellm-onyx-search"
 DEFAULT_REFRESH_HOURS = 24
+# The empty credential Onyx creates for sources that need none; never deleted.
+PUBLIC_CREDENTIAL_ID = 0
 
 
 class OnyxError(AgentError):
@@ -370,3 +372,23 @@ class Onyx:
         self.client.call("PUT", f"/manage/connector/{connector['id']}/credential/{created['id']}",
                          {"name": name, "access_type": "public", "groups": []})
         return f"Added {name} ({kind}); Onyx starts indexing it shortly"
+
+    def unused(self) -> tuple[list[dict], list[dict]]:
+        """The connectors and credentials no source uses, e.g. left behind when Onyx refused an
+        `add` part-way. Leftover credentials still hold their tokens."""
+        connectors = self.client.call("GET", "/manage/connector") or []
+        used = {credential_id for connector in connectors for credential_id in connector.get("credential_ids") or []}
+        credentials = [credential for credential in self.client.call("GET", "/manage/admin/credential") or []
+                       if credential["id"] != PUBLIC_CREDENTIAL_ID and credential["id"] not in used]
+        return [connector for connector in connectors if not connector.get("credential_ids")], credentials
+
+    def cleanup(self, connectors: list[dict], credentials: list[dict]) -> list[str]:
+        """Deletes connectors and credentials found by `unused`."""
+        lines = []
+        for connector in connectors:
+            self.client.call("DELETE", f"/manage/admin/connector/{connector['id']}")
+            lines.append(f"Deleted connector {connector['name']!r} ({connector['source']})")
+        for credential in credentials:
+            self.client.call("DELETE", f"/manage/admin/credential/{credential['id']}")
+            lines.append(f"Deleted credential {credential['name']!r} ({credential['source']})")
+        return lines

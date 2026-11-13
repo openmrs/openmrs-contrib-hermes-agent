@@ -206,6 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
     onyx.add_parser("token", help="print a new search token for ONYX_SEARCH_PAT, revoking the previous one")
     q = onyx.add_parser("sources", help="list Onyx's sources and their indexing state")
     q.add_argument("--json", action="store_true")
+    q = onyx.add_parser("cleanup", help="delete connectors and credentials no source uses (left by a failed add)")
+    q.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     q = onyx.add_parser("add", help="add a source for Onyx to index, asking for its settings",
                         description="Source types: " + "; ".join(f"{k}: {t.description}" for k, t in SOURCE_TYPES.items())
                         + ". Onyx doesn't copy sources' permissions: everything the account can see becomes "
@@ -250,6 +252,20 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
                 print("Cancelled (use --yes to skip confirmation).")
                 return 1
         print(onyx.add(args.type, args.name, values, args.refresh_hours))
+    elif args.onyx_command == "cleanup":
+        connectors, credentials = onyx.unused()
+        if not connectors and not credentials:
+            print("Nothing to clean up")
+            return 0
+        if not args.yes:
+            print("Not used by any source:")
+            for kind, items in (("connector", connectors), ("credential", credentials)):
+                for item in items:
+                    print(f"  {kind} {item['name']!r} ({item['source']})")
+            if not _confirm("Delete them? [y/N]"):
+                print("Cancelled (use --yes to skip confirmation).")
+                return 1
+        print("\n".join(onyx.cleanup(connectors, credentials)))
     return 0
 
 
