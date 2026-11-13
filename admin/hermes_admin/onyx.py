@@ -72,6 +72,10 @@ class SourceType:
     fixed: dict[str, Any] = field(default_factory=dict)
 
 
+# Onyx reaches Atlassian through api.atlassian.com for a scoped token, which the site's own URL
+# refuses (401). Service-account keys are always scoped.
+SCOPED_TOKEN_LABEL = "Scoped API token (service-account keys are)"
+
 SOURCE_TYPES = {
     "web": SourceType("web", "a public website, crawled from its base URL", "load_state", (
         SourceField("base_url", "Base URL (pages under it are crawled)"),
@@ -83,6 +87,7 @@ SOURCE_TYPES = {
         SourceField("include_attachments", "Index attachments", kind="bool"),
         SourceField("confluence_username", "Account email", secret=True),
         SourceField("confluence_access_token", "Atlassian API token", secret=True),
+        SourceField("scoped_token", SCOPED_TOKEN_LABEL, kind="bool", default=True),
     ), {"is_cloud": True}),
     "jira": SourceType("jira", "Jira issues (Atlassian Cloud)", "poll", (
         SourceField("jira_base_url", "Jira URL, e.g. https://<site>.atlassian.net"),
@@ -90,6 +95,7 @@ SOURCE_TYPES = {
         SourceField("jql_query", "JQL query instead of a project (blank: none)", required=False),
         SourceField("jira_user_email", "Account email", secret=True),
         SourceField("jira_api_token", "Atlassian API token", secret=True),
+        SourceField("scoped_token", SCOPED_TOKEN_LABEL, kind="bool", default=True),
     )),
     "discourse": SourceType("discourse", "a Discourse forum's topics and posts", "poll", (
         SourceField("base_url", "Forum URL"),
