@@ -6,7 +6,7 @@ filesystem work runs in worker threads so the interface stays responsive.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -200,38 +200,45 @@ class SourceTypeDialog(_Dialog):
 
 
 class SourceDialog(_Dialog):
-    """A new Onyx source's name, settings, and refresh interval; dismisses with them once
-    source_settings accepts them."""
+    """An Onyx source's name, settings, and refresh interval; dismisses with them once
+    source_settings accepts them. With `name` and `current` (from Onyx.source), edits that
+    source: fields start at their current values and blank tokens keep the stored ones."""
 
-    def __init__(self, kind: str) -> None:
+    def __init__(self, kind: str, name: str | None = None, current: dict[str, Any] | None = None,
+                 refresh_hours: float = DEFAULT_REFRESH_HOURS) -> None:
         super().__init__()
-        self._kind = kind
+        self._kind, self._name, self._current, self._refresh_hours = kind, name, current or {}, refresh_hours
         self._type = SOURCE_TYPES[kind]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label(f"Add a {self._kind} source", classes="title")
+            yield Label(f"Edit {self._name} ({self._kind})" if self._name else f"Add a {self._kind} source",
+                        classes="title")
             yield Label("Everything its account can see becomes searchable by every caller: use an account "
                         "that sees only public content.")
-            yield Input(placeholder="name in Onyx, e.g. wiki", id="name")
+            if not self._name:
+                yield Input(placeholder="name in Onyx, e.g. wiki", id="name")
             for f in self._type.fields:
                 if f.kind == "bool":
-                    yield Checkbox(f.label, value=f.default, id=f.key)
+                    yield Checkbox(f.label, value=self._current.get(f.key, f.default), id=f.key)
+                elif f.secret and self._name:
+                    yield Input(placeholder=f"{f.label} (blank keeps the current one)", password=True, id=f.key)
                 else:
-                    yield Input(placeholder=f.label, password=f.secret, id=f.key)
+                    yield Input(value=str(self._current.get(f.key, "")), placeholder=f.label, password=f.secret,
+                                id=f.key)
             yield Label("Re-index every (hours):")
-            yield Input(value=f"{DEFAULT_REFRESH_HOURS:g}", id="refresh-hours")
+            yield Input(value=f"{self._refresh_hours:g}", id="refresh-hours")
             yield Static("", classes="error", id="error")
-            yield self._buttons("Add")
+            yield self._buttons("Save" if self._name else "Add")
 
     @on(Button.Pressed, "#confirm")
     def _on_confirm(self) -> None:
         values = {f.key: self.query_one(f"#{f.key}", Checkbox).value if f.kind == "bool"
                   else self.query_one(f"#{f.key}", Input).value for f in self._type.fields}
-        name = self.query_one("#name", Input).value.strip()
+        name = self._name or self.query_one("#name", Input).value.strip()
         try:
             refresh_hours = float(self.query_one("#refresh-hours", Input).value.strip())
-            source_settings(self._kind, name, values, refresh_hours)
+            source_settings(self._kind, name, values, refresh_hours, keep_secrets=bool(self._name))
         except ValueError:
             self.query_one("#error", Static).update("Re-index interval must be a number of hours.")
             return
@@ -242,10 +249,13 @@ class SourceDialog(_Dialog):
 
 
 class OnyxScreen(Screen):
-    """Onyx's sources and their indexing state; adds sources through SourceTypeDialog and SourceDialog."""
+    """Onyx's sources and their indexing state; adds and edits sources through SourceTypeDialog and
+    SourceDialog, and deletes the selected one."""
 
     BINDINGS = [
         Binding("a", "add", "Add source"),
+        Binding("e", "edit", "Edit"),
+        Binding("d", "delete", "Delete"),
         Binding("f5", "refresh", "Refresh"),
         Binding("escape", "app.pop_screen", "Back"),
     ]
@@ -275,10 +285,14 @@ class OnyxScreen(Screen):
 
     def _show(self, sources: list[dict]) -> None:
         table = self.query_one("#sources", DataTable)
+        # Keeps the selection across refreshes, so e and d act on the source the user picked.
+        selected = self._selected()
         table.clear()
         for s in sources:
             table.add_row(s["name"], s["source"], s["status"] or "", str(s["documents"] or 0), s["last_index"] or "none",
                           key=s["name"])
+        if selected in {s["name"] for s in sources}:
+            table.move_cursor(row=table.get_row_index(selected))
 
     def action_add(self) -> None:
         def chosen(kind: str | None) -> None:
@@ -292,13 +306,57 @@ class OnyxScreen(Screen):
         self.app.push_screen(SourceTypeDialog(), chosen)
 
     def _add(self, kind: str, result: dict) -> None:
+        self._change("Add source", lambda: self.onyx.add(kind, result["name"], result["values"],
+                                                         result["refresh_hours"]))
+
+    def _change(self, label: str, change: Callable[[], str]) -> None:
+        """Runs `change` (in a worker thread), then reports its result and refreshes the table."""
         try:
-            done = self.onyx.add(kind, result["name"], result["values"], result["refresh_hours"])
+            done = change()
         except (AgentError, LiteLLMError) as e:
-            self.app.call_from_thread(self.notify, str(e), title="Add source failed", severity="error", timeout=10)
+            self.app.call_from_thread(self.notify, str(e), title=f"{label} failed", severity="error", timeout=10)
             return
-        self.app.call_from_thread(self.notify, done, title="Add source", timeout=8)
+        self.app.call_from_thread(self.notify, done, title=label, timeout=8)
         self.app.call_from_thread(self.action_refresh)
+
+    def _selected(self) -> str | None:
+        table = self.query_one("#sources", DataTable)
+        if not table.row_count:
+            return None
+        return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+
+    def action_edit(self) -> None:
+        name = self._selected()
+        if name:
+            self.run_worker(lambda: self._load_for_edit(name), thread=True, group="onyx-change")
+
+    def _load_for_edit(self, name: str) -> None:
+        try:
+            kind, current, refresh_hours = self.onyx.source(name)
+        except (AgentError, LiteLLMError) as e:
+            self.app.call_from_thread(self.notify, str(e), title="Edit source failed", severity="error", timeout=10)
+            return
+
+        def edited(result: dict | None) -> None:
+            if result:
+                self.run_worker(lambda: self._change("Edit source", lambda: self.onyx.edit(
+                    name, result["values"], result["refresh_hours"])), thread=True, group="onyx-change")
+
+        self.app.call_from_thread(self.app.push_screen, SourceDialog(kind, name, current, refresh_hours), edited)
+
+    def action_delete(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+
+        def confirmed(ok: bool | None) -> None:
+            if ok:
+                self.notify("Onyx can take a few minutes to remove its documents.", title=f"Deleting {name}")
+                self.run_worker(lambda: self._change("Delete source", lambda: self.onyx.delete(name)),
+                                thread=True, group="onyx-change")
+
+        self.app.push_screen(ConfirmDialog(f"Delete {name}?", "Removes its documents from the index; agents can't "
+                                           "find them until it's added again.", "Delete"), confirmed)
 
 
 class AdminApp(App):

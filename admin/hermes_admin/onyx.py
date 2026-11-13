@@ -41,6 +41,10 @@ SEARCH_TOKEN_NAME = "litellm-onyx-search"
 DEFAULT_REFRESH_HOURS = 24
 # The empty credential Onyx creates for sources that need none; never deleted.
 PUBLIC_CREDENTIAL_ID = 0
+# How long `delete` waits for Onyx to remove a source's documents before leaving its credential to
+# `onyx cleanup`. Onyx checks for deletions about every 20 seconds.
+DELETE_WAIT_SECONDS = 600
+DELETE_POLL_SECONDS = 5
 
 
 class OnyxError(AgentError):
@@ -125,11 +129,12 @@ def parse_bool(value: str) -> bool:
     raise OnyxError(f"expected yes or no, not {value!r}")
 
 
-def source_settings(kind: str, name: str, values: dict[str, Any],
-                    refresh_hours: float = DEFAULT_REFRESH_HOURS) -> tuple[SourceType, dict, dict]:
-    """Checks a new source's settings without calling Onyx, returning its type, connector config,
-    and credential. `values` maps field keys to strings (lists comma-separated, booleans as
-    yes/no) or, for "bool" fields, booleans."""
+def source_settings(kind: str, name: str, values: dict[str, Any], refresh_hours: float = DEFAULT_REFRESH_HOURS,
+                    keep_secrets: bool = False) -> tuple[SourceType, dict, dict]:
+    """Checks a source's settings without calling Onyx, returning its type, connector config, and
+    credential. `values` maps field keys to strings (lists comma-separated, booleans as yes/no)
+    or, for "bool" fields, booleans. With `keep_secrets` (editing a source), blank secret fields
+    are left out of the credential instead of being required, so Onyx keeps the stored ones."""
     source_type = SOURCE_TYPES.get(kind)
     if source_type is None:
         raise OnyxError(f"unknown source type {kind!r}; expected one of {', '.join(SOURCE_TYPES)}")
@@ -148,7 +153,7 @@ def source_settings(kind: str, name: str, values: dict[str, Any],
         else:
             value = str(value).strip()
             if not value:
-                if f.required:
+                if f.required and not (f.secret and keep_secrets):
                     raise OnyxError(f"{f.label} is required")
                 continue
             if f.kind == "list":
@@ -351,6 +356,74 @@ class Onyx:
                 "last_index": pair.get("last_index_attempt_status"),
             })
         return listed
+
+    def _status(self, name: str) -> dict:
+        for status in self.client.call("GET", "/manage/admin/connector/status") or []:
+            if status["name"] == name:
+                return status
+        raise OnyxError(f"Onyx has no source named {name!r}")
+
+    def source(self, name: str) -> tuple[str, dict[str, Any], float]:
+        """A source's SOURCE_TYPES key, current non-secret field values (as `add` takes them), and
+        refresh interval in hours. Onyx doesn't return stored tokens."""
+        connector = self._status(name)["connector"]
+        kind = connector["source"]
+        if kind not in SOURCE_TYPES:
+            raise OnyxError(f"admin can't edit {kind} sources; change {name!r} in Onyx itself")
+        config, values = connector["connector_specific_config"], {}
+        for f in SOURCE_TYPES[kind].fields:
+            if f.secret:
+                continue
+            value = config.get(f.key, f.default if f.kind == "bool" else "")
+            values[f.key] = ", ".join(value) if isinstance(value, list) else value
+        return kind, values, (connector.get("refresh_freq") or DEFAULT_REFRESH_HOURS * 3600) / 3600
+
+    def edit(self, name: str, values: dict[str, Any], refresh_hours: float) -> str:
+        """Replaces a source's settings with `values` (see source_settings); blank tokens keep the
+        stored ones. Onyx re-indexes when the change needs it."""
+        status = self._status(name)
+        connector, credential_id = status["connector"], status["credential"]["id"]
+        source_type, config, credential = source_settings(connector["source"], name, values, refresh_hours,
+                                                          keep_secrets=True)
+        # Keeps any settings admin doesn't ask for (e.g. set in Onyx itself).
+        fields = {f.key for f in source_type.fields}
+        config = {**{k: v for k, v in connector["connector_specific_config"].items() if k not in fields}, **config}
+        if credential:
+            # Onyx merges these into the stored credential.
+            self.client.call("PUT", f"/manage/admin/credential/{credential_id}",
+                             {"name": status["credential"].get("name") or name, "credential_json": credential})
+        self.client.call("PATCH", f"/manage/admin/connector/{connector['id']}", {
+            "name": connector["name"], "source": connector["source"], "input_type": connector["input_type"],
+            "connector_specific_config": config, "refresh_freq": int(refresh_hours * 3600),
+            "prune_freq": connector.get("prune_freq"), "indexing_start": connector.get("indexing_start"),
+            "access_type": status.get("access_type", "public"), "groups": status.get("groups") or [],
+        })
+        return f"Updated {name}"
+
+    def delete(self, name: str, wait: float = DELETE_WAIT_SECONDS, poll: float = DELETE_POLL_SECONDS) -> str:
+        """Deletes a source and its documents from the index, then its credential unless another
+        source uses it. Onyx deletes in the background and keeps credentials, so this waits up to
+        `wait` seconds for it to finish; after that the credential is left to `onyx cleanup`."""
+        status = self._status(name)
+        pair_id, credential_id = status["cc_pair_id"], status["credential"]["id"]
+        # Onyx never clears the message an earlier failed attempt left.
+        failed_before = self.client.call("GET", f"/manage/admin/cc-pair/{pair_id}").get("deletion_failure_message")
+        self.client.call("POST", "/manage/admin/deletion-attempt",
+                         {"connector_id": status["connector"]["id"], "credential_id": credential_id})
+        deadline = time.monotonic() + wait
+        while any(s["cc_pair_id"] == pair_id for s in self.client.call("GET", "/manage/admin/connector/status") or []):
+            failed = self.client.call("GET", f"/manage/admin/cc-pair/{pair_id}").get("deletion_failure_message")
+            if failed and failed != failed_before:
+                raise OnyxError(f"Onyx couldn't delete {name}: {failed.splitlines()[0]}")
+            if time.monotonic() >= deadline:
+                return (f"Still deleting {name}: Onyx removes its documents in the background. Run `onyx cleanup` "
+                        "once it's gone to delete its credential")
+            time.sleep(poll)
+        if credential_id == PUBLIC_CREDENTIAL_ID or any(
+                credential_id in (c.get("credential_ids") or []) for c in self.client.call("GET", "/manage/connector") or []):
+            return f"Deleted {name}"
+        self.client.call("DELETE", f"/manage/admin/credential/{credential_id}")
+        return f"Deleted {name} and its credential"
 
     def add(self, kind: str, name: str, values: dict[str, Any], refresh_hours: float = DEFAULT_REFRESH_HOURS) -> str:
         """Creates a source of SOURCE_TYPES[kind] named `name` (see source_settings); Onyx starts

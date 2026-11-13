@@ -8,7 +8,7 @@ import asyncio
 import sys
 
 from hermes_admin.agents import Agents, Settings
-from hermes_admin.onyx import Onyx, OnyxSettings
+from hermes_admin.onyx import Onyx, OnyxError, OnyxSettings
 from hermes_admin.tui import AdminApp, GrantDialog, OnyxScreen, SourceDialog
 from textual.widgets import DataTable, Input, SelectionList
 
@@ -46,18 +46,26 @@ class FakeOnyxClient:
     """Answers the Onyx API calls the Onyx screen makes, recording the changes."""
 
     def __init__(self):
-        self.sources = [{"name": "o3-docs", "source": "web"}]
+        self.sources = [{"id": 100, "name": "o3-docs", "source": "web", "input_type": "load_state",
+                         "connector_specific_config": {"base_url": "https://o3-docs.openmrs.org/",
+                                                       "web_connector_type": "recursive"}, "refresh_freq": 86400}]
         self.calls = []
 
     def call(self, method, path, body=None, form=None, ok=(200, 201, 204)):
         if method == "GET" and path == "/manage/admin/connector/status":
-            return [{"name": s["name"], "cc_pair_id": i, "connector": {"source": s["source"]}}
-                    for i, s in enumerate(self.sources)]
+            return [{"name": s["name"], "cc_pair_id": s["id"], "connector": s, "credential": {"id": s["id"] + 1, "name": s["name"]},
+                     "access_type": "public", "groups": []} for s in self.sources]
         if method == "GET" and path.startswith("/manage/admin/cc-pair/"):
-            return {"status": "ACTIVE", "num_docs_indexed": 3, "last_index_attempt_status": "success"}
+            return {"status": "ACTIVE", "num_docs_indexed": 3, "last_index_attempt_status": "success",
+                    "deletion_failure_message": None}
+        if method == "GET" and path == "/manage/connector":
+            return [{**s, "credential_ids": [s["id"] + 1]} for s in self.sources]
         self.calls.append((method, path, body))
         if path == "/manage/admin/connector":
-            self.sources.append({"name": body["name"], "source": body["source"]})
+            self.sources.append({**body, "id": len(self.calls)})
+        if path == "/manage/admin/deletion-attempt":
+            # Onyx deletes in the background; here it's done by the next poll.
+            self.sources = [s for s in self.sources if s["id"] != body["connector_id"]]
         return {"id": len(self.calls)}
 
 
@@ -80,6 +88,63 @@ def onyx_cleanup_checks(agents):
     onyx.cleanup(connectors, credentials)
     check("onyx cleanup deletes them", client.calls == [("DELETE", "/manage/admin/connector/2", None),
                                                         ("DELETE", "/manage/admin/credential/2", None)], client.calls)
+
+
+class ScriptedDeletion:
+    """Onyx deleting o3-docs (cc-pair 7, credential 8): it's listed for `polls` more status checks,
+    with `failures` giving each cc-pair read's deletion_failure_message, and `others` lists the
+    other sources' credential ids."""
+
+    def __init__(self, polls, failures=(), others=()):
+        self.polls, self.failures, self.others, self.calls = polls, list(failures), others, []
+
+    def call(self, method, path, body=None, form=None, ok=(200, 201, 204)):
+        if method == "GET" and path == "/manage/admin/connector/status":
+            listed = self.polls >= 0
+            self.polls -= 1
+            return [{"name": "o3-docs", "cc_pair_id": 7, "connector": {"id": 6}, "credential": {"id": 8}}] if listed else []
+        if method == "GET" and path == "/manage/admin/cc-pair/7":
+            return {"deletion_failure_message": self.failures.pop(0) if self.failures else None}
+        if method == "GET" and path == "/manage/connector":
+            return [{"id": 1, "credential_ids": [c]} for c in self.others]
+        self.calls.append((method, path))
+
+
+def onyx_delete_checks(agents):
+    def delete(client, wait=60):
+        return Onyx(OnyxSettings.from_env(), agents.api, client).delete("o3-docs", wait=wait, poll=0)
+
+    client = ScriptedDeletion(polls=2)
+    done = delete(client)
+    check("onyx delete waits for Onyx, then deletes the credential",
+          client.calls == [("POST", "/manage/admin/deletion-attempt"), ("DELETE", "/manage/admin/credential/8")]
+          and done == "Deleted o3-docs and its credential", (client.calls, done))
+
+    client = ScriptedDeletion(polls=0, others=[8])
+    delete(client)
+    check("onyx delete keeps a credential another source uses",
+          client.calls == [("POST", "/manage/admin/deletion-attempt")], client.calls)
+
+    client = ScriptedDeletion(polls=1, failures=["old failure", "old failure"])
+    delete(client)
+    check("onyx delete ignores an earlier attempt's failure",
+          client.calls[-1] == ("DELETE", "/manage/admin/credential/8"), client.calls)
+
+    client = ScriptedDeletion(polls=5, failures=[None, "Error: index unavailable\n\nStack Trace: ..."])
+    try:
+        delete(client)
+        failed = None
+    except OnyxError as e:
+        failed = str(e)
+    check("onyx delete reports Onyx's failure and keeps the credential",
+          failed == "Onyx couldn't delete o3-docs: Error: index unavailable"
+          and client.calls == [("POST", "/manage/admin/deletion-attempt")], (failed, client.calls))
+
+    client = ScriptedDeletion(polls=5)
+    done = delete(client, wait=0)
+    check("onyx delete leaves the credential to cleanup when Onyx is slow",
+          done.startswith("Still deleting o3-docs") and client.calls == [("POST", "/manage/admin/deletion-attempt")],
+          (done, client.calls))
 
 
 async def onyx_checks(agents):
@@ -124,6 +189,33 @@ async def onyx_checks(agents):
                   "repo_owner": "openmrs", "repositories": "openmrs-core, openmrs-esm-core", "include_files": True,
                   "include_prs": True, "include_issues": False}, connector)
         check("onyx screen shows the new source", app.screen.query_one("#sources", DataTable).row_count == 2)
+
+        github = client.sources[1]
+        app.screen.query_one("#sources", DataTable).move_cursor(row=1)
+        client.calls.clear()
+        await pilot.press("e")
+        await settle(app, pilot)
+        dialog = app.screen
+        check("edit opens the selected source with its current settings",
+              isinstance(dialog, SourceDialog) and dialog.query_one("#repositories", Input).value
+              == "openmrs-core, openmrs-esm-core", dialog)
+        dialog.query_one("#repositories", Input).value = "openmrs-core"
+        dialog.query_one("#confirm").scroll_visible(animate=False)
+        await pilot.pause(0.3)
+        await pilot.click("#confirm")
+        await settle(app, pilot)
+        check("edit updates the connector and keeps the stored token",
+              [(m, p) for m, p, _ in client.calls] == [("PATCH", f"/manage/admin/connector/{github['id']}")]
+              and client.calls[0][2]["connector_specific_config"]["repositories"] == "openmrs-core", client.calls)
+
+        client.calls.clear()
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.click("#confirm")
+        await settle(app, pilot)
+        check("delete deletes the selected source and its credential", client.calls == [
+            ("POST", "/manage/admin/deletion-attempt", {"connector_id": github["id"], "credential_id": github["id"] + 1}),
+            ("DELETE", f"/manage/admin/credential/{github['id'] + 1}", None)], client.calls)
 
 
 async def main():
@@ -196,6 +288,7 @@ async def main():
 
     await onyx_checks(agents)
     onyx_cleanup_checks(agents)
+    onyx_delete_checks(agents)
 
 
 try:

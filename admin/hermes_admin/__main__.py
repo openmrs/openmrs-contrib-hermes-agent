@@ -11,6 +11,7 @@ import argparse
 import getpass
 import json
 import sys
+from typing import Any
 
 from .agents import (DEFAULT_BUDGET, SLACK_REQUIRED_VARS, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents,
                      Settings, validate_name)
@@ -223,6 +224,15 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--from-stdin", action="store_true",
                    help="read the settings as KEY=VALUE lines from stdin instead of asking (keys: see the prompts)")
     q.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    q = onyx.add_parser("edit", help="change a source's settings, asking for each with its current value")
+    q.add_argument("name", nargs="?", help="the source's name (default: choose from a list)")
+    q.add_argument("--refresh-hours", type=float, help="how often Onyx re-indexes it (default: unchanged)")
+    q.add_argument("--from-stdin", action="store_true",
+                   help="read the settings to change as KEY=VALUE lines from stdin; the rest stay as they are")
+    q.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    q = onyx.add_parser("delete", help="delete a source, its documents in the index, and its credential")
+    q.add_argument("name", nargs="?", help="the source's name (default: choose from a list)")
+    q.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     return parser
 
 
@@ -248,14 +258,37 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
         source_settings(args.type, args.name, values, args.refresh_hours)
         if not args.yes:
             print(f"Add {args.name} ({args.type}), re-indexed every {args.refresh_hours:g} hours:")
-            for f in source_type.fields:
-                value = values.get(f.key, "")
-                shown = "(set)" if f.secret and value else value or ("(default)" if f.kind == "bool" else "(blank)")
-                print(f"  {f.label}: {shown}")
+            _print_source(source_type, values)
             if not _confirm("Everything this account can see becomes searchable by every caller. Add it? [y/N]"):
                 print("Cancelled (use --yes to skip confirmation).")
                 return 1
         print(onyx.add(args.type, args.name, values, args.refresh_hours))
+    elif args.onyx_command == "edit":
+        name = args.name or _pick_source(onyx)
+        if name is None:
+            return 1
+        kind, current, refresh_hours = onyx.source(name)
+        source_type = SOURCE_TYPES[kind]
+        values = {**current, **(_read_source_stdin(source_type) if args.from_stdin
+                                else _prompt_source(source_type, current))}
+        refresh_hours = args.refresh_hours or refresh_hours
+        source_settings(kind, name, values, refresh_hours, keep_secrets=True)
+        if not args.yes:
+            print(f"Update {name} ({kind}), re-indexed every {refresh_hours:g} hours:")
+            _print_source(source_type, values, blank_secret="(unchanged)")
+            if not _confirm("Update it? [y/N]"):
+                print("Cancelled (use --yes to skip confirmation).")
+                return 1
+        print(onyx.edit(name, values, refresh_hours))
+    elif args.onyx_command == "delete":
+        name = args.name or _pick_source(onyx)
+        if name is None:
+            return 1
+        if not args.yes and not _confirm(f"Delete {name} and remove its documents from the index? [y/N]"):
+            print("Cancelled (use --yes to skip confirmation).")
+            return 1
+        print(f"Deleting {name}; Onyx can take a few minutes to remove its documents...", flush=True)
+        print(onyx.delete(name))
     elif args.onyx_command == "cleanup":
         connectors, credentials = onyx.unused()
         if not connectors and not credentials:
@@ -287,15 +320,57 @@ def _read_source_stdin(source_type: SourceType) -> dict[str, str]:
     return values
 
 
-def _prompt_source(source_type: SourceType) -> dict[str, str]:
-    values = {}
+def _prompt_source(source_type: SourceType, current: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Asks for each field. With `current` (editing), Enter keeps a field's current value; blank
+    tokens are kept by Onyx."""
+    values: dict[str, Any] = {}
     for f in source_type.fields:
         if f.kind == "bool":
-            values[f.key] = input(f"{f.label} [{'Y/n' if f.default else 'y/N'}]: ").strip()
+            default = current[f.key] if current else f.default
+            answer = input(f"{f.label} [{'Y/n' if default else 'y/N'}]: ").strip()
+            values[f.key] = answer or default
+        elif f.secret:
+            hint = "input hidden; blank keeps the current one" if current is not None else "input hidden"
+            values[f.key] = getpass.getpass(f"{f.label} ({hint}): ").strip()
         else:
-            ask = getpass.getpass if f.secret else input
-            values[f.key] = ask(f"{f.label}{' (input hidden)' if f.secret else ''}: ").strip()
+            old = (current or {}).get(f.key, "")
+            answer = input(f"{f.label}{f' [{old}]' if old else ''}{' (- to clear)' if old and not f.required else ''}: ")
+            answer = answer.strip()
+            values[f.key] = "" if answer == "-" else answer or old
     return values
+
+
+def _print_source(source_type: SourceType, values: dict[str, Any], blank_secret: str = "(blank)") -> None:
+    for f in source_type.fields:
+        value = values.get(f.key, "")
+        if f.secret:
+            shown = "(set)" if value else blank_secret
+        elif f.kind == "bool":
+            shown = ("yes" if value else "no") if isinstance(value, bool) else value or "(default)"
+        else:
+            shown = value or "(blank)"
+        print(f"  {f.label}: {shown}")
+
+
+def _pick_source(onyx: Onyx) -> str | None:
+    """Lists Onyx's sources numbered and asks which one; None if there are none or no answer."""
+    names = [s["name"] for s in onyx.sources()]
+    if not names:
+        print("Onyx has no sources.")
+        return None
+    for i, name in enumerate(names, 1):
+        print(f"  {i}. {name}")
+    try:
+        answer = input(f"Which source? [1-{len(names)}] ").strip()
+    except EOFError:
+        print()
+        return None
+    if answer.isdigit() and 1 <= int(answer) <= len(names):
+        return names[int(answer) - 1]
+    if answer in names:
+        return answer
+    print("Cancelled: no such source.")
+    return None
 
 
 def run(args: argparse.Namespace, agents: Agents) -> int:
