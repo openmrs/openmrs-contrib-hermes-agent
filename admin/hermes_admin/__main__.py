@@ -140,9 +140,13 @@ def _prompt_slack(keep_existing: bool) -> dict[str, str]:
 
 
 def _confirm(question: str, expected: str = "y") -> bool:
-    if not sys.stdin.isatty():
+    """Asks on stdin, which needn't be a terminal: bin/admin passes `-T` when its output is
+    redirected, and some Compose setups don't allocate a TTY. No input (EOF) means no."""
+    try:
+        return input(f"{question} ").strip() == expected
+    except EOFError:
+        print()
         return False
-    return input(f"{question} ").strip() == expected
 
 
 def build_parser() -> argparse.ArgumentParser:

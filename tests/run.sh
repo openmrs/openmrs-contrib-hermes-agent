@@ -460,8 +460,10 @@ expect "slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_TOKEN=
   "$(admin_sh 'grep -E "^SLACK_(ALLOWED_USERS|BOT_TOKEN)=" /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
 expect "slack keeps the agent's key" "$reader_key" "$(agent_key default)"
 
-expect_refused "delete needs confirmation without --yes" admin delete nobody
-expect_ok "delete nobody (keep data)" admin delete nobody --yes
+expect_refused "delete needs confirmation without --yes" admin delete nobody </dev/null
+expect_refused "delete refuses an answer other than y" admin_stdin 'n\n' delete nobody
+# Without a TTY (bin/admin passes -T when output is redirected), the answer still comes from stdin.
+expect_ok "delete nobody (keep data), confirmed on stdin" admin_stdin 'y\n' delete nobody
 expect "delete revokes the key" "401" "$(request GET /v1/models "$new_nobody_key")"
 expect "delete keeps the agent's data" "False True" "$(agent_field nobody provisioned) $(agent_field nobody has_data)"
 expect "delete keeps the agent's budget" "1000.0" "$(agent_field nobody budget)"
