@@ -11,7 +11,7 @@ from typing import Any, Callable
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
@@ -20,7 +20,7 @@ from .agents import (DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentE
 from .litellm import LiteLLMError
 from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
                        START_HINT)
-from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, source_settings
+from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, format_errors, source_settings
 
 DIALOG_CSS = """
 ModalScreen { align: center middle; }
@@ -252,13 +252,39 @@ class SourceDialog(_Dialog):
         self.dismiss({"name": name, "values": values, "refresh_hours": refresh_hours})
 
 
+class ErrorsScreen(Screen):
+    """A source's latest indexing attempts and open errors, from Onyx.errors; t toggles failed
+    attempts' tracebacks."""
+
+    BINDINGS = [
+        Binding("t", "trace", "Tracebacks"),
+        Binding("escape", "app.pop_screen", "Back"),
+    ]
+
+    def __init__(self, report: dict) -> None:
+        super().__init__()
+        self._report, self._trace = report, False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with VerticalScroll():
+            yield Static(format_errors(self._report), markup=False, id="errors")
+        yield Footer()
+
+    def action_trace(self) -> None:
+        self._trace = not self._trace
+        self.query_one("#errors", Static).update(format_errors(self._report, self._trace))
+
+
 class OnyxScreen(Screen):
     """Onyx's sources and their indexing state; adds and edits sources through SourceTypeDialog and
-    SourceDialog, deletes the selected one, and cleans up what failed adds left behind."""
+    SourceDialog, shows the selected one's indexing errors, deletes it, and cleans up what failed adds
+    left behind."""
 
     BINDINGS = [
         Binding("a", "add", "Add"),
         Binding("e", "edit", "Edit"),
+        Binding("i", "errors", "Errors"),
         Binding("d", "delete", "Delete"),
         Binding("c", "cleanup", "Clean up"),
         Binding("f5", "refresh", "Refresh"),
@@ -348,6 +374,19 @@ class OnyxScreen(Screen):
                     name, result["values"], result["refresh_hours"])), thread=True, group="onyx-change")
 
         self.app.call_from_thread(self.app.push_screen, SourceDialog(kind, name, current, refresh_hours), edited)
+
+    def action_errors(self) -> None:
+        name = self._selected()
+        if name:
+            self.run_worker(lambda: self._load_errors(name), thread=True, group="onyx-change")
+
+    def _load_errors(self, name: str) -> None:
+        try:
+            report = self.onyx.errors(name)
+        except (AgentError, LiteLLMError) as e:
+            self.app.call_from_thread(self.notify, str(e), title="Errors failed", severity="error", timeout=10)
+            return
+        self.app.call_from_thread(self.app.push_screen, ErrorsScreen(report))
 
     def action_delete(self) -> None:
         name = self._selected()

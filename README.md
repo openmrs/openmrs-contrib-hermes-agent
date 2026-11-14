@@ -270,6 +270,7 @@ bin/admin agent compose <name>                  # agent-<name> and workspace-<na
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
 bin/admin onyx list                             # sources and their indexing state
+bin/admin onyx errors [<name>] [--trace]        # a source's latest indexing attempts and open errors
 bin/admin onyx add <type> <name> [--refresh-hours H] [--yes]
 bin/admin onyx edit [<name>] [--refresh-hours H] [--yes]
 bin/admin onyx delete [<name>] [--yes]
@@ -279,7 +280,8 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
 - **Names are optional** where shown in brackets: without one, admin lists the agents or sources and
   asks which.
 - **Changes ask for confirmation** where `--yes` is shown; `--yes` skips it, e.g. in scripts.
-- **`--json`** on `list`, `show`, `servers`, and `levels` prints machine-readable output.
+- **`--json`** on `list`, `show`, `servers`, `levels`, and `onyx errors` prints machine-readable output.
+- **Indexing logs** are in `docker compose logs onyx-background` (fetching, embedding, indexing).
 
 - **LiteLLM is the source of truth.** An agent is the set of keys tagged `managed_by: hermes-admin`;
   other keys are ignored. Budgets and spend are on the LiteLLM user `hermes-agent-<name>`.

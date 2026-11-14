@@ -5,14 +5,16 @@ Cleans up the agent it creates. The tests don't run Onyx, so its screen talks to
 """
 
 import asyncio
+import contextlib
 import io
+import json
 import sys
 
 from hermes_admin.__main__ import build_parser, run_onyx
 from hermes_admin.agents import Agents, Settings
 from hermes_admin.onyx import Onyx, OnyxError, OnyxSettings
-from hermes_admin.tui import AdminApp, ConfirmDialog, EditAgentDialog, OnyxScreen, SourceDialog
-from textual.widgets import DataTable, Input, SelectionList
+from hermes_admin.tui import AdminApp, ConfirmDialog, EditAgentDialog, ErrorsScreen, OnyxScreen, SourceDialog
+from textual.widgets import DataTable, Input, SelectionList, Static
 
 NAME = "tui-check"
 failures = []
@@ -44,6 +46,16 @@ def select_row(app, name):
     table.move_cursor(row=table.get_row_index(name))
 
 
+# A failed indexing attempt and one open document error, as Onyx reports them for every source.
+ATTEMPT = {"id": 5, "status": "failed", "time_started": "2026-11-14T15:12:26.1+00:00",
+           "time_finished": "2026-11-14T15:12:32.2+00:00", "total_docs_indexed": 0, "error_count": 1,
+           "error_msg": "Not Found (404) for https://o3-docs.openmrs.org/", "full_exception_trace": "Traceback: boom",
+           "from_beginning": False}
+DOC_ERROR = {"id": 1, "index_attempt_id": 5, "time_created": "2026-11-14T15:12:30Z", "document_id": "doc-1",
+             "document_link": "https://o3-docs.openmrs.org/page", "entity_id": None,
+             "failure_message": "embedding failed", "is_resolved": False}
+
+
 class FakeOnyxClient:
     """Answers the Onyx API calls the Onyx screen makes, recording the changes."""
 
@@ -59,6 +71,10 @@ class FakeOnyxClient:
         if method == "GET" and path == "/manage/admin/connector/status":
             return [{"name": s["name"], "cc_pair_id": s["id"], "connector": s, "credential": {"id": s["id"] + 1, "name": s["name"]},
                      "access_type": "public", "groups": []} for s in self.sources]
+        if method == "GET" and "/index-attempts?" in path:
+            return {"items": [ATTEMPT], "total_items": 1}
+        if method == "GET" and "/errors?" in path:
+            return {"items": [DOC_ERROR], "total_items": 3}
         if method == "GET" and path.startswith("/manage/admin/cc-pair/"):
             return {"status": "ACTIVE", "num_docs_indexed": 3, "last_index_attempt_status": "success",
                     "deletion_failure_message": None}
@@ -215,6 +231,20 @@ async def onyx_checks(agents):
               [(m, p) for m, p, _ in client.calls] == [("PATCH", f"/manage/admin/connector/{github['id']}")]
               and client.calls[0][2]["connector_specific_config"]["repositories"] == "openmrs-core", client.calls)
 
+        await pilot.press("i")
+        await settle(app, pilot)
+        shown = str(app.screen.query_one("#errors", Static).render()) if isinstance(app.screen, ErrorsScreen) else ""
+        check("errors shows the selected source's failed attempt and document errors",
+              "Indexing attempts for github" in shown and "Not Found (404)" in shown and "embedding failed" in shown
+              and "Traceback" not in shown, shown)
+        await pilot.press("t")
+        await pilot.pause()
+        shown = str(app.screen.query_one("#errors", Static).render())
+        check("t shows failed attempts' tracebacks", "Traceback: boom" in shown, shown)
+        await pilot.press("escape")
+        await pilot.pause()
+        check("escape returns from errors to the onyx screen", isinstance(app.screen, OnyxScreen), app.screen)
+
         client.calls.clear()
         await pilot.press("d")
         await pilot.pause()
@@ -253,6 +283,31 @@ def onyx_edit_cli_checks(agents):
     finally:
         sys.stdin = stdin
     check("onyx edit refuses a zero refresh interval", refused and not client.calls, client.calls)
+
+
+def onyx_errors_cli_checks(agents):
+    def errors(*flags):
+        client = FakeOnyxClient()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run_onyx(build_parser().parse_args(["onyx", "errors", "o3-docs", *flags]),
+                     Onyx(OnyxSettings.from_env(), agents.api, client))
+        return out.getvalue(), client
+
+    text, client = errors()
+    check("onyx errors lists attempts and open document errors, without changing anything", text == (
+        "Indexing attempts for o3-docs, newest first:\n"
+        "  #5 failed: started 2026-11-14 15:12 UTC, finished 2026-11-14 15:12 UTC, 0 documents, 1 errors\n"
+        "    Not Found (404) for https://o3-docs.openmrs.org/\n"
+        "Open document errors (1 of 3; the rest are in Onyx's web UI):\n"
+        "  https://o3-docs.openmrs.org/page (attempt #5, 2026-11-14 15:12 UTC)\n"
+        "    embedding failed\n") and not client.calls, (text, client.calls))
+    text, _ = errors("--trace")
+    check("onyx errors --trace adds failed attempts' tracebacks", "    Traceback: boom\n" in text, text)
+    report = json.loads(errors("--json")[0])
+    check("onyx errors --json gives the attempts and errors",
+          report["attempts"][0]["error_msg"] == ATTEMPT["error_msg"] and report["errors"][0]["document_id"] == "doc-1"
+          and report["total_errors"] == 3, report)
 
 
 async def main():
@@ -327,6 +382,7 @@ async def main():
     onyx_cleanup_checks(agents)
     onyx_delete_checks(agents)
     onyx_edit_cli_checks(agents)
+    onyx_errors_cli_checks(agents)
 
 
 try:

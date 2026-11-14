@@ -45,6 +45,9 @@ PUBLIC_CREDENTIAL_ID = 0
 # `onyx cleanup`. Onyx checks for deletions about every 20 seconds.
 DELETE_WAIT_SECONDS = 600
 DELETE_POLL_SECONDS = 5
+# How much of a source's indexing history `errors` shows; Onyx's web UI (onyx-web) has the rest.
+ERROR_ATTEMPTS = 5
+ERROR_PAGE_SIZE = 100
 
 
 class OnyxError(AgentError):
@@ -357,6 +360,24 @@ class Onyx:
             })
         return listed
 
+    def errors(self, name: str) -> dict:
+        """A source's latest ERROR_ATTEMPTS indexing attempts, newest first, each with Onyx's
+        message for a failed run, and the source's open per-document errors (at most
+        ERROR_PAGE_SIZE of them; `total_errors` counts all)."""
+        pair_id = self._status(name)["cc_pair_id"]
+        attempts = self.client.call("GET", f"/manage/admin/cc-pair/{pair_id}/index-attempts?page_size={ERROR_ATTEMPTS}")
+        errors = self.client.call("GET", f"/manage/admin/cc-pair/{pair_id}/errors?page_size={ERROR_PAGE_SIZE}")
+        return {
+            "name": name,
+            "attempts": [{key: attempt.get(key) for key in (
+                "id", "status", "time_started", "time_finished", "total_docs_indexed", "error_count",
+                "error_msg", "full_exception_trace")} for attempt in attempts["items"]],
+            "errors": [{key: error.get(key) for key in (
+                "index_attempt_id", "time_created", "document_id", "document_link", "entity_id",
+                "failure_message")} for error in errors["items"]],
+            "total_errors": errors["total_items"],
+        }
+
     def _status(self, name: str) -> dict:
         for status in self.client.call("GET", "/manage/admin/connector/status") or []:
             if status["name"] == name:
@@ -465,3 +486,34 @@ class Onyx:
             self.client.call("DELETE", f"/manage/admin/credential/{credential['id']}")
             lines.append(f"Deleted credential {credential['name']!r} ({credential['source']}).")
         return lines
+
+
+def format_errors(report: dict, trace: bool = False) -> str:
+    """`Onyx.errors`' report as text; with `trace`, failed attempts include their full traceback."""
+
+    def when(timestamp: str | None) -> str:
+        return timestamp[:16].replace("T", " ") + " UTC" if timestamp else "-"
+
+    def indent(text: str) -> str:
+        return "\n".join(f"    {line}" for line in text.strip().splitlines())
+
+    lines = [f"Indexing attempts for {report['name']}, newest first:" if report["attempts"]
+             else f"{report['name']} hasn't been indexed yet."]
+    for a in report["attempts"]:
+        lines.append(f"  #{a['id']} {a['status']}: started {when(a['time_started'])}, finished "
+                     f"{when(a['time_finished'])}, {a['total_docs_indexed']} documents, {a['error_count']} errors")
+        if a["error_msg"]:
+            lines.append(indent(a["error_msg"]))
+        if trace and a["full_exception_trace"]:
+            lines.append(indent(a["full_exception_trace"]))
+    errors, total = report["errors"], report["total_errors"]
+    if not total:
+        lines.append("No open document errors.")
+    else:
+        lines.append(f"Open document errors ({total}):" if total == len(errors)
+                     else f"Open document errors ({len(errors)} of {total}; the rest are in Onyx's web UI):")
+        for e in errors:
+            what = e["document_link"] or e["document_id"] or e["entity_id"] or "(whole run)"
+            lines.append(f"  {what} (attempt #{e['index_attempt_id']}, {when(e['time_created'])})")
+            lines.append(indent(e["failure_message"]))
+    return "\n".join(lines)

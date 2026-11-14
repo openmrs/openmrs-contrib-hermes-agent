@@ -20,7 +20,7 @@ from .litellm import LiteLLMError
 from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
                        START_HINT)
 from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxSettings, SourceType,
-                   source_settings)
+                   format_errors, source_settings)
 
 # The agent-<name> and workspace-<name> services for compose.yaml. tests/run.sh checks that
 # compose.yaml has this output for `default` and that the output passes the compose isolation checks.
@@ -250,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from-stdin", action="store_true",
                    help="read the settings as KEY=VALUE lines from stdin instead of asking (keys: see the prompts)")
     p.add_argument("--yes", action="store_true", help=no_confirm)
+    p = sub.add_parser("errors", help="show a source's latest indexing attempts and open errors")
+    p.add_argument("name", nargs="?", help=pick_source)
+    p.add_argument("--trace", action="store_true", help="include failed attempts' full tracebacks")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("edit", help="change a source's settings, asking for each with its current value")
     p.add_argument("name", nargs="?", help=pick_source)
     p.add_argument("--refresh-hours", type=float, help="how often Onyx re-indexes it (default: unchanged)")
@@ -386,7 +390,10 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
         name = _name(args, "source", lambda: [s["name"] for s in onyx.sources()])
         if name is None:
             return 1
-        if command == "edit":
+        if command == "errors":
+            report = onyx.errors(name)
+            print(json.dumps(report, indent=2) if args.json else format_errors(report, args.trace))
+        elif command == "edit":
             kind, current, refresh_hours = onyx.source(name)
             source_type = SOURCE_TYPES[kind]
             values = {**current, **(_read_stdin([f.key for f in source_type.fields]) if args.from_stdin
