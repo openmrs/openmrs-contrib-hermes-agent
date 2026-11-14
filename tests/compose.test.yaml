@@ -125,3 +125,5 @@ networks:
     driver_opts: {com.docker.network.bridge.name: ht-onyx-backend}
   onyx-egress:
     driver_opts: {com.docker.network.bridge.name: ht-onyx-egress}
+  onyx-ui:
+    driver_opts: {com.docker.network.bridge.name: ht-onyx-ui}

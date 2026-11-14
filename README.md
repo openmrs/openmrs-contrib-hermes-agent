@@ -242,6 +242,7 @@ Read from the environment or a `.env` file next to `compose.yaml` (git-ignored).
 | Variable | Default | Purpose |
 |---|---|---|
 | `LITELLM_HOST_PORT` | `4000` | Host port for LiteLLM's admin UI, on 127.0.0.1 |
+| `ONYX_UI_HOST_PORT` | `3000` | Host port for Onyx's web UI, on 127.0.0.1 |
 | `HERMES_UID`, `HERMES_GID` | `10000` | User and group agents run as and own their files |
 | `GIT_BOT_NAME`, `GIT_BOT_EMAIL` | (none) | Author of agents' commits (the `github_pr` App's bot). Commits fail until both are set |
 
@@ -281,6 +282,10 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   asks which.
 - **Changes ask for confirmation** where `--yes` is shown; `--yes` skips it, e.g. in scripts.
 - **`--json`** on `list`, `show`, `servers`, `levels`, and `onyx errors` prints machine-readable output.
+- **Onyx's web UI** is at `http://127.0.0.1:3000` (`ONYX_UI_HOST_PORT`); log in with
+  `ONYX_ADMIN_EMAIL` and `ONYX_ADMIN_PASSWORD` from `secrets/onyx-admin.env`. Use it to look into
+  indexing beyond what `onyx errors` shows and to browse what's indexed, but manage sources and
+  models with admin: the UI can also change them, which admin doesn't expect.
 - **Indexing logs** are in `docker compose logs onyx-background` (fetching, embedding, indexing).
 
 - **LiteLLM is the source of truth.** An agent is the set of keys tagged `managed_by: hermes-admin`;
@@ -324,6 +329,8 @@ digest of the tag's multi-platform index (`docker buildx imagetools inspect <ima
   the image, because agents can't write their `config.yaml`.
 - **LiteLLM:** the `litellm` image. `litellm/tier_classifier.py` depends on its internals (tested).
 - **mcp-atlassian:** the `mcp-atlassian` image.
+- **Onyx:** `x-onyx-backend` and `onyx-web` together. Check that the web UI still logs in: it
+  reaches `onyx-api` through a route Onyx calls development-only (see `onyx-web`).
 - **Python:** the base image in the `admin/`, `github-token/`, and `workspace/` Dockerfiles.
 - **Workspace toolchain:** the JDK, Node, Maven, and GitHub CLI pins in `workspace/Dockerfile`.
 - **Postgres:** a major version also needs `pg_upgrade` or a dump and restore; the volume is

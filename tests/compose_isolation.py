@@ -214,11 +214,19 @@ def members(network):
     return sorted(name for name, s in services.items() if network in network_names(s))
 
 
-onyx_services = sorted(name for name in services if name.startswith("onyx-"))
+# onyx-web, the UI, is checked separately: it publishes a port and never reaches the datastores.
+onyx_services = sorted(name for name in services if name.startswith("onyx-") and name != "onyx-web")
 check("onyx services exist", {"onyx-api", "onyx-background", "onyx-mcp", "onyx-db", "onyx-opensearch"} <= set(onyx_services),
       onyx_services)
 for name in onyx_services:
     check(f"{name}: no published ports", not services[name].get("ports"), services[name].get("ports"))
+onyx_web = services.get("onyx-web", {})
+check("onyx-web service exists", bool(onyx_web))
+check("onyx-web: no secrets", not secrets(onyx_web), secrets(onyx_web))
+check("onyx-web: only on the onyx-ui network", network_names(onyx_web) == {"onyx-ui"}, sorted(network_names(onyx_web)))
+check("onyx-web: host port bound to 127.0.0.1 only",
+      all(p.get("host_ip") == "127.0.0.1" for p in onyx_web.get("ports") or []), onyx_web.get("ports"))
+check("onyx-web: no mounts", not mounts(onyx_web), mounts(onyx_web))
 for network in ("onyx", "onyx-backend"):
     check(f"{network} network is internal", networks.get(network, {}).get("internal") is True, networks.get(network))
 check("onyx network: only litellm, admin, and the Onyx services that call models, serve MCP, or take configuration",
@@ -226,6 +234,7 @@ check("onyx network: only litellm, admin, and the Onyx services that call models
 check("onyx-backend network: only Onyx services", members("onyx-backend") == onyx_services, members("onyx-backend"))
 check("onyx-egress network: only onyx-api and onyx-background",
       members("onyx-egress") == ["onyx-api", "onyx-background"], members("onyx-egress"))
+check("onyx-ui network: only onyx-web and onyx-api", members("onyx-ui") == ["onyx-api", "onyx-web"], members("onyx-ui"))
 check("litellm-db network is internal", networks.get("litellm-db", {}).get("internal") is True, networks.get("litellm-db"))
 
 sys.exit(1 if failures else 0)

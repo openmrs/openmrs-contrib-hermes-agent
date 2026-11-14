@@ -23,6 +23,8 @@
 #   onyx-backend - Onyx's services and its datastores (Postgres, OpenSearch, Redis).
 #                 Internal: nothing else reaches the datastores.
 #   onyx-egress - onyx-api and onyx-background's internet access, to fetch indexed sources.
+#   onyx-ui     - onyx-web <-> onyx-api only. Not internal, since an internal network can't publish
+#                 onyx-web's host port.
 
 name: hermes
 
@@ -176,8 +178,7 @@ services:
       start_period: 30s
 
   # Mints short-lived GitHub App tokens for the levels in github-token/levels.json that an agent's
-  # LiteLLM key has been granted. The Apps' private keys stay here. secrets/github-app.env is
-  # optional: a level without credentials answers 503.
+  # LiteLLM key has been granted.
   github-token:
     build: ./github-token
     image: hermes-github-token:local
@@ -199,10 +200,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # Jira and Confluence tools for the atlassian_* MCP servers in litellm/config.yaml. It holds no
-  # credentials and refuses requests without one: each request carries the Atlassian API key of the
-  # LiteLLM server it came through, which also limits the tools each server exposes. ENABLED_TOOLS
-  # must list exactly the tools those servers allow between them (tests/run.sh checks).
+  # Jira and Confluence tools for the atlassian_* MCP servers in litellm/config.yaml.
   mcp-atlassian:
     image: ghcr.io/sooperset/mcp-atlassian:0.23.1@sha256:5b7c9b64d4eb3210cab74be8bf3e6aeea9ed14f3042dc59ba5c5287bd4dbe466
     restart: unless-stopped
@@ -244,7 +242,7 @@ services:
   onyx-api:
     <<: *onyx-backend
     command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn onyx.main:app --host 0.0.0.0 --port 8080"]
-    networks: [onyx, onyx-backend, onyx-egress]
+    networks: [onyx, onyx-backend, onyx-egress, onyx-ui]
     depends_on:
       onyx-db:
         condition: service_healthy
@@ -262,11 +260,6 @@ services:
   # Celery workers: fetching, embedding, and indexing sources, on the schedules admin configured.
   onyx-background:
     <<: *onyx-backend
-    # Onyx's supervisord config, but as onyx: its config sets user=root, which -u overrides. Its
-    # programs log to files in /var/log (tailed to stdout), so /var/log is a tmpfs onyx can write.
-    # Celery beat writes its schedule to the working directory; /app belongs to root. The config
-    # puts /app on PYTHONPATH, so imports don't depend on it. Onyx's Slack and Discord bots, which
-    # this stack doesn't use, are started by relative path and so exit; supervisord gives up on them.
     command: ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf", "-u", "onyx"]
     working_dir: /tmp
     tmpfs: ["/var/log:mode=1777"]
@@ -275,8 +268,7 @@ services:
       onyx-api:
         condition: service_healthy
 
-  # Onyx's MCP server, for LiteLLM's onyx_search. Each request carries the search user's token
-  # (ONYX_SEARCH_PAT in secrets/litellm.env), which it checks against onyx-api.
+  # Onyx's MCP server, for LiteLLM's onyx_search.
   onyx-mcp:
     <<: *onyx-backend
     command: ["python", "-m", "onyx.mcp_server_main"]
@@ -293,6 +285,24 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Onyx's web UI on 127.0.0.1, for looking into indexing (attempts, errors, tracebacks) and browsing
+  # what's indexed.
+  onyx-web:
+    image: onyxdotapp/onyx-web-server:v5.0.4@sha256:8cb4bb4d7b6669f9cf9a5c3322af4fe26bfe3052d0b7bbd0947551f6dce077c3
+    restart: unless-stopped
+    logging: *logging
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [onyx-ui]
+    environment:
+      INTERNAL_URL: http://onyx-api:8080
+      OVERRIDE_API_PRODUCTION: "true"
+    ports:
+      - "127.0.0.1:${ONYX_UI_HOST_PORT:-3000}:3000"
+    depends_on:
+      onyx-api:
+        condition: service_healthy
 
   onyx-db:
     image: postgres:18.6-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
@@ -463,6 +473,8 @@ networks:
     driver_opts: {com.docker.network.bridge.name: hm-onyx-backend}
   onyx-egress:
     driver_opts: {com.docker.network.bridge.name: hm-onyx-egress}
+  onyx-ui:
+    driver_opts: {com.docker.network.bridge.name: hm-onyx-ui}
 
 volumes:
   postgres-data: {}
