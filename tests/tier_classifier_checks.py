@@ -93,13 +93,14 @@ proxy_server.llm_router = router
 # Delegates follow the proxy's current Router.
 chain = tc.ChainedTierClassifier(("llm",), "fast")
 first = chain._current_delegates()
-check("delegates built on first use", len(first) == 1 and first[0][1].litellm_router_instance is router, first)
+check("delegates built on first use", len(first) == 1 and first[0][1].ctx.belongs_to(router), first)
 check("delegates reused while the Router is unchanged", chain._current_delegates() is first)
 replacement = make_router()
 proxy_server.llm_router = replacement
 second = chain._current_delegates()
 check("delegates rebuilt when the proxy replaces its Router",
-      second is not first and second[0][1].litellm_router_instance is replacement, second)
+      second is not first and second[0][1].ctx.belongs_to(replacement) and not second[0][1].ctx.belongs_to(router),
+      second)
 
 # Runtime guard against re-entry.
 context = RoutingContext(raw_messages=[], structured_messages=[{"role": "user", "content": "hi"}], candidate_models=[])
