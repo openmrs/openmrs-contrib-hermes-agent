@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
 from .agents import (DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, validate_budget,
@@ -32,6 +33,12 @@ ModalScreen { align: center middle; }
 #dialog .buttons Button { margin-left: 1; }
 #dialog .error { color: $error; }
 """
+
+# Textual's default dark theme with a darker background and a teal highlight, which is easier to read than its
+# light blue. The status colours and accent match the default.
+THEME = Theme(name="hermes-dark", primary="#2A9D8F", secondary="#264653", accent="#ffa62b", warning="#ffa62b",
+              error="#ba3c5b", success="#4EBF71", foreground="#e0e0e0", background="#050607", surface="#0E1114",
+              panel="#161B20", dark=True)
 
 
 class _Dialog(ModalScreen):
@@ -449,6 +456,8 @@ class AdminApp(App):
         self._listed: dict[str, Agent] = {}
         self._servers: list[str] = []
         self._levels: list[str] = []
+        self.register_theme(THEME)
+        self.theme = THEME.name
 
     def compose(self) -> ComposeResult:
         yield Header()
