@@ -14,7 +14,8 @@ from unittest import mock
 from hermes_admin.__main__ import build_parser, run_onyx
 from hermes_admin.agents import Agents, Settings
 from hermes_admin.onyx import Onyx, OnyxError, OnyxSettings
-from hermes_admin.tui import AdminApp, ConfirmDialog, EditAgentDialog, ErrorsScreen, OnyxScreen, SourceDialog
+from hermes_admin.tui import (AdminApp, ConfirmDialog, EditAgentDialog, ErrorsScreen, IndexDialog, OnyxScreen,
+                              SourceDialog)
 from textual.widgets import DataTable, Input, SelectionList, Static
 
 NAME = "tui-check"
@@ -66,6 +67,8 @@ class FakeOnyxClient:
                                                        "web_connector_type": "recursive"}, "refresh_freq": 86400}]
         # Credentials no source uses, which cleanup deletes.
         self.unused_credentials = []
+        # Whether a source is being indexed, so Onyx skips a run-once.
+        self.indexing = False
         self.calls = []
 
     def call(self, method, path, body=None, form=None, ok=(200, 201, 204)):
@@ -87,6 +90,8 @@ class FakeOnyxClient:
         self.calls.append((method, path, body))
         if path == "/manage/admin/connector":
             self.sources.append({**body, "id": len(self.calls)})
+        if path == "/manage/admin/connector/run-once":
+            return {"success": True, "message": "", "data": 0 if self.indexing else 1}
         if path == "/manage/admin/deletion-attempt":
             # Onyx deletes in the background; here it's done by the next poll.
             self.sources = [s for s in self.sources if s["id"] != body["connector_id"]]
@@ -249,6 +254,19 @@ async def onyx_checks(agents):
         check("escape returns from errors to the onyx screen", isinstance(app.screen, OnyxScreen), app.screen)
 
         client.calls.clear()
+        await pilot.press("r")
+        await pilot.pause()
+        check("index asks first", isinstance(app.screen, IndexDialog) and not client.calls, (app.screen, client.calls))
+        await pilot.click("#full")
+        await pilot.pause(0.3)
+        await pilot.click("#confirm")
+        await settle(app, pilot)
+        check("index with re-index everything queues a full run of the selected source", client.calls == [
+            ("POST", "/manage/admin/connector/run-once",
+             {"connector_id": github["id"], "credential_ids": [github["id"] + 1], "from_beginning": True})],
+              client.calls)
+
+        client.calls.clear()
         await pilot.press("d")
         await pilot.pause()
         await pilot.click("#confirm")
@@ -378,6 +396,30 @@ def onyx_errors_cli_checks(agents):
           and report["total_errors"] == 3, report)
 
 
+def onyx_index_cli_checks(agents):
+    def index(*flags, indexing=False):
+        client = FakeOnyxClient()
+        client.indexing = indexing
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run_onyx(build_parser().parse_args(["onyx", "index", "o3-docs", *flags]),
+                            Onyx(OnyxSettings.from_env(), agents.api, client))
+        return code, out.getvalue(), client.calls
+
+    code, text, calls = index()
+    check("onyx index queues an incremental run of the source", code == 0 and calls == [
+        ("POST", "/manage/admin/connector/run-once", {"connector_id": 100, "credential_ids": [101],
+                                                      "from_beginning": False})]
+          and text == "Queued indexing of o3-docs. `onyx errors o3-docs` shows how it went.\n", (code, text, calls))
+    code, text, calls = index("--full")
+    check("onyx index --full queues a run from the beginning",
+          code == 0 and calls[0][2]["from_beginning"] and text.startswith("Queued a full re-index of o3-docs."),
+          (code, text, calls))
+    code, text, _ = index(indexing=True)
+    check("onyx index fails when the source is already being indexed",
+          code == 1 and text == "o3-docs is already being indexed; try again once that run finishes.\n", (code, text))
+
+
 async def main():
     agents = Agents(Settings.from_env())
     app = AdminApp(agents)
@@ -452,6 +494,7 @@ async def main():
     onyx_edit_cli_checks(agents)
     onyx_refresh_cli_checks(agents)
     onyx_errors_cli_checks(agents)
+    onyx_index_cli_checks(agents)
 
 
 try:

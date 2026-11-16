@@ -272,6 +272,7 @@ bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
 bin/admin onyx list                             # sources, their indexing state, and refresh intervals
 bin/admin onyx errors [<name>] [--trace]        # a source's latest indexing attempts and open errors
+bin/admin onyx index [<name>] [--full]          # index a source now; --full refetches everything
 bin/admin onyx add <type> <name> [--refresh-hours H] [--yes]
 bin/admin onyx edit [<name>] [--refresh-hours H] [--yes]
 bin/admin onyx delete [<name>] [--yes]

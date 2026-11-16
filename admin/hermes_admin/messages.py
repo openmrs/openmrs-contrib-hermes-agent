@@ -1,5 +1,5 @@
 """Follow-up instructions shown after a change, worded the same in the CLI and the interactive
-interface. Each takes the agent's name via `.format(name=...)`."""
+interface. Each takes the agent's or source's name via `.format(name=...)`."""
 
 START_HINT = ("Start it with: docker compose up -d agent-{name}. If compose.yaml has no agent-{name} service "
               "yet, see: docker compose run --rm admin agent compose {name}")
@@ -10,3 +10,5 @@ ROTATE_HINT = "Restart the agent and its workspace to apply: docker compose rest
 ROTATE_WARNING = "The agent stops working until it and its workspace are restarted."
 DELETED = "Deleted {name} (data kept)."
 PURGED = "Deleted {name} and its data."
+INDEX_QUEUED = "Queued {what} of {name}."
+INDEX_BUSY = "{name} is already being indexed; try again once that run finishes."

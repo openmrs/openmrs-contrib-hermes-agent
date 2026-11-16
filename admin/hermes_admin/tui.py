@@ -19,8 +19,8 @@ from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, 
 from .agents import (DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, validate_budget,
                      validate_name)
 from .litellm import LiteLLMError
-from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
-                       START_HINT)
+from .messages import (DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE, ROTATE_HINT,
+                       ROTATE_WARNING, SLACK_HINT, START_HINT)
 from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, format_errors, source_settings
 
 DIALOG_CSS = """
@@ -195,6 +195,26 @@ class ConfirmDialog(_Dialog):
         self.dismiss(True)
 
 
+class IndexDialog(_Dialog):
+    """Confirms indexing a source now; dismisses with whether to re-index everything (Onyx.index's
+    `full`)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Index {self._name} now?", classes="title")
+            yield Label("Fetches what changed since the last run.")
+            yield Checkbox("Re-index everything (only changed documents are re-embedded)", id="full")
+            yield self._buttons("Index")
+
+    @on(Button.Pressed, "#confirm")
+    def _on_confirm(self) -> None:
+        self.dismiss(self.query_one("#full", Checkbox).value)
+
+
 class SourceTypeDialog(_Dialog):
     """Chooses the kind of Onyx source to add; dismisses with its SOURCE_TYPES key."""
 
@@ -286,13 +306,14 @@ class ErrorsScreen(Screen):
 
 class OnyxScreen(Screen):
     """Onyx's sources and their indexing state; adds and edits sources through SourceTypeDialog and
-    SourceDialog, shows the selected one's indexing errors, deletes it, and cleans up what failed adds
-    left behind."""
+    SourceDialog, shows the selected one's indexing errors, indexes it now, deletes it, and cleans up
+    what failed adds left behind."""
 
     BINDINGS = [
         Binding("a", "add", "Add"),
         Binding("e", "edit", "Edit"),
         Binding("i", "errors", "Errors"),
+        Binding("r", "index", "Index"),
         Binding("d", "delete", "Delete"),
         Binding("c", "cleanup", "Clean up"),
         Binding("f5", "refresh", "Refresh"),
@@ -396,6 +417,23 @@ class OnyxScreen(Screen):
             self.app.call_from_thread(self.notify, str(e), title="Errors failed", severity="error", timeout=10)
             return
         self.app.call_from_thread(self.app.push_screen, ErrorsScreen(report))
+
+    def action_index(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+
+        def index(full: bool) -> str:
+            if not self.onyx.index(name, full):
+                return INDEX_BUSY.format(name=name)
+            return INDEX_QUEUED.format(what="a full re-index" if full else "indexing", name=name)
+
+        def confirmed(full: bool | None) -> None:
+            if full is not None:
+                self.run_worker(lambda: self._change("Index source", lambda: index(full)), thread=True,
+                                group="onyx-change")
+
+        self.app.push_screen(IndexDialog(name), confirmed)
 
     def action_delete(self) -> None:
         name = self._selected()

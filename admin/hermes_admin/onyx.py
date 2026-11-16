@@ -424,6 +424,19 @@ class Onyx:
         })
         return f"Updated {name}."
 
+    def index(self, name: str, full: bool = False) -> bool:
+        """Asks Onyx to index a source now rather than wait for its refresh interval; Onyx's
+        scheduler starts the run within a minute or so. A normal run fetches what changed since the
+        last one; `full` refetches everything, though only changed documents are re-embedded.
+
+        Returns False, queuing nothing, when the source is already being indexed."""
+        status = self._status(name)
+        response = self.client.call("POST", "/manage/admin/connector/run-once", {
+            "connector_id": status["connector"]["id"], "credential_ids": [status["credential"]["id"]],
+            "from_beginning": full,
+        })
+        return bool((response or {}).get("data"))
+
     def delete(self, name: str, wait: float = DELETE_WAIT_SECONDS, poll: float = DELETE_POLL_SECONDS) -> str:
         """Deletes a source and its documents from the index, then its credential unless another
         source uses it. Onyx deletes in the background and keeps credentials, so this waits up to

@@ -17,8 +17,8 @@ from typing import Any, Callable
 
 from .agents import DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, Settings, validate_name
 from .litellm import LiteLLMError
-from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
-                       START_HINT)
+from .messages import (DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE, ROTATE_HINT,
+                       ROTATE_WARNING, SLACK_HINT, START_HINT)
 from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, OnyxSettings,
                    SourceType, format_errors, source_settings)
 
@@ -254,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help=pick_source)
     p.add_argument("--trace", action="store_true", help="include failed attempts' full tracebacks")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("index", help="index a source now instead of waiting for its next refresh")
+    p.add_argument("name", nargs="?", help=pick_source)
+    p.add_argument("--full", action="store_true",
+                   help="refetch everything, not just what changed since the last run (only changed documents "
+                        "are re-embedded)")
     p = sub.add_parser("edit", help="change a source's settings, asking for each with its current value")
     p.add_argument("name", nargs="?", help=pick_source)
     p.add_argument("--refresh-hours", type=float,
@@ -398,6 +403,12 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
         if command == "errors":
             report = onyx.errors(name)
             print(json.dumps(report, indent=2) if args.json else format_errors(report, args.trace))
+        elif command == "index":
+            if not onyx.index(name, args.full):
+                print(INDEX_BUSY.format(name=name))
+                return 1
+            print(INDEX_QUEUED.format(what="a full re-index" if args.full else "indexing", name=name),
+                  f"`onyx errors {name}` shows how it went.")
         elif command == "edit":
             kind, current, refresh_hours = onyx.source(name)
             source_type = SOURCE_TYPES[kind]
