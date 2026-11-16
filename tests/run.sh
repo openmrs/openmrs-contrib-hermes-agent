@@ -7,8 +7,11 @@
 # Usage: tests/run.sh
 #
 # Uses fake credentials, mock models, and fake Jev, Atlassian, Anthropic, and GitHub endpoints, so
-# nothing reaches a real provider. Runs as its own Compose project ("hermes-test") and removes its
-# containers and volumes on exit, so a running stack is untouched. Needs Docker Compose 2.24.4+
+# nothing reaches a real provider. Runs as its own Compose project ("hermes-test-N", where N is the
+# run's slot) with its own images, and removes its containers and volumes on exit, so a running
+# stack is untouched. Up to ten runs can go at once, e.g. from different worktrees: each claims a
+# free slot (see tests/slot_lock.py) for its project, bridge names, port, and image tags. Needs
+# Docker Compose 2.24.4+
 # (for !override) and python3, openssl, shasum, base64, and git on the host.
 #
 # What it checks:
@@ -45,13 +48,21 @@
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
-#   TEST_LITELLM_PORT  Host port the test LiteLLM publishes (default 14000; not used by the tests)
+#   TEST_SLOT          Slot to use, 0-9 (default: the first free one); fails if another run has it
+#   TEST_LITELLM_PORT  Host port the test LiteLLM publishes (default 14000 plus the slot; not used by
+#                      the tests)
 
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 compose_cmd="${COMPOSE:-docker compose}"
-export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-14000}"
+# slot_lock.py holds the slot until this script exits; fd 3 keeps its output pipe open meanwhile.
+exec 3< <(python3 "$root/tests/slot_lock.py" "${TMPDIR:-/tmp}/hermes-test-slots" $$ ${TEST_SLOT:+"$TEST_SLOT"})
+if ! read -r TEST_SLOT <&3; then
+  exit 1
+fi
+export TEST_SLOT
+export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-$((14000 + TEST_SLOT))}"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
@@ -65,7 +76,7 @@ failures=0
 
 compose() {
   # shellcheck disable=SC2086 # compose_cmd may be two words ("docker compose")
-  $compose_cmd --progress quiet -p hermes-test --project-directory "$root" \
+  $compose_cmd --progress quiet -p "hermes-test-$TEST_SLOT" --project-directory "$root" \
     -f "$root/compose.yaml" -f "$root/tests/compose.test.yaml" "$@"
 }
 

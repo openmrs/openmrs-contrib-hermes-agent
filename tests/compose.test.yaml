@@ -1,6 +1,8 @@
 # Compose override for tests/run.sh: tests/fixtures secrets, the generated mock LiteLLM config,
 # fake Jev, Atlassian, Anthropic, and GitHub endpoints, and a git server standing in for GitHub for the
-# workspace. TEST_WORK is run.sh's temporary directory.
+# workspace. TEST_WORK is run.sh's temporary directory and TEST_SLOT its slot (0-9), which keeps
+# concurrent runs' bridge names and images apart. Images built from this repository get per-slot
+# tags so a run never uses another run's build, or overwrites the running stack's.
 
 services:
   postgres:
@@ -25,6 +27,7 @@ services:
     env_file: !override [tests/fixtures/atlassian.env]
 
   admin:
+    image: hermes-admin:test-${TEST_SLOT:?run tests/run.sh}
     env_file: !override [tests/fixtures/master.env, tests/fixtures/onyx-admin.env]
     volumes:
       - ./tests:/tests:ro
@@ -43,14 +46,19 @@ services:
     env_file: !override [tests/fixtures/onyx-db.env]
 
   github-token:
+    image: hermes-github-token:test-${TEST_SLOT}
     env_file: !override [{path: "${TEST_WORK}/github-app.env"}]
     environment:
       GITHUB_API_URL: http://fake-github:8004
     volumes:
       - ${TEST_WORK}/github-levels.json:/app/levels.json:ro
 
+  agent-default:
+    image: hermes-agent:test-${TEST_SLOT}
+
   # A 15-second idle limit, so run.sh can watch a reset.
   workspace-default:
+    image: hermes-workspace:test-${TEST_SLOT}
     environment:
       WORKSPACE_IDLE_MINUTES: "0.25"
       WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
@@ -60,7 +68,7 @@ services:
   # git). Like GitHub, it speaks git's smart protocol, which partial clones need.
   # safe.directory: the repository belongs to the host user, not the container's.
   fake-git:
-    image: hermes-workspace:local
+    image: hermes-workspace:test-${TEST_SLOT}
     networks: [workspaces]
     volumes:
       - ${TEST_WORK}/git:/srv:ro
@@ -104,26 +112,26 @@ services:
       - ${TEST_WORK}/github-app.pub.pem:/app/public.pem:ro
     command: ["python", "-u", "/app/fake_github.py"]
 
-# Bridge names must be unique on the host (see compose.yaml), so the test project can't share the
-# stack's.
+# Bridge names must be unique on the host (see compose.yaml), so each slot has its own, and none
+# is the stack's. Linux limits them to 15 characters.
 networks:
   agents:
-    driver_opts: {com.docker.network.bridge.name: ht-agents}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-agents"}
   litellm-db:
-    driver_opts: {com.docker.network.bridge.name: ht-litellm-db}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-litellm-db"}
   admin:
-    driver_opts: {com.docker.network.bridge.name: ht-admin}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-admin"}
   workspaces:
-    driver_opts: {com.docker.network.bridge.name: ht-workspaces}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-workspaces"}
   workspace-egress:
-    driver_opts: {com.docker.network.bridge.name: ht-wsp-egress}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-wsp-egress"}
   atlassian:
-    driver_opts: {com.docker.network.bridge.name: ht-atlassian}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-atlassian"}
   onyx:
-    driver_opts: {com.docker.network.bridge.name: ht-onyx}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx"}
   onyx-backend:
-    driver_opts: {com.docker.network.bridge.name: ht-onyx-backend}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-be"}
   onyx-egress:
-    driver_opts: {com.docker.network.bridge.name: ht-onyx-egress}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-egress"}
   onyx-ui:
-    driver_opts: {com.docker.network.bridge.name: ht-onyx-ui}
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-ui"}
