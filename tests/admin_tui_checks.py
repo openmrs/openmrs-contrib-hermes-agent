@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import sys
+from unittest import mock
 
 from hermes_admin.__main__ import build_parser, run_onyx
 from hermes_admin.agents import Agents, Settings
@@ -180,6 +181,8 @@ async def onyx_checks(agents):
         table = app.screen.query_one("#sources", DataTable)
         check("onyx screen lists Onyx's sources", isinstance(app.screen, OnyxScreen) and table.row_count == 1,
               app.screen)
+        row = table.get_row_at(0)
+        check("onyx screen shows each source's refresh interval", row[-1] == "every 24h", row)
         await pilot.press("s")
         await pilot.pause()
         check("agent shortcuts are off on the onyx screen", isinstance(app.screen, OnyxScreen), app.screen)
@@ -285,6 +288,71 @@ def onyx_edit_cli_checks(agents):
     check("onyx edit refuses a zero refresh interval", refused and not client.calls, client.calls)
 
 
+def run_cli(agents, argv, answers=(), stdin=""):
+    """Runs `bin/admin <argv>` against a FakeOnyxClient, answering its prompts with `answers` in
+    order; returns its output, the client, and the error it raised, if any."""
+    client = FakeOnyxClient()
+    out, error = io.StringIO(), None
+    answers = iter(answers)
+    saved, sys.stdin = sys.stdin, io.StringIO(stdin)
+    try:
+        with contextlib.redirect_stdout(out), mock.patch("builtins.input", lambda prompt="": next(answers)), \
+                mock.patch("getpass.getpass", lambda prompt="": next(answers)):
+            run_onyx(build_parser().parse_args(argv), Onyx(OnyxSettings.from_env(), agents.api, client))
+    except (OnyxError, StopIteration) as e:
+        error = e
+    finally:
+        sys.stdin = saved
+    return out.getvalue(), client, error
+
+
+def refresh_freqs(client):
+    return [body.get("refresh_freq") for method, path, body in client.calls
+            if path.startswith("/manage/admin/connector") and method in ("POST", "PATCH")]
+
+
+def onyx_refresh_cli_checks(agents):
+    client = FakeOnyxClient()
+    client.sources.append({**client.sources[0], "id": 200, "name": "manual", "refresh_freq": None})
+    onyx = Onyx(OnyxSettings.from_env(), agents.api, client)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        run_onyx(build_parser().parse_args(["onyx", "list"]), onyx)
+    check("onyx list shows each source's refresh interval", out.getvalue() == (
+        "o3-docs (web): ACTIVE, 3 documents, last index success, re-indexed every 24 hours\n"
+        "manual (web): ACTIVE, 3 documents, last index success, never re-indexed on its own\n"), out.getvalue())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        run_onyx(build_parser().parse_args(["onyx", "list", "--json"]), onyx)
+    listed = [s["refresh_hours"] for s in json.loads(out.getvalue())]
+    check("onyx list --json gives each source's refresh interval", listed == [24, None], listed)
+
+    _, client, error = run_cli(agents, ["onyx", "add", "web", "site"], ["https://example.org/", "6", "y"])
+    check("onyx add asks for the refresh interval", not error and refresh_freqs(client) == [6 * 3600],
+          (error, client.calls))
+    _, client, error = run_cli(agents, ["onyx", "add", "web", "site"], ["https://example.org/", "", "y"])
+    check("onyx add defaults the refresh interval to 24 hours", not error and refresh_freqs(client) == [24 * 3600],
+          (error, client.calls))
+    _, client, error = run_cli(agents, ["onyx", "add", "web", "site", "--from-stdin", "--yes"],
+                               stdin="base_url=https://example.org/\n")
+    check("onyx add --from-stdin doesn't ask for the refresh interval",
+          not error and refresh_freqs(client) == [24 * 3600], (error, client.calls))
+
+    out, client, error = run_cli(agents, ["onyx", "edit", "o3-docs"], ["", "12", "y"])
+    check("onyx edit asks for the refresh interval", not error and refresh_freqs(client) == [12 * 3600],
+          (error, client.calls))
+    check("onyx edit confirms the new interval", "re-indexed every 12 hours" in out, out)
+    _, client, error = run_cli(agents, ["onyx", "edit", "o3-docs"], ["", "", "y"])
+    check("onyx edit keeps the refresh interval on Enter", not error and refresh_freqs(client) == [24 * 3600],
+          (error, client.calls))
+    _, client, error = run_cli(agents, ["onyx", "edit", "o3-docs", "--refresh-hours", "3"], ["", "y"])
+    check("onyx edit --refresh-hours skips the question", not error and refresh_freqs(client) == [3 * 3600],
+          (error, client.calls))
+    _, client, error = run_cli(agents, ["onyx", "edit", "o3-docs"], ["", "daily"])
+    check("onyx edit refuses a refresh interval that isn't a number",
+          isinstance(error, OnyxError) and "daily" in str(error) and not client.calls, (error, client.calls))
+
+
 def onyx_errors_cli_checks(agents):
     def errors(*flags):
         client = FakeOnyxClient()
@@ -382,6 +450,7 @@ async def main():
     onyx_cleanup_checks(agents)
     onyx_delete_checks(agents)
     onyx_edit_cli_checks(agents)
+    onyx_refresh_cli_checks(agents)
     onyx_errors_cli_checks(agents)
 
 

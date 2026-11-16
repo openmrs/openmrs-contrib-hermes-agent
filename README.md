@@ -270,7 +270,7 @@ bin/admin agent compose <name>                  # agent-<name> and workspace-<na
 
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
-bin/admin onyx list                             # sources and their indexing state
+bin/admin onyx list                             # sources, their indexing state, and refresh intervals
 bin/admin onyx errors [<name>] [--trace]        # a source's latest indexing attempts and open errors
 bin/admin onyx add <type> <name> [--refresh-hours H] [--yes]
 bin/admin onyx edit [<name>] [--refresh-hours H] [--yes]

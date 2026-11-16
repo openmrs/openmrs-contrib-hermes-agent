@@ -347,16 +347,19 @@ class Onyx:
     # -- sources ---------------------------------------------------------------------------------
 
     def sources(self) -> list[dict]:
-        """Onyx's sources with their indexing state."""
+        """Onyx's sources with their indexing state and refresh interval (`refresh_hours`, None when
+        Onyx never re-indexes the source on its own)."""
         listed = []
         for status in self.client.call("GET", "/manage/admin/connector/status") or []:
             pair = self.client.call("GET", f"/manage/admin/cc-pair/{status['cc_pair_id']}")
+            refresh_freq = status["connector"].get("refresh_freq")
             listed.append({
                 "name": status["name"],
                 "source": status["connector"]["source"],
                 "status": pair.get("status"),
                 "documents": pair.get("num_docs_indexed"),
                 "last_index": pair.get("last_index_attempt_status"),
+                "refresh_hours": refresh_freq / 3600 if refresh_freq else None,
             })
         return listed
 

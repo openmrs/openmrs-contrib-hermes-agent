@@ -19,8 +19,8 @@ from .agents import DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentEr
 from .litellm import LiteLLMError
 from .messages import (DELETED, EDIT_HINT, PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT,
                        START_HINT)
-from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxSettings, SourceType,
-                   format_errors, source_settings)
+from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, OnyxSettings,
+                   SourceType, format_errors, source_settings)
 
 # The agent-<name> and workspace-<name> services for compose.yaml. tests/run.sh checks that
 # compose.yaml has this output for `default` and that the output passes the compose isolation checks.
@@ -245,8 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "searchable by every caller.")
     p.add_argument("type", choices=list(SOURCE_TYPES))
     p.add_argument("name", help="a name for the source in Onyx, e.g. wiki")
-    p.add_argument("--refresh-hours", type=float, default=DEFAULT_REFRESH_HOURS,
-                   help=f"how often Onyx re-indexes it (default: {DEFAULT_REFRESH_HOURS})")
+    p.add_argument("--refresh-hours", type=float,
+                   help=f"how often Onyx re-indexes it (default: ask, or {DEFAULT_REFRESH_HOURS:g} with --from-stdin)")
     p.add_argument("--from-stdin", action="store_true",
                    help="read the settings as KEY=VALUE lines from stdin instead of asking (keys: see the prompts)")
     p.add_argument("--yes", action="store_true", help=no_confirm)
@@ -256,7 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("edit", help="change a source's settings, asking for each with its current value")
     p.add_argument("name", nargs="?", help=pick_source)
-    p.add_argument("--refresh-hours", type=float, help="how often Onyx re-indexes it (default: unchanged)")
+    p.add_argument("--refresh-hours", type=float,
+                   help="how often Onyx re-indexes it (default: ask, or unchanged with --from-stdin)")
     p.add_argument("--from-stdin", action="store_true",
                    help="read the settings to change as KEY=VALUE lines from stdin instead of asking")
     p.add_argument("--yes", action="store_true", help=no_confirm)
@@ -360,18 +361,22 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
             print(json.dumps(sources, indent=2))
         else:
             print("\n".join(f"{s['name']} ({s['source']}): {s['status'] or 'unknown'}, {s['documents'] or 0} "
-                            f"documents, last index {s['last_index'] or 'none'}" for s in sources) or "(no sources)")
+                            f"documents, last index {s['last_index'] or 'none'}, {_refresh_text(s['refresh_hours'])}"
+                            for s in sources) or "(no sources)")
     elif command == "add":
         source_type = SOURCE_TYPES[args.type]
         values = _read_stdin([f.key for f in source_type.fields]) if args.from_stdin else _prompt_source(source_type)
-        source_settings(args.type, args.name, values, args.refresh_hours)
+        refresh_hours = args.refresh_hours
+        if refresh_hours is None:
+            refresh_hours = DEFAULT_REFRESH_HOURS if args.from_stdin else _prompt_refresh_hours(DEFAULT_REFRESH_HOURS)
+        source_settings(args.type, args.name, values, refresh_hours)
         if not args.yes:
-            print(f"Add {args.name} ({args.type}), re-indexed every {args.refresh_hours:g} hours:")
+            print(f"Add {args.name} ({args.type}), re-indexed every {refresh_hours:g} hours:")
             _print_source(source_type, values)
             if not _confirm("Everything this account can see becomes searchable by every caller. Add it? [y/N]"):
                 print(CANCELLED)
                 return 1
-        print(onyx.add(args.type, args.name, values, args.refresh_hours))
+        print(onyx.add(args.type, args.name, values, refresh_hours))
     elif command == "cleanup":
         connectors, credentials = onyx.unused()
         if not connectors and not credentials:
@@ -400,6 +405,8 @@ def run_onyx(args: argparse.Namespace, onyx: Onyx) -> int:
                                     else _prompt_source(source_type, current))}
             if args.refresh_hours is not None:
                 refresh_hours = args.refresh_hours
+            elif not args.from_stdin:
+                refresh_hours = _prompt_refresh_hours(refresh_hours)
             source_settings(kind, name, values, refresh_hours, keep_secrets=True)
             if not args.yes:
                 print(f"Update {name} ({kind}), re-indexed every {refresh_hours:g} hours:")
@@ -435,6 +442,21 @@ def _prompt_source(source_type: SourceType, current: dict[str, Any] | None = Non
             answer = answer.strip()
             values[f.key] = "" if answer == "-" else answer or old
     return values
+
+
+def _prompt_refresh_hours(current: float) -> float:
+    """Asks how often Onyx should re-index a source; Enter keeps `current`."""
+    answer = input(f"Re-index every how many hours [{current:g}]: ").strip()
+    if not answer:
+        return current
+    try:
+        return float(answer)
+    except ValueError:
+        raise OnyxError(f"expected a number of hours, not {answer!r}") from None
+
+
+def _refresh_text(hours: float | None) -> str:
+    return f"re-indexed every {hours:g} hours" if hours else "never re-indexed on its own"
 
 
 def _print_source(source_type: SourceType, values: dict[str, Any], blank_secret: str = "(blank)") -> None:

@@ -34,9 +34,10 @@ ModalScreen { align: center middle; }
 #dialog .error { color: $error; }
 """
 
-# Textual's default dark theme with a darker background and a teal highlight, which is easier to read than its
-# light blue. The status colours and accent match the default.
-THEME = Theme(name="hermes-dark", primary="#2A9D8F", secondary="#264653", accent="#ffa62b", warning="#ffa62b",
+# Textual's default dark theme with a darker background and a slate-blue highlight. Textual draws light text on
+# the highlight (selected rows, primary buttons), so it needs to be dark enough for that to read: this gives
+# about 5.8:1. The status colours and accent match the default.
+THEME = Theme(name="hermes-dark", primary="#3D5A80", secondary="#264653", accent="#ffa62b", warning="#ffa62b",
               error="#ba3c5b", success="#4EBF71", foreground="#e0e0e0", background="#050607", surface="#0E1114",
               panel="#161B20", dark=True)
 
@@ -297,7 +298,7 @@ class OnyxScreen(Screen):
         Binding("f5", "refresh", "Refresh"),
         Binding("escape", "app.pop_screen", "Back"),
     ]
-    COLUMNS = ("Source", "Type", "Status", "Documents", "Last index")
+    COLUMNS = ("Source", "Type", "Status", "Documents", "Last index", "Re-index")
 
     def __init__(self, onyx: Onyx) -> None:
         super().__init__()
@@ -327,8 +328,9 @@ class OnyxScreen(Screen):
         selected = self._selected()
         table.clear()
         for s in sources:
+            refresh = f"every {s['refresh_hours']:g}h" if s["refresh_hours"] else "never"
             table.add_row(s["name"], s["source"], s["status"] or "unknown", str(s["documents"] or 0), s["last_index"] or "none",
-                          key=s["name"])
+                          refresh, key=s["name"])
         if selected in {s["name"] for s in sources}:
             table.move_cursor(row=table.get_row_index(selected))
 
