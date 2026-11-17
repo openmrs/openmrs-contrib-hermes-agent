@@ -174,7 +174,7 @@ mcp_servers:
     pinned_tools:
       search_indexed_documents:
         description: |-
-          Search an index of public OpenMRS community content: the OpenMRS Wiki, OpenMRS Talk (the community forum), OpenMRS Jira issues, the O3 documentation site, and pull requests in OpenMRS GitHub repositories. Use it first for questions about OpenMRS itself: how a module or feature works, how to configure or deploy OpenMRS, why something was designed a certain way, what the community has decided or discussed, and the history or status of an issue or change. Prefer it over general web search or memory for OpenMRS-specific details, which change often.
+          Search an index of public OpenMRS community content: the OpenMRS Wiki, OpenMRS Talk (the community forum), OpenMRS Jira issues, the O3 documentation site, pull requests in OpenMRS GitHub repositories, and public OpenMRS Slack channels. Use it first for questions about OpenMRS itself: how a module or feature works, how to configure or deploy OpenMRS, why something was designed a certain way, what the community has decided or discussed, and the history or status of an issue or change. Prefer it over general web search or memory for OpenMRS-specific details, which change often.
 
           Write `query` as a natural-language question or a short description of what you need; the search expands and reranks it, so exact keywords aren't required. Narrow with `source_types` when you know where the answer lives (e.g. `jira` for an issue's status, `discourse` for community discussion), and with `time_cutoff` when only recent material is relevant.
 
@@ -189,12 +189,12 @@ mcp_servers:
               type: array
               items:
                 type: string
-                enum: [confluence, discourse, jira, web, github]
+                enum: [confluence, discourse, jira, web, github, slack]
               description: >-
                 Only return results from these sources; omit to search everything. confluence: the
                 OpenMRS Wiki. discourse: the OpenMRS Talk forum. jira: OpenMRS Jira issues. web: the
                 O3 documentation site. github: pull requests in OpenMRS GitHub repositories (title
-                and description only). If a listed source has nothing indexed yet, the call fails
+                and description only). slack: public channels in the OpenMRS Slack. If a listed source has nothing indexed yet, the call fails
                 with an error naming the sources that are available.
             time_cutoff:
               type: string

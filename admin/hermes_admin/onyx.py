@@ -121,6 +121,15 @@ SOURCE_TYPES = {
         SourceField("include_issues", "Index issues", kind="bool"),
         SourceField("github_access_token", "Token (fine-grained, read-only, public repositories)", secret=True),
     )),
+    "slack": SourceType("slack", "Slack messages and threads in public channels", "poll", (
+        SourceField("channels", "Channels, comma-separated (blank: every public channel; the bot joins each)",
+                    kind="list", required=False),
+        SourceField("exclude_channels", "Channels to skip, comma-separated (blank: none)",
+                    kind="list", required=False),
+        SourceField("include_bot_messages", "Index messages from bots and apps", kind="bool"),
+        SourceField("slack_bot_token", "Bot token (xoxb-; scopes channels:read, channels:history, "
+                    "channels:join, users:read; never groups:*)", secret=True),
+    )),
 }
 
 
