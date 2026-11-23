@@ -49,8 +49,10 @@
 #      of their data.
 #  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
 #      its workspace opens a page with agent-browser over SSH;
-#      prepare_workspace resets the workspace (the terminal still works after), for one review at a
-#      time, never for a PR and commit already reviewed, and fails when the workspace is down; the
+#      prepare_workspace resets the workspace, also the reset-request directory (the terminal still
+#      works after), for one review at a time (a waiter takes the workspace from a holder with no
+#      heartbeat, not from a live one), with its own longer tool deadline, never for a PR and commit
+#      already reviewed, and fails when the workspace is down; the
 #      workspace rejects a reset request that is a symlink; a compacted session keeps its binding and
 #      the workspace;
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
@@ -1038,13 +1040,13 @@ from model_tools import handle_function_call
 print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
 expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
 expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
-# Each successful prepare_workspace below (ten of them) is one reset on request.
+# Each successful prepare_workspace below (thirteen of them) is one reset on request.
 resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
 expect "prepare_workspace and post_pr_review: one review at a time, only for the bound, prepared PR, once" \
-  "j=prepared j-reset=clean k=waited a0=prepared a=posted b=refused c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused m1=refused m2=posted n1=refused n2=prepared" \
+  "deadline=extended j=prepared j-reset=clean k=waited s=prepared s-fast=yes s-old=refused l=refused a0=prepared a=posted b=refused c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused m1=refused m2=posted n1=refused n2=prepared" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
     tail -n 1)"
-expect "workspace-reviewer resets once per prepare_workspace" "10" \
+expect "workspace-reviewer resets once per prepare_workspace" "13" \
   "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
 review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
   'curl -s -H "Authorization: Bearer $KEY" http://github-token:8080/token/github_review' || true)"

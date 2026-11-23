@@ -9,3 +9,5 @@ provides_hooks:
   - pre_llm_call
   - on_session_end
   - post_compaction
+  - pre_api_request
+  - post_tool_call

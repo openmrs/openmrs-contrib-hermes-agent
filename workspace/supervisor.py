@@ -267,6 +267,10 @@ def remove_user_files() -> None:
 def reset() -> None:
     kill_user_processes()
     remove_user_files()
+    # Whatever the workspace user left with the reset requests, so it can't reach a later review.
+    if RESET_REQUESTS.is_dir():
+        for entry in RESET_REQUESTS.iterdir():
+            remove(entry)
     for path in (HOME, WORK / "tmp"):
         if not path.is_dir():
             path.mkdir(mode=0o700)

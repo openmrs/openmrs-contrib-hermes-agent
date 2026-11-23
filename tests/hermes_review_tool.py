@@ -92,16 +92,26 @@ if sys.argv[1:] == ["stopped"]:
     print(" ".join(f"{case}={outcome}" for case, outcome in outcomes.items()))
     sys.exit()
 
-# (j) prepare_workspace kills what an earlier review left running and deletes its files, and the
-# terminal still works after the reset closed Hermes' SSH connection.
+# Hermes gives prepare_workspace its own deadline, longer than the generic 420 s, to wait behind a
+# long review.
+from tools.registry import registry  # noqa: E402
+
+deadline = registry.get_entry("prepare_workspace").execution_timeout
+outcomes["deadline"] = "extended" if deadline == plugin.PREPARE_TIMEOUT_SECONDS > 7200 else str(deadline)
+
+# (j) prepare_workspace kills what an earlier review left running and deletes its files, also one
+# left with the reset requests, and the terminal still works after the reset closed Hermes' SSH
+# connection.
 # Counts sleep processes; the image has no pgrep.
 SLEEPS = "$(grep -l '^Name:[[:space:]]*sleep$' /proc/[0-9]*/status 2>/dev/null | wc -l)"
-planted = terminal("review-j", "echo x > /work/home/planted; (setsid sleep 999 >/dev/null 2>&1 &); sleep 1; "
-                               f"echo $(ls /work/home/planted) {SLEEPS}")
+planted = terminal("review-j", "echo x > /work/home/planted; echo x > /run/workspace-reset/.planted; "
+                               "(setsid sleep 999 >/dev/null 2>&1 &); sleep 1; "
+                               f"echo $(ls /work/home/planted /run/workspace-reset/.planted) {SLEEPS}")
 bind("review-j", target(CHART, 10, "9" * 40))
 outcomes["j"] = prepare("review-j")
-left = terminal("review-j", f"echo $(ls /work/home/planted 2>/dev/null) {SLEEPS}")
-outcomes["j-reset"] = "clean" if (planted, left) == ("/work/home/planted 1", "0") else f"{planted!r}->{left!r}"
+left = terminal("review-j", f"echo $(ls /work/home/planted /run/workspace-reset/.planted 2>/dev/null) {SLEEPS}")
+outcomes["j-reset"] = ("clean" if (planted, left) == ("/run/workspace-reset/.planted /work/home/planted 1", "0")
+                       else f"{planted!r}->{left!r}")
 end("review-j")
 
 # (k) one review at a time: a second session's prepare_workspace waits until the first session's
@@ -119,6 +129,49 @@ end("review-k1")
 waiter.join(150)
 outcomes["k"] = "waited" if waited and second.get("outcome") == "prepared" else f"waited={waited} {second}"
 end("review-k2")
+
+# Short limits for (s) and (l): stale after 4 s with no heartbeat, waiters recheck every second.
+limits = plugin.LOCK_WAIT_SECONDS, plugin.LOCK_STALE_SECONDS, plugin.LOCK_SLICE_SECONDS
+plugin.LOCK_STALE_SECONDS, plugin.LOCK_SLICE_SECONDS = 4, 1
+
+
+def heartbeat(session):
+    """The session's review is still running: a model request, then a tool result."""
+    invoke_hook("pre_api_request", session_id=session, task_id=session, turn_id="t1", api_request_id="r1",
+                platform="webhook", model="auto")
+    invoke_hook("post_tool_call", tool_name="terminal", args={}, result="", task_id=session, session_id=session,
+                tool_call_id="c1", turn_id="t1", api_request_id="r1", duration_ms=1, status="ok")
+
+
+# (s) a holder whose turn failed (no heartbeat, no on_session_end) is stale: a waiting session takes
+# the workspace within a slice, and the old holder can't post.
+bind_prepared("review-s1", target(CHART, 10, "5" * 40))
+time.sleep(5)
+bind("review-s2", target(CHART, 10, "4" * 40))
+started = time.monotonic()
+outcomes["s"] = prepare("review-s2")
+outcomes["s-fast"] = "yes" if time.monotonic() - started < 30 else f"{time.monotonic() - started:.0f}s"
+outcomes["s-old"] = post("review-s1", review)
+end("review-s1")
+end("review-s2")
+
+# (l) a holder that keeps its heartbeat is not broken: the waiter (a 10-second wait) gives up and
+# says why.
+bind_prepared("review-l1", target(CHART, 10, "3" * 40))
+bind("review-l2", target(CHART, 10, "2" * 40))
+plugin.LOCK_WAIT_SECONDS = 10
+second = {}
+waiter = threading.Thread(target=contextvars.copy_context().run, args=(lambda: second.update(
+    result=json.loads(handle_function_call("prepare_workspace", {}, task_id="review-l2", session_id="review-l2"))),))
+waiter.start()
+while waiter.is_alive():
+    heartbeat("review-l1")
+    time.sleep(1)
+error = str(second.get("result", {}).get("error"))
+outcomes["l"] = "refused" if "another review held the workspace" in error else str(second)
+end("review-l1")
+end("review-l2")
+plugin.LOCK_WAIT_SECONDS, plugin.LOCK_STALE_SECONDS, plugin.LOCK_SLICE_SECONDS = limits
 
 # (a) bound and prepared: posts. (b) a second post in the same session: refused.
 outcomes["a0"] = bind_prepared("review-a", f"{target(CHART, 11, 'a' * 40)}\nReview this pull request.")

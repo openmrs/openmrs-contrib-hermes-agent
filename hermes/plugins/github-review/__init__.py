@@ -19,9 +19,15 @@ supervisor reset it (workspace/supervisor.py), so nothing an earlier review's bu
 remains. It refuses without a binding and for a (repository, pull request, commit) already in
 posted.json, so a replayed webhook does no work. One review has the workspace at a time: the next
 waits up to LOCK_WAIT_SECONDS, until on_session_end for the holder's webhook turn. That hook doesn't
-fire when a turn fails on a model error, so a holder older than LOCK_BREAK_SECONDS loses the
-workspace to the next review. post_compaction moves the binding and the workspace to the session a
-compaction continues in.
+fire when a turn fails on a model error, so the holder's session keeps a heartbeat (each model
+request and tool result); a waiting review takes the workspace from a holder with no heartbeat for
+LOCK_STALE_SECONDS, or that has held it for LOCK_BREAK_SECONDS. post_compaction moves the binding and
+the workspace to the session a compaction continues in.
+
+Hermes abandons a tool call after a generic deadline (420 s, <H>/agent/tool_executor.py:137), so
+prepare_workspace registers a longer one (PREPARE_TIMEOUT_SECONDS); the call stamps the turn's
+activity every 30 s, so the gateway's inactivity timeout doesn't end the turn while it waits. A wait
+that Hermes cancels anyway stops without taking the workspace.
 
 The github_review token comes from github-token with the agent's LiteLLM key, and stays in this
 process: workspaces can't get it.
@@ -43,6 +49,8 @@ from pathlib import Path
 
 from agent.secret_scope import get_secret
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from tools.interrupt import is_interrupted
+from tools.registry import registry
 from tools.terminal_scope import terminal_env
 
 # Also in github-token/levels.json and the webhook route's filter; change all three together.
@@ -63,8 +71,15 @@ RESET_REQUEST_DIR = "/run/workspace-reset"
 RESET_DONE = "/run/workspace/reset-done"
 RESET_WAIT_SECONDS = 120
 RESET_POLL_SECONDS = 2
-LOCK_WAIT_SECONDS = 60 * 60
+# Long enough to wait behind a 60-90 minute review. A holder is stale after LOCK_STALE_SECONDS with no
+# model request or tool result (no single tool call of a review runs that long), and broken after
+# LOCK_BREAK_SECONDS regardless. A waiter rechecks every LOCK_SLICE_SECONDS.
+LOCK_WAIT_SECONDS = 2 * 60 * 60
+LOCK_STALE_SECONDS = 45 * 60
 LOCK_BREAK_SECONDS = 3 * 60 * 60
+LOCK_SLICE_SECONDS = 30
+# Hermes' deadline for one prepare_workspace call: the longest wait, the reset, and its SSH calls.
+PREPARE_TIMEOUT_SECONDS = LOCK_WAIT_SECONDS + RESET_WAIT_SECONDS + 5 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +97,7 @@ class Binding:
 class Holder:
     session_id: str
     since: float
+    heartbeat: float
 
 
 # Hermes session id -> Binding, and the session that has the workspace. One lock for all state, held
@@ -124,6 +140,14 @@ def release_workspace(session_id="", platform="", **kwargs):
         _release(session_id)
 
 
+def heartbeat(session_id="", **kwargs):
+    """pre_api_request and post_tool_call: the holder's review is still running."""
+    del kwargs
+    with _lock:
+        if _holder is not None and session_id and _holder.session_id == session_id:
+            _holder.heartbeat = time.monotonic()
+
+
 def follow_compaction(session_id="", old_session_id="", **kwargs):
     """post_compaction: a compaction that continues in a new session moves the binding and the
     workspace there, so the review can still post and on_session_end still releases."""
@@ -161,17 +185,25 @@ def _take_workspace(session_id):
     deadline = time.monotonic() + LOCK_WAIT_SECONDS
     while _holder is not None:
         now = time.monotonic()
-        if now - _holder.since >= LOCK_BREAK_SECONDS:
-            logger.warning("github-review: taking the workspace from session %s, which has had it for over %d s",
-                           _holder.session_id, LOCK_BREAK_SECONDS)
+        idle, held = now - _holder.heartbeat, now - _holder.since
+        if idle >= LOCK_STALE_SECONDS or held >= LOCK_BREAK_SECONDS:
+            logger.warning("github-review: session %s takes the workspace from session %s (held %d s, no activity "
+                           "for %d s)", session_id, _holder.session_id, held, idle)
             stale = _bindings.get(_holder.session_id)
             if stale is not None:
                 stale.prepared = False
             break
+        if is_interrupted():
+            logger.warning("github-review: session %s stopped waiting for the workspace (call cancelled)", session_id)
+            return "The call was cancelled while waiting for the workspace."
         if now >= deadline:
-            return f"Another review has had the workspace for over {LOCK_WAIT_SECONDS // 60} minutes; try again later."
-        _workspace_free.wait(min(deadline - now, 60))
-    _holder = Holder(session_id, time.monotonic())
+            logger.warning("github-review: session %s gave up after waiting %d s for the workspace, held by session %s",
+                           session_id, LOCK_WAIT_SECONDS, _holder.session_id)
+            return (f"This review was not done: another review held the workspace for the whole "
+                    f"{LOCK_WAIT_SECONDS // 60}-minute wait. Stop; don't retry.")
+        _workspace_free.wait(min(deadline - now, LOCK_SLICE_SECONDS))
+    now = time.monotonic()
+    _holder = Holder(session_id, now, now)
     return None
 
 
@@ -446,7 +478,15 @@ SCHEMA = {
 def register(ctx):
     ctx.register_tool(name="prepare_workspace", toolset="github_review", schema=PREPARE_SCHEMA,
                       handler=prepare_workspace)
+    # The plugin API takes no deadline; MCP tools set the same field (<H>/tools/registry.py:232).
+    entry = registry.get_entry("prepare_workspace")
+    if entry is not None:
+        entry.execution_timeout = PREPARE_TIMEOUT_SECONDS
+    else:
+        logger.warning("github-review: prepare_workspace keeps Hermes' generic tool deadline")
     ctx.register_tool(name="post_pr_review", toolset="github_review", schema=SCHEMA, handler=post_pr_review)
     ctx.register_hook("pre_llm_call", bind_review_target)
     ctx.register_hook("on_session_end", release_workspace)
     ctx.register_hook("post_compaction", follow_compaction)
+    ctx.register_hook("pre_api_request", heartbeat)
+    ctx.register_hook("post_tool_call", heartbeat)
