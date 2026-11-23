@@ -48,7 +48,8 @@
 #  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
 #      commit the webhook prompt bound the session to, only after the workspace is prepared, and
-#      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible.
+#      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible, and
+#      an unknown outcome (a 5xx, an unreadable answer) counts as posted.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
@@ -982,7 +983,7 @@ print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list",
 expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
 expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
 expect "post_pr_review posts only for the bound, prepared PR, once" \
-  "a=posted b=refused c=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e=refused f=posted g1=github-422 g2=posted" \
+  "a=posted b=refused c=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
     tail -n 1)"
 review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
@@ -993,8 +994,10 @@ expect "review ignores repo, pr_number, commit_id, and event in the parameters" 
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-core pr=13 commit=$(printf 'f%.0s' $(seq 40)) event=COMMENT comments=1 token=$review_token")"
 expect "review is posted again after GitHub's 422" "2" \
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-management pr=14 commit=$(printf '1%.0s' $(seq 40)) event=COMMENT ")"
-expect "refused reviews never reach GitHub" "4" "$(log_count fake-github "^review ")"
-expect "posted reviews are recorded, owned by the Hermes user" "3 ${HERMES_UID:-10000}" \
+expect "GitHub's 500 and a non-JSON answer each reach GitHub once, with no retry" "1 1" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=15 ") $(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=16 ")"
+expect "refused reviews never reach GitHub" "6" "$(log_count fake-github "^review ")"
+expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "5 ${HERMES_UID:-10000}" \
   "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
     echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
 compose stop agent-reviewer workspace-reviewer >/dev/null

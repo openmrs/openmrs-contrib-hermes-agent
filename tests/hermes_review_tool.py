@@ -4,8 +4,9 @@ used by tests/run.sh.
 Runs in agent-reviewer (on stdin, as the Hermes user). Loads the plugin through Hermes' own plugin
 discovery, so it also checks that the managed config (/etc/hermes/config.yaml) enables it. Each case
 uses its own session id; posts go to tests/fake_github.py, whose log run.sh checks. Prints one
-summary line, `<case>=<outcome>` for each case: "posted", "refused", or "github-422" (GitHub's
-message for a line outside the diff came back).
+summary line, `<case>=<outcome>` for each case: "posted", "refused", "github-422" (GitHub's
+message for a line outside the diff came back), or "unknown" (the tool can't tell whether GitHub
+created the review).
 
 The tool needs the agent's LiteLLM key for github-token, which Hermes reads from the profile's
 secret scope; a bare `compose exec` has no scope and no LITELLM_API_KEY, so the scope is loaded here
@@ -52,6 +53,8 @@ def post(session, args):
         return "posted"
     if "must be part of the diff" in str(result.get("error")):
         return "github-422"
+    if "may or may not have been posted" in str(result.get("error")):
+        return "unknown"
     return "refused"
 
 
@@ -90,5 +93,18 @@ outcomes["f"] = post("review-f", {"body": "Other PR?", "comments": COMMENTS[:1],
 bind_prepared("review-g", target("openmrs/openmrs-esm-patient-management", 14, "1" * 40))
 outcomes["g1"] = post("review-g", {"body": "x", "comments": [{"path": "not-in-diff.txt", "line": 1, "body": "y"}]})
 outcomes["g2"] = post("review-g", review)
+# (h) GitHub answers 500: the outcome is unknown, so neither a retry nor a new session for the same
+# commit (a redelivered webhook) may post.
+bind_prepared("review-h", target(CHART, 15, "2" * 40))
+outcomes["h1"] = post("review-h", review)
+outcomes["h2"] = post("review-h", review)
+bind_prepared("review-h3", target(CHART, 15, "2" * 40))
+outcomes["h3"] = post("review-h3", review)
+# (i) GitHub answers 200 with a body that isn't JSON: posted, and recorded like any other post.
+bind_prepared("review-i", target(CHART, 16, "3" * 40))
+outcomes["i1"] = post("review-i", review)
+outcomes["i2"] = post("review-i", review)
+bind_prepared("review-i3", target(CHART, 16, "3" * 40))
+outcomes["i3"] = post("review-i3", review)
 
 print(" ".join(f"{case}={outcome}" for case, outcome in outcomes.items()))

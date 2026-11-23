@@ -10,7 +10,9 @@ On a webhook session's first turn, the pre_llm_call hook binds the session to th
 other platforms, and messages without exactly one such line bind nothing. post_pr_review takes the
 repository, pull request, and commit from the binding, never from its parameters, and always posts
 with event COMMENT. It refuses without a binding, before the workspace is prepared, after this
-session has posted, and for a (repository, pull request, commit) already in posted.json.
+session has posted, and for a (repository, pull request, commit) already in posted.json. A review
+is recorded there once GitHub accepts it, and also when the outcome is unknown (no answer, a 5xx,
+an unreadable answer), so neither a retry nor a redelivered webhook can post a second review.
 
 The github_review token comes from github-token with the agent's LiteLLM key, and stays in this
 process: workspaces can't get it.
@@ -151,8 +153,17 @@ def _github_token():
         return response.read().decode().strip()
 
 
+def _json_or_empty(raw):
+    try:
+        data = json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _create_review(binding, body, comments, token):
-    """POSTs the review; returns (status, response JSON). Raises on network errors."""
+    """POSTs the review; returns (status, response JSON, or {} if the body isn't a JSON object).
+    Raises on network errors."""
     api = os.environ.get("GITHUB_API_URL") or "https://api.github.com"
     payload = {"commit_id": binding.head_sha, "event": "COMMENT", "body": body, "comments": comments}
     request = urllib.request.Request(
@@ -162,12 +173,9 @@ def _create_review(binding, body, comments, token):
                  "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            return response.status, json.loads(response.read() or b"{}")
+            return response.status, _json_or_empty(response.read())
     except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read() or b"{}")
-        except ValueError:
-            return e.code, {}
+        return e.code, _json_or_empty(e.read())
 
 
 def post_pr_review(args, session_id="", **kwargs):
@@ -198,24 +206,36 @@ def post_pr_review(args, session_id="", **kwargs):
             return _result(False, error=f"Can't get a GitHub token ({type(e).__name__}).")
         try:
             status, response = _create_review(binding, body, comments, token)
-        except (OSError, urllib.error.URLError) as e:
-            # The review may or may not exist now; a retry could post twice, so none is allowed.
-            binding.posted = True
-            return _result(False, error=f"GitHub did not answer ({type(e).__name__}); the review may or may not have been posted. Don't retry.")
+        except Exception as e:  # noqa: BLE001 - once the request is sent, any failure is an unknown outcome
+            return _unknown_outcome(binding, posted, f"GitHub's answer was lost ({type(e).__name__})")
         if status == 422:
             return _result(False, error=f"GitHub refused the review: {response.get('message', 'unprocessable')}. "
                                         "Fix the comments (each line must be in the diff) and call post_pr_review again.")
+        if status >= 500:
+            return _unknown_outcome(binding, posted, f"GitHub answered {status}")
         if not 200 <= status < 300:
-            if status >= 500:
-                binding.posted = True
-                return _result(False, error=f"GitHub answered {status}; the review may or may not have been posted. Don't retry.")
             return _result(False, error=f"GitHub answered {status}: {response.get('message', '')}")
-        binding.posted = True
-        try:
-            _write_posted(posted + [_key(binding)])
-        except OSError as e:
-            return _result(True, url=response.get("html_url"), warning=f"Posted, but not recorded: {e}")
-        return _result(True, url=response.get("html_url"))
+        warning = _record(binding, posted)
+        return _result(True, url=response.get("html_url"), **({"warning": warning} if warning else {}))
+
+
+def _record(binding, posted):
+    """Marks the binding posted and adds its key to posted.json; returns a warning if the write
+    failed (the session still can't post again)."""
+    binding.posted = True
+    try:
+        _write_posted(posted + [_key(binding)])
+    except OSError as e:
+        return f"Not recorded in {POSTED_FILE}: {e}"
+    return None
+
+
+def _unknown_outcome(binding, posted, reason):
+    """The review may or may not exist now: record it as posted, so no retry or redelivered webhook
+    can post a second one."""
+    warning = _record(binding, posted)
+    return _result(False, error=f"{reason}; the review may or may not have been posted. Don't retry.",
+                   **({"warning": warning} if warning else {}))
 
 
 SCHEMA = {

@@ -7,7 +7,8 @@ and repositories, and answers with a numbered token.
 
 Review requests: logs a "review" line with the repository, pull request, commit, event, number of
 inline comments, and token, and answers as GitHub does. A comment on the path "not-in-diff.txt"
-gets GitHub's 422 for a line outside the diff.
+gets GitHub's 422 for a line outside the diff. Pull request 15 gets a 500 and pull request 16 a 200
+whose body isn't JSON, both after the review is logged, as if GitHub had created it.
 """
 
 import base64
@@ -69,6 +70,12 @@ class Handler(BaseHTTPRequestHandler):
               f"comments={len(comments)} token={token}", flush=True)
         if any(c.get("path") == "not-in-diff.txt" for c in comments):
             self.send_json(422, {"message": LINE_NOT_IN_DIFF, "status": "422"})
+            return
+        if pr in ("15", "16"):
+            self.send_response(500 if pr == "15" else 200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html>not JSON</html>")
             return
         self.send_json(200, {"id": 1, "html_url": f"https://github.com/{repo}/pull/{pr}#pullrequestreview-1"})
 
