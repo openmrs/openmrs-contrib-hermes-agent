@@ -59,19 +59,20 @@ ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python", "/app/supervisor.py"]
 
 # The reviewer's workspace: the above plus Chromium and agent-browser, to check a PR's UI. Chromium
-# comes from a fixed Debian snapshot, so the exact version stays installable on amd64 and arm64;
-# chromium-common is pinned too, as the base image's trixie-security source may have a newer one.
-# To update: a snapshot timestamp whose trixie has the new version, and the version.
+# comes from a fixed snapshot of Debian's security archive, so the exact version stays installable
+# on amd64 and arm64 and isn't behind a security fix; chromium-common is pinned too, as the base
+# image's live trixie-security source may have a newer one. To update: a debian-security snapshot
+# timestamp whose trixie-security has the new version, and the version.
 #
 # agent-browser's settings are in a wrapper because Docker's ENV doesn't reach SSH sessions (see
 # supervisor.py). Chromium runs without its own sandbox, which needs privileges the container drops;
 # the container is the sandbox. No version check: it calls Google and suggests `agent-browser
 # install`, which would download another browser.
 FROM workspace AS reviewer
-ARG CHROMIUM_SNAPSHOT=20261121T225354Z
-ARG CHROMIUM_VERSION=156.0.8078.79-1~deb13u1
+ARG CHROMIUM_SNAPSHOT=20261123T171314Z
+ARG CHROMIUM_VERSION=156.0.8078.108-1~deb13u1
 ARG AGENT_BROWSER_VERSION=0.43.0
-RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$CHROMIUM_SNAPSHOT/ trixie main" \
+RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/$CHROMIUM_SNAPSHOT/ trixie-security main" \
     > /etc/apt/sources.list.d/chromium-snapshot.list \
   && apt-get update \
   && apt-get install -y --no-install-recommends "chromium=$CHROMIUM_VERSION" "chromium-common=$CHROMIUM_VERSION" \
