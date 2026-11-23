@@ -46,6 +46,9 @@ AGENT_EXTRA_BINDS = {
 # A workspace's cache volume, if not the shared workspace-cache. The reviewer builds untrusted PRs,
 # so it gets its own: a poisoned cache can't reach other agents.
 WORKSPACE_CACHE = {"workspace-reviewer": "reviewer-cache"}
+# Services that only start with a profile: the reviewer needs its agent's data and webhook secret,
+# which a host without a reviewer doesn't have.
+SERVICE_PROFILES = {"agent-reviewer": ["reviewer"], "workspace-reviewer": ["reviewer"]}
 
 
 def marker(secret):
@@ -151,6 +154,9 @@ for name, service in sorted(workspaces.items()):
           network_names(service) == {"workspaces", "workspace-egress"}, sorted(network_names(service)))
     check(f"{name}: no published ports", not service.get("ports"), service.get("ports"))
     check(f"{name}: read-only root filesystem", service.get("read_only") is True, service.get("read_only"))
+    # The workspace user can write /run (reset requests), so it must not fill the host's memory.
+    run_tmpfs = [t for t in service.get("tmpfs") or [] if str(t).split(":")[0] == "/run"]
+    check(f"{name}: /run tmpfs has a size limit", len(run_tmpfs) == 1 and "size=" in str(run_tmpfs[0]), run_tmpfs)
     service_mounts = mounts(service)
     configs = [m for m in service_mounts if m.get("source") == "workspace-config"]
     cache_volume = WORKSPACE_CACHE.get(name, "workspace-cache")
@@ -167,6 +173,10 @@ for name, service in sorted(workspaces.items()):
         check(f"{name}: workspace-config subpath not shared", subpath not in config_subpaths,
               f"{subpath!r} also used by {config_subpaths.get(subpath)}")
         config_subpaths[subpath] = name
+
+for name, profiles in sorted(SERVICE_PROFILES.items()):
+    check(f"{name}: not started by default (profile {', '.join(profiles)})",
+          (services.get(name) or {}).get("profiles") == profiles, (services.get(name) or {}).get("profiles"))
 
 for name, service in services.items():
     check(f"{name}: no-new-privileges", "no-new-privileges:true" in (service.get("security_opt") or []),

@@ -69,6 +69,15 @@ def terminal(session, command):
     return json.loads(handle_function_call("terminal", {"command": command}, task_id=session))["output"].strip()
 
 
+def terminal_as(session, command):
+    """The terminal tool as the session's own model calls it, so its pre_tool_call hook sees the
+    session: "blocked" if the plugin refused the call, else the command's output."""
+    result = json.loads(handle_function_call("terminal", {"command": command}, task_id=session, session_id=session))
+    if "prepare_workspace" in str(result.get("error", "")):
+        return "blocked"
+    return str(result.get("output", result)).strip()
+
+
 def post(session, args):
     result = json.loads(handle_function_call("post_pr_review", args, task_id=session, session_id=session))
     if result.get("success"):
@@ -77,6 +86,8 @@ def post(session, args):
         return "github-422"
     if "may or may not have been posted" in str(result.get("error")):
         return "unknown"
+    if "being posted" in str(result.get("error")):
+        return "busy"
     return "refused"
 
 
@@ -155,6 +166,20 @@ outcomes["s-old"] = post("review-s1", review)
 end("review-s1")
 end("review-s2")
 
+# (p) a bound session's tools run only while it has the workspace: not before prepare_workspace,
+# and not after another review took the workspace from it. Other sessions' tools are not affected.
+bind("review-p1", target(CHART, 20, "b" * 40))
+outcomes["p-before"] = terminal_as("review-p1", "echo ran")
+outcomes["p"] = prepare("review-p1")
+outcomes["p-after"] = terminal_as("review-p1", "echo ran")
+time.sleep(5)
+bind_prepared("review-p2", target(CHART, 20, "c" * 40))
+outcomes["p-taken"] = terminal_as("review-p1", "echo ran")
+bind("review-p3", target(CHART, 20, "d" * 40), platform="slack")
+outcomes["p-unbound"] = terminal_as("review-p3", "echo ran")
+end("review-p1")
+end("review-p2")
+
 # (l) a holder that keeps its heartbeat is not broken: the waiter (a 10-second wait) gives up and
 # says why.
 bind_prepared("review-l1", target(CHART, 10, "3" * 40))
@@ -178,6 +203,36 @@ outcomes["a0"] = bind_prepared("review-a", f"{target(CHART, 11, 'a' * 40)}\nRevi
 outcomes["a"] = post("review-a", review)
 outcomes["b"] = post("review-a", review)
 end("review-a")
+# (q) a post in progress holds no lock (hooks and other sessions go on), and a second post in the
+# same session is refused until it ends. Its token request waits until the second post is refused.
+token_started, token_release = threading.Event(), threading.Event()
+github_token = plugin._github_token
+
+
+def slow_github_token():
+    token_started.set()
+    token_release.wait(20)
+    return github_token()
+
+
+plugin._github_token = slow_github_token
+bind_prepared("review-q", target(CHART, 19, "b" * 40))
+first = {}
+poster = threading.Thread(target=contextvars.copy_context().run,
+                          args=(lambda: first.update(outcome=post("review-q", review)),))
+poster.start()
+token_started.wait(20)
+unlocked = plugin._lock.acquire(timeout=2)
+if unlocked:
+    plugin._lock.release()
+outcomes["q-unlocked"] = "yes" if unlocked else "no"
+threading.Timer(3, token_release.set).start()
+outcomes["q-second"] = post("review-q", review)
+token_release.set()
+poster.join(60)
+outcomes["q"] = first.get("outcome", "running")
+plugin._github_token = github_token
+end("review-q")
 # (c) bound but not prepared.
 bind("review-c", target(CHART, 12, "c" * 40))
 outcomes["c"] = post("review-c", review)

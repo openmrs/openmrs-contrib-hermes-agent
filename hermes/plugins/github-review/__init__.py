@@ -10,9 +10,10 @@ On a webhook session's first turn, the pre_llm_call hook binds the session to th
 other platforms, and messages without exactly one such line bind nothing. post_pr_review takes the
 repository, pull request, and commit from the binding, never from its parameters, and always posts
 with event COMMENT. It refuses without a binding, before the workspace is prepared, after this
-session has posted, and for a (repository, pull request, commit) already in posted.json. A review
-is recorded there once GitHub accepts it, and also when the outcome is unknown (no answer, a 5xx,
-an unreadable answer), so neither a retry nor a redelivered webhook can post a second review.
+session has posted, while another call is posting the same commit's review, and for a (repository,
+pull request, commit) already in posted.json. A review is recorded there once GitHub accepts it,
+and also when the outcome is unknown (no answer, a 5xx, an unreadable answer), so neither a retry
+nor a redelivered webhook can post a second review.
 
 prepare_workspace, the review's first step, takes the workspace for this session and has its
 supervisor reset it (workspace/supervisor.py), so nothing an earlier review's build left behind
@@ -23,6 +24,10 @@ fire when a turn fails on a model error, so the holder's session keeps a heartbe
 request and tool result); a waiting review takes the workspace from a holder with no heartbeat for
 LOCK_STALE_SECONDS, or that has held it for LOCK_BREAK_SECONDS. post_compaction moves the binding and
 the workspace to the session a compaction continues in.
+
+A bound session's tool calls, other than prepare_workspace, are blocked (pre_tool_call) unless it has
+the workspace and prepare_workspace has reset it for this review: not before then, and not after
+another review took the workspace from it. Sessions without a binding are not affected.
 
 Hermes abandons a tool call after a generic deadline (420 s, <H>/agent/tool_executor.py:137), so
 prepare_workspace registers a longer one (PREPARE_TIMEOUT_SECONDS); the call stamps the turn's
@@ -91,6 +96,8 @@ class Binding:
     head_sha: str
     prepared: bool = False
     posted: bool = False
+    # A post_pr_review call is sending this review to GitHub.
+    posting: bool = False
 
 
 @dataclass
@@ -101,9 +108,10 @@ class Holder:
 
 
 # Hermes session id -> Binding, and the session that has the workspace. One lock for all state, held
-# across a post, so two calls can't both pass the checks; never held while waiting for the
-# workspace (the condition releases it) or resetting it. Tools run on the agent's thread, hooks on
-# Hermes' hook threads.
+# only briefly: never across a network call, while waiting for the workspace (the condition releases
+# it), or while resetting it, because Hermes cuts hooks that wait for it off after 30 s and then skips
+# them for 60 s. A post marks its binding `posting` under the lock instead, so two calls can't both
+# pass the checks. Tools run on the agent's thread, hooks on Hermes' hook threads.
 _bindings: dict[str, Binding] = {}
 _holder: Holder | None = None
 _lock = threading.Lock()
@@ -131,6 +139,21 @@ def bind_review_target(session_id="", user_message="", is_first_turn=False, plat
     with _lock:
         _bindings.setdefault(session_id, Binding(match.group(1), int(match.group(2)), match.group(3)))
     return None
+
+
+def guard_tool_call(tool_name="", session_id="", **kwargs):
+    """pre_tool_call: blocks a bound session's tools, other than prepare_workspace, unless the
+    workspace is prepared for it and it still has it."""
+    del kwargs
+    if not session_id or tool_name == "prepare_workspace":
+        return None
+    with _lock:
+        binding = _bindings.get(session_id)
+        if binding is None or (binding.prepared and _holder is not None and _holder.session_id == session_id):
+            return None
+    return {"action": "block",
+            "message": "This review doesn't have the workspace. Call prepare_workspace first; if it already "
+                       "succeeded, another review has since taken the workspace, so stop."}
 
 
 def release_workspace(session_id="", platform="", **kwargs):
@@ -390,46 +413,64 @@ def post_pr_review(args, session_id="", **kwargs):
             return _result(False, error="The workspace has not been prepared for this review.")
         if binding.posted:
             return _result(False, error="This session has already posted its review.")
+        if any(b.posting and _key(b) == _key(binding) for b in _bindings.values()):
+            return _result(False, error="A review of this pull request's head commit is being posted; wait for that "
+                                        "call's result.")
         try:
             posted = _read_posted()
         except (OSError, ValueError) as e:
             return _result(False, error=f"Can't read the record of posted reviews: {e}")
         if _key(binding) in posted:
             return _result(False, error="This pull request's head commit has already been reviewed.")
-        try:
-            token = _github_token()
-        except (OSError, urllib.error.URLError) as e:
-            return _result(False, error=f"Can't get a GitHub token ({type(e).__name__}).")
-        try:
-            status, response = _create_review(binding, body, comments, token)
-        except Exception as e:  # noqa: BLE001 - once the request is sent, any failure is an unknown outcome
-            return _unknown_outcome(binding, posted, f"GitHub's answer was lost ({type(e).__name__})")
-        if status == 422:
-            return _result(False, error=f"GitHub refused the review: {response.get('message', 'unprocessable')}. "
-                                        "Fix the comments (each line must be in the diff) and call post_pr_review again.")
-        if status >= 500:
-            return _unknown_outcome(binding, posted, f"GitHub answered {status}")
-        if not 200 <= status < 300:
-            return _result(False, error=f"GitHub answered {status}: {response.get('message', '')}")
-        warning = _record(binding, posted)
-        return _result(True, url=response.get("html_url"), **({"warning": warning} if warning else {}))
-
-
-def _record(binding, posted):
-    """Marks the binding posted and adds its key to posted.json; returns a warning if the write
-    failed (the session still can't post again)."""
-    binding.posted = True
+        binding.posting = True
     try:
-        _write_posted(posted + [_key(binding)])
-    except OSError as e:
-        return f"Not recorded in {POSTED_FILE}: {e}"
+        return _post(binding, body, comments)
+    finally:
+        with _lock:
+            binding.posting = False
+
+
+def _post(binding, body, comments):
+    """Gets a token and POSTs the review, without _lock; records it when GitHub accepted it or the
+    outcome is unknown."""
+    try:
+        token = _github_token()
+    except (OSError, urllib.error.URLError) as e:
+        return _result(False, error=f"Can't get a GitHub token ({type(e).__name__}).")
+    try:
+        status, response = _create_review(binding, body, comments, token)
+    except Exception as e:  # noqa: BLE001 - once the request is sent, any failure is an unknown outcome
+        return _unknown_outcome(binding, f"GitHub's answer was lost ({type(e).__name__})")
+    if status == 422:
+        return _result(False, error=f"GitHub refused the review: {response.get('message', 'unprocessable')}. "
+                                    "Fix the comments (each line must be in the diff) and call post_pr_review again.")
+    if status >= 500:
+        return _unknown_outcome(binding, f"GitHub answered {status}")
+    if not 200 <= status < 300:
+        return _result(False, error=f"GitHub answered {status}: {response.get('message', '')}")
+    warning = _record(binding)
+    return _result(True, url=response.get("html_url"), **({"warning": warning} if warning else {}))
+
+
+def _record(binding):
+    """Marks the binding posted and adds its key to posted.json, read again so a review another
+    session recorded during the post is kept; returns a warning if that failed (the session still
+    can't post again)."""
+    with _lock:
+        binding.posted = True
+        try:
+            posted = _read_posted()
+            if _key(binding) not in posted:
+                _write_posted(posted + [_key(binding)])
+        except (OSError, ValueError) as e:
+            return f"Not recorded in {POSTED_FILE}: {e}"
     return None
 
 
-def _unknown_outcome(binding, posted, reason):
+def _unknown_outcome(binding, reason):
     """The review may or may not exist now: record it as posted, so no retry or redelivered webhook
     can post a second one."""
-    warning = _record(binding, posted)
+    warning = _record(binding)
     return _result(False, error=f"{reason}; the review may or may not have been posted. Don't retry.",
                    **({"warning": warning} if warning else {}))
 
@@ -486,6 +527,7 @@ def register(ctx):
         logger.warning("github-review: prepare_workspace keeps Hermes' generic tool deadline")
     ctx.register_tool(name="post_pr_review", toolset="github_review", schema=SCHEMA, handler=post_pr_review)
     ctx.register_hook("pre_llm_call", bind_review_target)
+    ctx.register_hook("pre_tool_call", guard_tool_call)
     ctx.register_hook("on_session_end", release_workspace)
     ctx.register_hook("post_compaction", follow_compaction)
     ctx.register_hook("pre_api_request", heartbeat)

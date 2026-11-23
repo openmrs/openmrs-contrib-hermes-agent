@@ -12,8 +12,10 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TEXT = "cache-check-answered"
-# Log field: text in hermes/souls/reviewer.md and hermes/reviewer/skills/pr-review/SKILL.md.
-MARKERS = {"soul_marker": "REVIEWER-SOUL-MARKER", "skill_marker": "PR-REVIEW-SKILL-MARKER"}
+# Log field: text in hermes/souls/reviewer.md and hermes/reviewer/skills/pr-review/SKILL.md, and in
+# the title, body, and author of tests/run.sh's pull_request events (which must not reach the model).
+MARKERS = {"soul_marker": "REVIEWER-SOUL-MARKER", "skill_marker": "PR-REVIEW-SKILL-MARKER",
+           "pr_text_marker": "PR-TEXT-MARKER"}
 
 
 def has_marker(content):

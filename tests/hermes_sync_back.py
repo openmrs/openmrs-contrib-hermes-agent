@@ -1,8 +1,11 @@
-"""Plants a skill in the workspace's .hermes directory, then ends the terminal session, used by tests/run.sh.
+"""Changes the pr-review skill and plants a file next to it in the workspace's .hermes directory,
+then ends the terminal session, used by tests/run.sh.
 
 Runs in the agent container (on stdin, as the Hermes user). Ending the session makes Hermes copy
-changed files from the workspace's .hermes back into the agent's HERMES_HOME (sync_back). Prints one
-line: whether the planted file existed in the workspace before the session ended.
+changed files from the workspace's .hermes back into the agent's HERMES_HOME (sync_back): a changed
+file it pushed, and a new file in a folder that holds one it pushed (a new file anywhere else has no
+host path, so it is skipped either way). Prints one line: whether the skill was pushed to the
+workspace, and whether both changes were made there before the session ended.
 
 Tools run under the profile's terminal scope, as in tests/hermes_workspace_tools.py.
 """
@@ -17,8 +20,15 @@ from tools.terminal_tool_lifecycle import cleanup_vm
 install_profile_terminal_scope(get_hermes_home())
 
 TASK = "sync-check"
-planted = json.loads(handle_function_call("terminal", {
-    "command": "mkdir -p ~/.hermes/skills/planted && echo planted > ~/.hermes/skills/planted/SKILL.md"
-               " && test -f ~/.hermes/skills/planted/SKILL.md && echo yes"}, task_id=TASK))["output"].strip()
+SKILL = "~/.hermes/skills/pr-review"
+
+
+def terminal(command):
+    return json.loads(handle_function_call("terminal", {"command": command}, task_id=TASK))["output"].strip()
+
+
+pushed = terminal(f"test -f {SKILL}/SKILL.md && echo yes")
+changed = terminal(f"echo planted >> {SKILL}/SKILL.md && echo planted > {SKILL}/planted.md"
+                   f" && grep -qx planted {SKILL}/SKILL.md && test -f {SKILL}/planted.md && echo yes")
 cleanup_vm(TASK)
-print(f"planted_in_workspace={planted}")
+print(f"pushed={pushed} changed_in_workspace={changed}")

@@ -109,7 +109,8 @@ x-workspace: &workspace
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID, SYS_CHROOT]
   read_only: true
   # exec because Docker defaults tmpfs to noexec, and builds load native libraries from /tmp
-  tmpfs: ["/tmp:size=2g,exec", "/run"]
+  # /run holds sshd's and the supervisor's small files, and the workspace user can write to it.
+  tmpfs: ["/tmp:size=2g,exec", "/run:size=16m"]
   networks: [workspaces, workspace-egress]
   environment: &workspace-environment
     # Resets after this many minutes with no one logged in: kills the workspace user's processes and,
@@ -451,6 +452,9 @@ services:
   # token), and its skills are all read-only, so neither the agent nor a PR it reads can change them.
   agent-reviewer:
     <<: *hermes-agent
+    # Only with `--profile reviewer` (or COMPOSE_PROFILES=reviewer): a host without the reviewer
+    # agent has no data or webhook secret for it.
+    profiles: [reviewer]
     depends_on:
       litellm:
         condition: service_healthy
@@ -481,6 +485,7 @@ services:
   # builds and a browser.
   workspace-reviewer:
     <<: *workspace
+    profiles: [reviewer]
     build: {context: ./workspace, target: reviewer}
     image: hermes-workspace-reviewer:local
     environment:
