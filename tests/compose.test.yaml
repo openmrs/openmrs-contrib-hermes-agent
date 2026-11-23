@@ -64,6 +64,21 @@ services:
       WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
       WORKSPACE_POLL_SECONDS: "2"
 
+  # Posts reviews to fake-github.
+  agent-reviewer:
+    image: hermes-agent:test-${TEST_SLOT}
+    environment:
+      GITHUB_API_URL: http://fake-github:8004
+
+  # Like workspace-default; 2 GB because the production 8 GB doesn't fit next to the test stack.
+  workspace-reviewer:
+    image: hermes-workspace:test-${TEST_SLOT}
+    mem_limit: 2g
+    environment:
+      WORKSPACE_IDLE_MINUTES: "0.25"
+      WORKSPACE_KEEP_FILES: "false"
+      WORKSPACE_POLL_SECONDS: "2"
+
   # Serves the test repository run.sh creates with git daemon, from the workspace image (which has
   # git). Like GitHub, it speaks git's smart protocol, which partial clones need.
   # safe.directory: the repository belongs to the host user, not the container's.

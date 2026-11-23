@@ -35,6 +35,17 @@ SECRET_FILES = {
 # JIRA_API_TOKEN, ATLASSIAN_OAUTH_ACCESS_TOKEN, ALLOW_GLOBAL_CRED_FALLBACK) would let callers act
 # without one.
 MCP_ATLASSIAN_ENV_ALLOWED = {"ATLASSIAN_OAUTH_ENABLE", "TOOLSETS", "ENABLED_TOOLS"}
+# Read-only binds an agent has beyond the four every agent has (target: source in the repository).
+AGENT_EXTRA_BINDS = {
+    "agent-reviewer": {
+        "/etc/hermes/config.yaml": "hermes/reviewer/config.yaml",
+        "/opt/data/plugins/github-review": "hermes/plugins/github-review",
+        "/opt/data/skills": "hermes/reviewer/skills",
+    },
+}
+# A workspace's cache volume, if not the shared workspace-cache. The reviewer builds untrusted PRs,
+# so it gets its own: a poisoned cache can't reach other agents.
+WORKSPACE_CACHE = {"workspace-reviewer": "reviewer-cache"}
 
 
 def marker(secret):
@@ -94,9 +105,18 @@ for name, service in sorted(agents.items()):
     envs = [m for m in agents_data if m.get("target") == "/opt/data/.env"]
     souls = [m for m in service_mounts if m.get("target") == "/opt/data/SOUL.md"]
     configs = [m for m in service_mounts if m.get("target") == "/opt/data/config.yaml"]
-    check(f"{name}: mounts only its own agents-data subdirectory, .env, SOUL.md, and config.yaml",
-          len(service_mounts) == 4 and len(agents_data) == 2 and len(data) == 1 and len(envs) == 1
-          and len(souls) == 1 and len(configs) == 1, service_mounts)
+    extra_binds = AGENT_EXTRA_BINDS.get(name, {})
+    extras = [m for m in service_mounts if m.get("target") in extra_binds]
+    check(f"{name}: mounts only its own agents-data subdirectory, .env, SOUL.md, and config.yaml"
+          + (f", and {', '.join(sorted(extra_binds))}" if extra_binds else ""),
+          len(service_mounts) == 4 + len(extra_binds) and len(agents_data) == 2 and len(data) == 1 and len(envs) == 1
+          and len(souls) == 1 and len(configs) == 1 and len(extras) == len(extra_binds), service_mounts)
+    for target, source in sorted(extra_binds.items()):
+        found = [m for m in extras if m.get("target") == target]
+        check(f"{name}: {target} is {source}, read-only",
+              len(found) == 1 and found[0].get("type") == "bind" and found[0].get("read_only") is True
+              and str(found[0].get("source", "")).replace("\\", "/").endswith(f"/{source}"),
+              found)
     check(f"{name}: agents-data subdirectory is {expected_subpath!r}",
           len(data) == 1 and data[0].get("type") == "volume"
           and (data[0].get("volume") or {}).get("subpath") == expected_subpath,
@@ -133,9 +153,10 @@ for name, service in sorted(workspaces.items()):
     check(f"{name}: read-only root filesystem", service.get("read_only") is True, service.get("read_only"))
     service_mounts = mounts(service)
     configs = [m for m in service_mounts if m.get("source") == "workspace-config"]
-    caches = [m for m in service_mounts if m.get("source") == "workspace-cache" and m.get("target") == "/cache"]
+    cache_volume = WORKSPACE_CACHE.get(name, "workspace-cache")
+    caches = [m for m in service_mounts if m.get("source") == cache_volume and m.get("target") == "/cache"]
     work = [m for m in service_mounts if m.get("target") == "/work" and not m.get("source")]
-    check(f"{name}: mounts only its own workspace-config subdirectory, the cache, and an anonymous /work",
+    check(f"{name}: mounts only its own workspace-config subdirectory, the {cache_volume} cache, and an anonymous /work",
           len(service_mounts) == 3 and len(configs) == 1 and len(caches) == 1 and len(work) == 1, service_mounts)
     check(f"{name}: workspace-config subdirectory is {expected_subpath!r}, read-only",
           len(configs) == 1 and configs[0].get("type") == "volume" and configs[0].get("read_only") is True

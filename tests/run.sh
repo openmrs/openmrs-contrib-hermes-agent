@@ -45,6 +45,10 @@
 #      LiteLLM or Postgres, and holds no agent secrets; going idle kills its processes and deletes
 #      its files except the caches, or with WORKSPACE_KEEP_FILES keeps /work, also across restarts.
 #      Then purging the agents removes all of their data.
+#  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
+#      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
+#      commit the webhook prompt bound the session to, only after the workspace is prepared, and
+#      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
@@ -274,7 +278,7 @@ else
 fi
 
 echo "== Starting LiteLLM"
-compose --profile admin build admin agent-default workspace-default github-token >/dev/null
+compose --profile admin build admin agent-default workspace-default agent-reviewer workspace-reviewer github-token >/dev/null
 compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-token fake-jev fake-atlassian \
   fake-onyx fake-anthropic \
   fake-github fake-git >/dev/null
@@ -948,6 +952,52 @@ expect_ok "agent delete --purge an agent that has run" admin agent delete defaul
 expect "purge removes all of a run agent's data and its workspace configuration" "absent absent" \
   "$(admin_sh 'for p in /agents/default /workspaces/default; do test -e $p && echo present || echo absent; done' |
     tr '\n' ' ' | sed 's/ $//')"
+
+echo "== 11. Reviewer"
+expect_ok "agent add reviewer (github_read, github_review)" admin agent add reviewer --github github_read,github_review
+if compose up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null &&
+  compose up -d --no-deps agent-reviewer >/dev/null; then
+  pass "reviewer services start"
+else
+  fail "reviewer services start"
+fi
+# The gateway gets this far only with the read-only skills and plugin mounts in place.
+context=""
+for _ in $(seq 1 60); do
+  context="$(compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
+    sed -n 's/.*Model context warmed: auto -> \([0-9]*\) tokens.*/\1/p' | tail -n 1 || true)"
+  [ -n "$context" ] && break
+  sleep 3
+done
+expect "reviewer gateway starts (auto context length)" "$expected_context" "$context"
+expect "reviewer's SOUL.md is hermes/souls/reviewer.md" "$(shasum -a 256 < "$root/hermes/souls/reviewer.md" | cut -d' ' -f1)" \
+  "$(compose exec -T agent-reviewer cat /opt/data/SOUL.md | shasum -a 256 | cut -d' ' -f1)"
+expect "reviewer's managed config applies over hermes/config.yaml" "150 false" \
+  "$(compose exec -T agent-reviewer sh -c 'echo $(hermes config get agent.max_turns) $(hermes config get memory.memory_enabled)' 2>&1)"
+# skills_list is the agent's own tool; `hermes skills list` fails on the read-only skills directory.
+expect "reviewer's skills are only hermes/reviewer/skills" "pr-review" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python -c 'import json
+from model_tools import handle_function_call
+print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
+expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
+expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
+expect "post_pr_review posts only for the bound, prepared PR, once" \
+  "a=posted b=refused c=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e=refused f=posted g1=github-422 g2=posted" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1)"
+review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
+  'curl -s -H "Authorization: Bearer $KEY" http://github-token:8080/token/github_review' || true)"
+expect "review: the bound PR and commit, COMMENT, both comments, a github_review token" "1" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=11 commit=$(printf 'a%.0s' $(seq 40)) event=COMMENT comments=2 token=$review_token")"
+expect "review ignores repo, pr_number, commit_id, and event in the parameters" "1" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-core pr=13 commit=$(printf 'f%.0s' $(seq 40)) event=COMMENT comments=1 token=$review_token")"
+expect "review is posted again after GitHub's 422" "2" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-management pr=14 commit=$(printf '1%.0s' $(seq 40)) event=COMMENT ")"
+expect "refused reviews never reach GitHub" "4" "$(log_count fake-github "^review ")"
+expect "posted reviews are recorded, owned by the Hermes user" "3 ${HERMES_UID:-10000}" \
+  "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
+    echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
+compose stop agent-reviewer workspace-reviewer >/dev/null
 
 echo
 if [ "$failures" -eq 0 ]; then

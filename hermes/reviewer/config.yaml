@@ -1,0 +1,25 @@
+# The reviewer's managed scope: Hermes merges this file, mounted read-only at /etc/hermes/config.yaml,
+# key by key over the shared hermes/config.yaml. Only the reviewer mounts it.
+
+agent:
+  # 39 of the user's Claude Code /pr-review runs: median 26 model calls, 45 with a browser test,
+  # largest 82 (about 130 with its subagent calls). The reviewer has no subagents and starts
+  # each review in an empty workspace, so it needs more. Tune after the first real reviews.
+  max_turns: 150
+# PR text must not end up in memories or skills (<H>/hermes_cli/config_defaults.py:1326, :825, :1512).
+memory:
+  memory_enabled: false
+auxiliary:
+  background_review:
+    enabled: false
+curator:
+  enabled: false
+# Without this, a route whose toolsets name no MCP server gets every enabled one
+# (<H>/hermes_cli/tools_config.py:707-710). The route also lists no_mcp.
+mcp_servers:
+  atlassian_read: {enabled: false}
+  atlassian_jira_write: {enabled: false}
+  atlassian_confluence_write: {enabled: false}
+  onyx_search: {enabled: false}
+plugins:
+  enabled: [github-review]

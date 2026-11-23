@@ -445,6 +445,58 @@ services:
       # Emptied whenever the workspace resets.
       - /work
 
+  # Reviews pull requests in three OpenMRS repositories when GitHub's webhook starts it. Its own
+  # settings (/etc/hermes/config.yaml, Hermes' managed scope, merged over the shared config.yaml), the
+  # github-review plugin (binds each run to its PR and posts one COMMENT review with a github_review
+  # token), and its skills are all read-only, so neither the agent nor a PR it reads can change them.
+  agent-reviewer:
+    <<: *hermes-agent
+    depends_on:
+      litellm:
+        condition: service_healthy
+      workspace-reviewer:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - type: volume
+        source: agents-data
+        target: /opt/data
+        volume:
+          subpath: reviewer
+      - type: volume
+        source: agents-data
+        target: /opt/data/.env
+        read_only: true
+        volume:
+          subpath: reviewer/.env
+      - ./hermes/souls/reviewer.md:/opt/data/SOUL.md:ro
+      - ./hermes/config.yaml:/opt/data/config.yaml:ro
+      - ./hermes/reviewer/config.yaml:/etc/hermes/config.yaml:ro
+      - ./hermes/plugins/github-review:/opt/data/plugins/github-review:ro
+      - ./hermes/reviewer/skills:/opt/data/skills:ro
+
+  # Builds and tests untrusted PRs, so it has its own cache (reviewer-cache), and more memory for
+  # builds and a browser.
+  workspace-reviewer:
+    <<: *workspace
+    environment:
+      <<: *workspace-environment
+      # A fallback; the reviewer also resets its workspace before each review.
+      WORKSPACE_IDLE_MINUTES: "10"
+      WORKSPACE_KEEP_FILES: "false"
+    mem_limit: 8g
+    shm_size: 1g
+    volumes:
+      - type: volume
+        source: workspace-config
+        target: /config
+        read_only: true
+        volume:
+          subpath: reviewer
+      - reviewer-cache:/cache
+      # Emptied whenever the workspace resets.
+      - /work
+
 # Bridge names are pinned (at most 15 characters) because Podman's netavark can leave an internal
 # network's "no forwarding" setting behind for its bridge name, and an external network that later
 # reuses the name gets no egress (containers/netavark#1497). Each name must be unique on the host,
@@ -482,6 +534,8 @@ volumes:
   onyx-opensearch-data: {}
   # Maven, npm, Yarn, pnpm, and Corepack caches, shared by every workspace and kept across resets.
   workspace-cache: {}
+  # The same caches for workspace-reviewer only, which builds untrusted pull requests.
+  reviewer-cache: {}
   # Per agent: its workspace's SSH keys and LiteLLM key, written by admin. Each workspace mounts
   # only its own; agents mount none of it.
   workspace-config: {}
