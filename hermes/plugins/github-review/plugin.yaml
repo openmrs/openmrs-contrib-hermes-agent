@@ -3,6 +3,9 @@ version: "1.0"
 description: Binds a webhook-started session to the pull request that triggered it and posts one COMMENT review for it.
 kind: standalone
 provides_tools:
+  - prepare_workspace
   - post_pr_review
 provides_hooks:
   - pre_llm_call
+  - on_session_end
+  - post_compaction

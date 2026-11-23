@@ -2,8 +2,10 @@
 
 Logs an "anthropic request" line per call saying whether the system prompt and the final message
 carry cache_control, the names of the tools offered, and whether the system prompt or messages
-contain each of MARKERS. Always answers with plain text, so an agent run ends without calling a
-tool; streams the answer when the request asks for it.
+contain each of MARKERS. Answers with plain text, so an agent run ends, except that a request
+offering prepare_workspace with no tool result yet gets a call to it (logged as "anthropic tool_use",
+and its result as "anthropic tool_result"), as the reviewer's first step. Streams the answer when the
+request asks for it.
 """
 
 import json
@@ -16,6 +18,27 @@ MARKERS = {"soul_marker": "REVIEWER-SOUL-MARKER", "skill_marker": "PR-REVIEW-SKI
 
 def has_marker(content):
     return isinstance(content, list) and any(isinstance(b, dict) and b.get("cache_control") for b in content)
+
+
+def tool_results(messages):
+    """The text of each tool_result block in the messages."""
+    results = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    inner = "".join(b.get("text", "") for b in inner if isinstance(b, dict))
+                results.append(str(inner))
+    return results
+
+
+def succeeded(text):
+    try:
+        return json.loads(text).get("success") is True
+    except (ValueError, AttributeError):
+        return False
 
 
 def sse(event, data):
@@ -36,13 +59,27 @@ class Handler(BaseHTTPRequestHandler):
             f"stream={bool(body.get('stream'))} tools={tools} {markers}",
             flush=True,
         )
+        results = tool_results(body.get("messages") or [])
+        if results:
+            if not succeeded(results[-1]):
+                print(f"anthropic tool_result_text {results[-1][:300]}", flush=True)
+            print(f"anthropic tool_result success={succeeded(results[-1])}", flush=True)
+        if "prepare_workspace" in tools.split(",") and not results:
+            print("anthropic tool_use name=prepare_workspace", flush=True)
+            block = {"type": "tool_use", "id": "toolu_test_prepare", "name": "prepare_workspace", "input": {}}
+            stop_reason = "tool_use"
+            start_block, delta = dict(block, input={}), {"type": "input_json_delta", "partial_json": "{}"}
+        else:
+            block = {"type": "text", "text": TEXT}
+            stop_reason = "end_turn"
+            start_block, delta = {"type": "text", "text": ""}, {"type": "text_delta", "text": TEXT}
         message = {
             "id": "msg_test",
             "type": "message",
             "role": "assistant",
             "model": body.get("model"),
-            "content": [{"type": "text", "text": TEXT}],
-            "stop_reason": "end_turn",
+            "content": [block],
+            "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": {"input_tokens": 10, "output_tokens": 3},
         }
@@ -53,12 +90,10 @@ class Handler(BaseHTTPRequestHandler):
             start = dict(message, content=[], stop_reason=None, usage={"input_tokens": 10, "output_tokens": 1})
             for event, data in (
                 ("message_start", {"type": "message_start", "message": start}),
-                ("content_block_start", {"type": "content_block_start", "index": 0,
-                                         "content_block": {"type": "text", "text": ""}}),
-                ("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                         "delta": {"type": "text_delta", "text": TEXT}}),
+                ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": start_block}),
+                ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
                 ("content_block_stop", {"type": "content_block_stop", "index": 0}),
-                ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                                    "usage": {"output_tokens": 3}}),
                 ("message_stop", {"type": "message_stop"}),
             ):

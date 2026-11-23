@@ -49,13 +49,17 @@
 #      of their data.
 #  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
 #      its workspace opens a page with agent-browser over SSH;
+#      prepare_workspace resets the workspace (the terminal still works after), for one review at a
+#      time, never for a PR and commit already reviewed, and fails when the workspace is down; the
+#      workspace rejects a reset request that is a symlink; a compacted session keeps its binding and
+#      the workspace;
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
 #      commit the webhook prompt bound the session to, only after the workspace is prepared, and
 #      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible, and
 #      an unknown outcome (a 5xx, an unreadable answer) counts as posted. The github-pr webhook route
 #      needs a valid signature, starts a run only for a ready, human-authored PR to a listed
-#      repository, and gives the model the reviewer's SOUL.md, the pr-review skill, and only its own
-#      tools.
+#      repository, and gives the model the reviewer's SOUL.md, the pr-review skill, and exactly its
+#      own tools; the model's first call, prepare_workspace, resets the workspace.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
@@ -1034,10 +1038,14 @@ from model_tools import handle_function_call
 print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
 expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
 expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
-expect "post_pr_review posts only for the bound, prepared PR, once" \
-  "a=posted b=refused c=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused" \
+# Each successful prepare_workspace below (ten of them) is one reset on request.
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+expect "prepare_workspace and post_pr_review: one review at a time, only for the bound, prepared PR, once" \
+  "j=prepared j-reset=clean k=waited a0=prepared a=posted b=refused c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused m1=refused m2=posted n1=refused n2=prepared" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
     tail -n 1)"
+expect "workspace-reviewer resets once per prepare_workspace" "10" \
+  "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
 review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
   'curl -s -H "Authorization: Bearer $KEY" http://github-token:8080/token/github_review' || true)"
 expect "review: the bound PR and commit, COMMENT, both comments, a github_review token" "1" \
@@ -1048,10 +1056,28 @@ expect "review is posted again after GitHub's 422" "2" \
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-management pr=14 commit=$(printf '1%.0s' $(seq 40)) event=COMMENT ")"
 expect "GitHub's 500 and a non-JSON answer each reach GitHub once, with no retry" "1 1" \
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=15 ") $(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=16 ")"
-expect "refused reviews never reach GitHub" "6" "$(log_count fake-github "^review ")"
-expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "5 ${HERMES_UID:-10000}" \
+expect "refused reviews never reach GitHub" "7" "$(log_count fake-github "^review ")"
+expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "6 ${HERMES_UID:-10000}" \
   "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
     echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
+compose stop workspace-reviewer >/dev/null
+expect "prepare_workspace fails while the workspace is down, so post_pr_review refuses" "prepare=refused post=refused" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - stopped < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1)"
+compose up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null
+# As the workspace user, a symlink to the workspace's LiteLLM key as the reset request: the
+# supervisor deletes it without following it or resetting. Checked within the 15-second idle limit.
+rejected_before="$(log_count_fixed workspace-reviewer "rejected a reset request")"
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+  ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer \
+  'echo x > ~/kept && ln -s /config/litellm_key /run/workspace-reset/request' >/dev/null 2>&1 || true
+sleep 6
+expect "a symlinked reset request is deleted and logged, without a reset or the key in reset-done" "1 0 deleted /work/home/kept clean" \
+  "$(($(log_count_fixed workspace-reviewer "rejected a reset request") - rejected_before)) $(($(log_count_fixed workspace-reviewer "reset on request") - resets_before)) $(
+    compose exec -T workspace-reviewer sh -c '[ -L /run/workspace-reset/request ] || echo deleted; ls /work/home/kept
+      grep -qF -f /config/litellm_key /run/workspace/reset-done 2>/dev/null && echo leaked || echo clean' 2>&1 |
+    tr '\n' ' ' | sed 's/ $//')"
 
 # The webhook route. The tier models now go to fake-anthropic, which logs what the model gets and
 # answers with plain text, so an accepted run ends without calling a tool.
@@ -1074,6 +1100,10 @@ webhook() {
 review_requests() {
   log_count fake-anthropic "anthropic request .* tools=[^ ]*post_pr_review"
 }
+# fake-anthropic answers a review's first request with a prepare_workspace call, and logs its result.
+tool_results() {
+  log_count fake-anthropic "anthropic tool_result "
+}
 chart=openmrs/openmrs-esm-patient-chart
 model_before="$(log_count fake-anthropic "anthropic request")"
 expect "webhook: a draft PR is ignored" "200 ignored filter" "$(webhook "$(pr_event opened true User "$chart" 21)")"
@@ -1088,26 +1118,28 @@ expect "webhook: the published port answers on 127.0.0.1" "401" \
     "http://127.0.0.1:$TEST_REVIEWER_PORT/webhooks/github-pr" "$reviewer_secret" pull_request --bad-signature)"
 expect "webhook: ignored and refused events reach no model" "$model_before" "$(log_count fake-anthropic "anthropic request")"
 review_before="$(review_requests)"
+results_before="$(tool_results)"
+tool_uses_before="$(log_count fake-anthropic "anthropic tool_use ")"
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
 expect "webhook: a new PR (opened) starts a review" "202 accepted" "$(webhook "$(pr_event opened false User "$chart" 26)")"
-review_after="$review_before"
 for _ in $(seq 1 60); do
-  review_after="$(review_requests)"
-  [ "$review_after" -gt "$review_before" ] && break
+  [ "$(tool_results)" -gt "$results_before" ] && break
   sleep 3
 done
-expect "webhook: the review reaches the model" "1" "$((review_after - review_before))"
+expect "webhook: the review reaches the model, before and after its tool call" "2" "$(($(review_requests) - review_before))"
+expect "webhook: the model's first tool call is prepare_workspace, which succeeds and resets the workspace" \
+  "name=prepare_workspace success=True 1" \
+  "$(grep -E "anthropic tool_use " "$TEST_WORK/fake-anthropic.log" | sed -n "$((tool_uses_before + 1))s/.* //p") $(
+    grep -E "anthropic tool_result " "$TEST_WORK/fake-anthropic.log" | sed -n "$((results_before + 1))s/.* //p") $((
+    $(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
 review_line="$(grep -E "anthropic request .* tools=[^ ]*post_pr_review" "$TEST_WORK/fake-anthropic.log" | tail -n 1 || true)"
 expect "webhook: the model gets the reviewer's SOUL.md and the pr-review skill" "soul_marker=True skill_marker=True" \
   "$(printf '%s' "$review_line" | sed -nE 's/.*(soul_marker=[A-Za-z]+ skill_marker=[A-Za-z]+).*/\1/p')"
-review_tools="$(printf '%s' "$review_line" | sed -nE 's/.* tools=([^ ]*).*/\1/p' | tr , '\n')"
-# Task 6 adds prepare_workspace to the tools the route must offer.
-expect "webhook: the review has terminal and post_pr_review" "post_pr_review terminal" \
-  "$(printf '%s\n' "$review_tools" | grep -x -E 'terminal|post_pr_review' | sort | tr '\n' ' ' | sed 's/ $//')"
-# tool_search, tool_describe, and tool_call would hide other tools behind them.
-forbidden_tools="$(printf '%s\n' "$review_tools" |
-  grep -E '^(memory|skills_list|skill_view|skill_manage|mcp_.*|tool_search|tool_describe|tool_call)$' | tr '\n' ' ' || true)"
-expect "webhook: the review has no memory, skill, MCP, or tool-search tools" "none" \
-  "$(if [ -n "$review_tools" ]; then echo "${forbidden_tools:-none}"; else echo "no review request logged"; fi)"
+# Exactly the route's toolsets: no memory, skill, MCP, or tool-search tools (tool_search would hide
+# the others behind it).
+expect "webhook: the review has exactly the terminal, file, and github_review tools" \
+  "patch,post_pr_review,prepare_workspace,process_manage,read_file,search_files,terminal,write_file" \
+  "$(printf '%s' "$review_line" | sed -nE 's/.* tools=([^ ]*).*/\1/p' | tr , '\n' | sort | paste -sd , -)"
 expect "webhook: a PR marked ready for review starts a review" "202 accepted" \
   "$(webhook "$(pr_event ready_for_review false User "$chart" 27)")"
 # Each run ends when the model answers with text, which the route's `deliver: log` writes.
@@ -1119,6 +1151,8 @@ for _ in $(seq 1 60); do
   sleep 3
 done
 expect "webhook: both accepted runs end with the model's answer" "2" "$answered"
+expect "webhook: each run resets the workspace" "2" \
+  "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
 unset TEST_LITELLM_CONFIG
 restart_litellm
 compose stop agent-reviewer workspace-reviewer >/dev/null
