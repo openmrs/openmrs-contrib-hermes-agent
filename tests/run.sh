@@ -512,6 +512,19 @@ expect "agent slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_
   "$(admin_sh 'grep -E "^SLACK_(ALLOWED_USERS|BOT_TOKEN)=" /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
 expect "agent slack keeps the agent's key" "$reader_key" "$(agent_key default)"
 
+webhook_secret="$(admin agent webhook default --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "agent webhook prints a 64-character hex secret" "64" "$(printf '%s' "$webhook_secret" | wc -c | tr -d ' ')"
+expect "agent webhook writes the same secret to .env" "$webhook_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+expect_refused "agent webhook asks before replacing a secret" admin agent webhook default </dev/null
+expect "a refused replacement keeps the secret" "$webhook_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+new_webhook_secret="$(admin agent webhook default --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "agent webhook --yes replaces the secret" "different" \
+  "$([ -n "$new_webhook_secret" ] && [ "$new_webhook_secret" != "$webhook_secret" ] && echo different || echo same)"
+expect "the replacement is in .env" "$new_webhook_secret" "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+expect "agent webhook keeps the other settings and the agent's key" "$reader_key" "$(agent_key default)"
+
 expect_refused "agent delete needs confirmation without --yes" admin agent delete nobody </dev/null
 expect_refused "agent delete refuses an answer other than y" admin_stdin 'n\n' agent delete nobody
 # Without a TTY (bin/admin passes -T when output is redirected), the answer still comes from stdin.
@@ -956,6 +969,12 @@ expect "purge removes all of a run agent's data and its workspace configuration"
 
 echo "== 11. Reviewer"
 expect_ok "agent add reviewer (github_read, github_review)" admin agent add reviewer --github github_read,github_review
+reviewer_secret="$(admin agent webhook reviewer --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "reviewer's .env holds only its key, the workspace host, and the webhook secret" \
+  "LITELLM_API_KEY TERMINAL_SSH_HOST WEBHOOK_SECRET" \
+  "$(admin_sh 'cut -d= -f1 /agents/reviewer/.env | sort | tr "\n" " "' | sed 's/ $//')"
+expect "reviewer's webhook secret is the one admin printed" "$reviewer_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/reviewer/.env")"
 if compose up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null &&
   compose up -d --no-deps agent-reviewer >/dev/null; then
   pass "reviewer services start"
