@@ -1040,6 +1040,17 @@ from model_tools import handle_function_call
 print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
 expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
 expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
+# Ending a terminal session copies changed files in the workspace's .hermes back to the agent
+# (sync_back), also into skills/. The read-only mount makes that copy fail without a trace.
+expect "workspace .hermes file written, session ended" "planted_in_workspace=yes" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_sync_back.py" 2>/dev/null |
+    tail -n 1)"
+expect "a skill planted in the workspace doesn't reach the reviewer's skills" "absent" \
+  "$(compose exec -T agent-reviewer sh -c 'test -e /opt/data/skills/planted && echo present || echo absent')"
+# The agent has no healthcheck: it is healthy when it still runs and its webhook listener accepts.
+expect "reviewer is still running, with its webhook listener, after sync_back" "running listening" \
+  "$(compose ps --format '{{.State}}' agent-reviewer) $(compose exec -T agent-reviewer python3 -c \
+    'import socket; socket.create_connection(("127.0.0.1", 8644), timeout=3); print("listening")' 2>/dev/null)"
 # Each successful prepare_workspace below (thirteen of them) is one reset on request.
 resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
 expect "prepare_workspace and post_pr_review: one review at a time, only for the bound, prepared PR, once" \
