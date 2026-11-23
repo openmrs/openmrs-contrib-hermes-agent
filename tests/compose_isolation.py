@@ -183,6 +183,17 @@ for name, service in services.items():
     for secret in secrets(service):
         check(f"{name}: may receive secrets/{secret}", name in SECRET_FILES[secret])
 
+# GitHub must reach the reviewer's webhook, so its port is the one published on all addresses.
+for name, service in sorted(services.items()):
+    for port in service.get("ports") or []:
+        if port.get("host_ip") != "127.0.0.1":
+            check(f"{name}: a port on all addresses is only agent-reviewer's 8644",
+                  name == "agent-reviewer" and port.get("target") == 8644 and str(port.get("published")) == "8644", port)
+reviewer_ports = services.get("agent-reviewer", {}).get("ports") or []
+check("agent-reviewer: publishes only 8644, on all addresses",
+      [(p.get("host_ip") or "0.0.0.0", p.get("target"), str(p.get("published"))) for p in reviewer_ports]
+      == [("0.0.0.0", 8644, "8644")], reviewer_ports)
+
 admin, litellm, postgres = services.get("admin", {}), services["litellm"], services["postgres"]
 github_token = services.get("github-token", {})
 check("admin service exists", bool(admin))

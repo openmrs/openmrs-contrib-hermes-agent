@@ -1,6 +1,6 @@
 """Derives tests/run.sh's LiteLLM config from litellm/config.yaml.
 
-Usage: python3 tests/make_litellm_config.py <litellm/config.yaml> <output.yaml>
+Usage: python3 tests/make_litellm_config.py <litellm/config.yaml> <output.yaml> [<upstream.yaml>]
 
 Changes from the real config:
   - fast / balanced / strong get a mock_response naming the tier, so a reply shows which model
@@ -12,6 +12,9 @@ Changes from the real config:
   - each tier is copied, unmocked, as `cache-check-<tier>` against tests/fake_anthropic.py, to see
     what LiteLLM sends upstream.
   - prompts are stored in spend logs, so the test can check what reached the model.
+
+<upstream.yaml>, if given, is the same except that fast / balanced / strong are not mocked but sent
+to tests/fake_anthropic.py, so a test can see what an agent sends to its model.
 """
 
 import sys
@@ -46,10 +49,15 @@ def model_entry(config: str, name: str) -> str:
             return config[start:end]
 
 
-def main(source: str, dest: str) -> None:
+def main(source: str, dest: str, upstream_dest: str = "") -> None:
     with open(source) as f:
-        config = f.read()
+        source_config = f.read()
+    write(source_config, dest, source, upstream=False)
+    if upstream_dest:
+        write(source_config, upstream_dest, source, upstream=True)
 
+
+def write(config: str, dest: str, source: str, upstream: bool) -> None:
     cache_checks = ""
     for name in TIER_MODELS:
         line = f"model: os.environ/LLM_MODEL_{name}\n"
@@ -61,7 +69,10 @@ def main(source: str, dest: str) -> None:
             .replace(f"model_name: {tier}\n", f"model_name: cache-check-{tier}\n")
             .replace(line, f"{line}      api_base: {FAKE_ANTHROPIC}\n")
         )
-        config = config.replace(line, f'{line}      mock_response: "{tier}-model-answered"\n')
+        if upstream:
+            config = config.replace(line, f"{line}      api_base: {FAKE_ANTHROPIC}\n")
+        else:
+            config = config.replace(line, f'{line}      mock_response: "{tier}-model-answered"\n')
 
     if config.count("model_list:\n") != 1:
         sys.exit(f"{source}: expected exactly one 'model_list:' line")
@@ -84,6 +95,6 @@ def main(source: str, dest: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
-    main(sys.argv[1], sys.argv[2])
+    main(*sys.argv[1:])

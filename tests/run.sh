@@ -16,7 +16,8 @@
 #
 # What it checks:
 #   1. compose.yaml separates secrets, volumes, and networks; every service has no-new-privileges
-#      and only the capabilities it needs (static).
+#      and only the capabilities it needs; only the reviewer's webhook port is published beyond
+#      127.0.0.1 (static).
 #   2. Admin tool: agent add/edit/rotate/slack/delete; key lockdown (no management API, no provider
 #      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
 #      rotation; per-key MCP access with the right credential and only that server's tools;
@@ -28,7 +29,7 @@
 #      come from `fast`; the read-only SOUL.md reaches the model; MCP reaches only granted servers;
 #      the terminal, file tools, and execute_code run in the workspace; the agent can't change its
 #      .env but sees admin's changes after a restart; it holds no other secrets and can't reach
-#      Postgres.
+#      Postgres; it has no webhook listener.
 #   6. tier_classifier.py internals: refuses router classifier models, follows Router rebuilds,
 #      declines re-entry.
 #   7. Classifier fallbacks: both fail -> heuristic; classifier model `auto` refused without
@@ -49,13 +50,17 @@
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
 #      commit the webhook prompt bound the session to, only after the workspace is prepared, and
 #      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible, and
-#      an unknown outcome (a 5xx, an unreadable answer) counts as posted.
+#      an unknown outcome (a 5xx, an unreadable answer) counts as posted. The github-pr webhook route
+#      needs a valid signature, starts a run only for a ready, human-authored PR to a listed
+#      repository, and gives the model the reviewer's SOUL.md, the pr-review skill, and only its own
+#      tools.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
 #   TEST_SLOT          Slot to use, 0-9 (default: the first free one); fails if another run has it
 #   TEST_LITELLM_PORT  Host port the test LiteLLM publishes (default 14000 plus the slot; not used by
 #                      the tests)
+#   TEST_REVIEWER_PORT Host port the test reviewer's webhook publishes (default 14644 plus the slot)
 
 set -euo pipefail
 
@@ -68,6 +73,7 @@ if ! read -r TEST_SLOT <&3; then
 fi
 export TEST_SLOT
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-$((14000 + TEST_SLOT))}"
+export TEST_REVIEWER_PORT="${TEST_REVIEWER_PORT:-$((14644 + TEST_SLOT))}"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
@@ -235,7 +241,9 @@ agent_field() {
 
 echo "== Setup"
 compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
-python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml"
+# litellm-upstream.yaml, for the reviewer's webhook checks, sends the tier models to fake-anthropic.
+python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml" \
+  "$TEST_WORK/litellm-upstream.yaml"
 # Throwaway GitHub App key pair: github-token signs, fake-github verifies.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
 openssl rsa -in "$TEST_WORK/github-app.pem" -pubout -out "$TEST_WORK/github-app.pub.pem" 2>/dev/null
@@ -724,6 +732,13 @@ if compose exec -T agent-default python3 -c 'import socket; socket.create_connec
 else
   pass "agent can't reach Postgres"
 fi
+# The reviewer's webhook route is in its own managed config only.
+if compose exec -T litellm python3 -c 'import socket; socket.create_connection(("agent-default", 8644), timeout=3)' \
+  >/dev/null 2>&1; then
+  fail "agent-default has no listener on 8644"
+else
+  pass "agent-default has no listener on 8644"
+fi
 # admin replaces .env with a new file, which the agent's mount only picks up on restart.
 expect_ok "agent slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' agent slack default --from-stdin
 compose restart agent-default >/dev/null
@@ -1019,6 +1034,75 @@ expect "refused reviews never reach GitHub" "6" "$(log_count fake-github "^revie
 expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "5 ${HERMES_UID:-10000}" \
   "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
     echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
+
+# The webhook route. The tier models now go to fake-anthropic, which logs what the model gets and
+# answers with plain text, so an accepted run ends without calling a tool.
+export TEST_LITELLM_CONFIG=litellm-upstream.yaml
+restart_litellm
+# Prints a pull_request event: action, draft, author type, repository, PR number.
+pr_event() {
+  printf '{"action": "%s", "number": %s, "repository": {"full_name": "%s"}, "pull_request": {"number": %s, "draft": %s,
+    "user": {"login": "someone", "type": "%s"}, "head": {"sha": "%s"}, "base": {"ref": "main"},
+    "html_url": "https://github.com/%s/pull/%s", "title": "A title", "body": "A body"}}' \
+    "$1" "$5" "$4" "$5" "$2" "$3" "$(printf 'c%.0s' $(seq 40))" "$4" "$5"
+}
+# Sends an event, signed with the reviewer's secret, from inside the agents network; prints the
+# HTTP status and the answer's status and reason.
+webhook() {
+  printf '%s' "$1" | compose exec -T litellm python3 /tests/webhook_post.py \
+    http://agent-reviewer:8644/webhooks/github-pr "$reviewer_secret" pull_request "${@:2}"
+}
+# Requests that offer post_pr_review are the reviewer's own turns; side tasks offer no tools.
+review_requests() {
+  log_count fake-anthropic "anthropic request .* tools=[^ ]*post_pr_review"
+}
+chart=openmrs/openmrs-esm-patient-chart
+model_before="$(log_count fake-anthropic "anthropic request")"
+expect "webhook: a draft PR is ignored" "200 ignored filter" "$(webhook "$(pr_event opened true User "$chart" 21)")"
+expect "webhook: a bot's PR is ignored" "200 ignored filter" "$(webhook "$(pr_event opened false Bot "$chart" 22)")"
+expect "webhook: an unlisted repository is ignored" "200 ignored filter" \
+  "$(webhook "$(pr_event opened false User openmrs/openmrs-module-fhir2 23)")"
+expect "webhook: a new commit (synchronize) is ignored" "200 ignored filter" \
+  "$(webhook "$(pr_event synchronize false User "$chart" 24)")"
+expect "webhook: a bad signature is refused" "401" "$(webhook "$(pr_event opened false User "$chart" 25)" --bad-signature)"
+expect "webhook: the published port answers on 127.0.0.1" "401" \
+  "$(pr_event opened false User "$chart" 25 | python3 "$root/tests/webhook_post.py" \
+    "http://127.0.0.1:$TEST_REVIEWER_PORT/webhooks/github-pr" "$reviewer_secret" pull_request --bad-signature)"
+expect "webhook: ignored and refused events reach no model" "$model_before" "$(log_count fake-anthropic "anthropic request")"
+review_before="$(review_requests)"
+expect "webhook: a new PR (opened) starts a review" "202 accepted" "$(webhook "$(pr_event opened false User "$chart" 26)")"
+review_after="$review_before"
+for _ in $(seq 1 60); do
+  review_after="$(review_requests)"
+  [ "$review_after" -gt "$review_before" ] && break
+  sleep 3
+done
+expect "webhook: the review reaches the model" "1" "$((review_after - review_before))"
+review_line="$(grep -E "anthropic request .* tools=[^ ]*post_pr_review" "$TEST_WORK/fake-anthropic.log" | tail -n 1 || true)"
+expect "webhook: the model gets the reviewer's SOUL.md and the pr-review skill" "soul_marker=True skill_marker=True" \
+  "$(printf '%s' "$review_line" | sed -nE 's/.*(soul_marker=[A-Za-z]+ skill_marker=[A-Za-z]+).*/\1/p')"
+review_tools="$(printf '%s' "$review_line" | sed -nE 's/.* tools=([^ ]*).*/\1/p' | tr , '\n')"
+# Task 6 adds prepare_workspace to the tools the route must offer.
+expect "webhook: the review has terminal and post_pr_review" "post_pr_review terminal" \
+  "$(printf '%s\n' "$review_tools" | grep -x -E 'terminal|post_pr_review' | sort | tr '\n' ' ' | sed 's/ $//')"
+# tool_search, tool_describe, and tool_call would hide other tools behind them.
+forbidden_tools="$(printf '%s\n' "$review_tools" |
+  grep -E '^(memory|skills_list|skill_view|skill_manage|mcp_.*|tool_search|tool_describe|tool_call)$' | tr '\n' ' ' || true)"
+expect "webhook: the review has no memory, skill, MCP, or tool-search tools" "none" \
+  "$(if [ -n "$review_tools" ]; then echo "${forbidden_tools:-none}"; else echo "no review request logged"; fi)"
+expect "webhook: a PR marked ready for review starts a review" "202 accepted" \
+  "$(webhook "$(pr_event ready_for_review false User "$chart" 27)")"
+# Each run ends when the model answers with text, which the route's `deliver: log` writes.
+answered=0
+for _ in $(seq 1 60); do
+  answered="$(compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
+    grep -c "\[webhook\] Response for .*: cache-check-answered" || true)"
+  [ "${answered:-0}" -ge 2 ] && break
+  sleep 3
+done
+expect "webhook: both accepted runs end with the model's answer" "2" "$answered"
+unset TEST_LITELLM_CONFIG
+restart_litellm
 compose stop agent-reviewer workspace-reviewer >/dev/null
 
 echo

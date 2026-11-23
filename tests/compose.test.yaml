@@ -13,7 +13,7 @@ services:
     ports: !override
       - "127.0.0.1:${TEST_LITELLM_PORT:-14000}:4000"
     volumes:
-      - ${TEST_WORK:?run tests/run.sh}/litellm.yaml:/app/config.yaml:ro
+      - ${TEST_WORK:?run tests/run.sh}/${TEST_LITELLM_CONFIG:-litellm.yaml}:/app/config.yaml:ro
       - ./tests:/tests:ro
     environment:
       TYPESAFE_API_BASE: http://fake-jev:8001
@@ -64,9 +64,11 @@ services:
       WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
       WORKSPACE_POLL_SECONDS: "2"
 
-  # Posts reviews to fake-github.
+  # Posts reviews to fake-github. Its webhook port is on 127.0.0.1 and per slot, like LiteLLM's.
   agent-reviewer:
     image: hermes-agent:test-${TEST_SLOT}
+    ports: !override
+      - "127.0.0.1:${TEST_REVIEWER_PORT:-14644}:8644"
     environment:
       GITHUB_API_URL: http://fake-github:8004
 

@@ -474,6 +474,8 @@ services:
       - ./hermes/reviewer/config.yaml:/etc/hermes/config.yaml:ro
       - ./hermes/plugins/github-review:/opt/data/plugins/github-review:ro
       - ./hermes/reviewer/skills:/opt/data/skills:ro
+    # GitHub's webhooks (the github-pr route in hermes/reviewer/config.yaml).
+    ports: ["8644:8644"]
 
   # Builds and tests untrusted PRs, so it has its own cache (reviewer-cache), and more memory for
   # builds and a browser.
