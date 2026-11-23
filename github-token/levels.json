@@ -20,5 +20,11 @@
       "metadata": "read",
       "pull_requests": "write"
     }
+  },
+  "github_review": {
+    "description": "Post pull request reviews. Agent keys only; never issued to workspaces",
+    "agent_only": true,
+    "repositories": ["openmrs-esm-patient-chart", "openmrs-esm-patient-management", "openmrs-core"],
+    "permissions": {"metadata": "read", "pull_requests": "write"}
   }
 }

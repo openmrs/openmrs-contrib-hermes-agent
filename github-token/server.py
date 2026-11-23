@@ -9,7 +9,8 @@ App. Credentials come from environment variables prefixed with the upper-cased l
   <LEVEL>_PRIVATE_KEY_BASE64      the App's PEM private key, base64-encoded onto one line
 
 Agents authenticate with their LiteLLM virtual key, checked against LiteLLM's /key/info. A token
-is issued only for a level in the key's `github_levels` metadata (set by the admin tool). Keys
+is issued only for a level in the key's `github_levels` metadata (set by the admin tool). A level
+with `agent_only` is further limited to agent keys, never workspace keys. Keys
 LiteLLM rejects (revoked, expired, blocked) get nothing.
 
   GET /token/<level>   Authorization: Bearer <LiteLLM key>; returns the token as plain text.
@@ -55,6 +56,7 @@ class Level:
     name: str
     permissions: dict[str, str]
     repositories: list[str] | None
+    agent_only: bool
     app_id: str
     installation_id: str
     private_key: bytes
@@ -79,6 +81,7 @@ def load_levels() -> dict[str, Level]:
             name=name,
             permissions=permissions,
             repositories=spec.get("repositories"),
+            agent_only=spec.get("agent_only", False),
             app_id=os.environ.get(f"{prefix}_APP_ID", "").strip(),
             installation_id=os.environ.get(f"{prefix}_INSTALLATION_ID", "").strip(),
             private_key=base64.b64decode(os.environ.get(f"{prefix}_PRIVATE_KEY_BASE64", "").strip() or b""),
@@ -149,8 +152,8 @@ def _mint(level: Level) -> tuple[str, float]:
     return result["token"], expires
 
 
-def _granted_levels(litellm_key: str) -> list[str]:
-    """The key's github_levels, from /key/info authenticated as the key itself."""
+def _key_metadata(litellm_key: str) -> dict:
+    """The key's metadata, from /key/info authenticated as the key itself."""
     request = urllib.request.Request(f"{LITELLM_URL}/key/info", headers={"Authorization": f"Bearer {litellm_key}"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -163,24 +166,24 @@ def _granted_levels(litellm_key: str) -> list[str]:
         raise TokenError(502, f"could not reach LiteLLM: {e}")
     if info.get("status", "active") != "active":
         raise TokenError(401, f"key is {info.get('status')}")
-    return list((info.get("metadata") or {}).get("github_levels") or [])
+    return info.get("metadata") or {}
 
 
 _lock = threading.Lock()
 _tokens: dict[str, tuple[str, float]] = {}
-_grants: dict[str, tuple[list[str], float]] = {}
+_keys: dict[str, tuple[dict, float]] = {}
 
 
-def _cached_grants(litellm_key: str) -> list[str]:
+def _cached_metadata(litellm_key: str) -> dict:
     digest = hashlib.sha256(litellm_key.encode()).hexdigest()
     with _lock:
-        cached = _grants.get(digest)
+        cached = _keys.get(digest)
         if cached and cached[1] > time.time():
             return cached[0]
-    levels = _granted_levels(litellm_key)
+    metadata = _key_metadata(litellm_key)
     with _lock:
-        _grants[digest] = (levels, time.time() + GRANT_CACHE_SECONDS)
-    return levels
+        _keys[digest] = (metadata, time.time() + GRANT_CACHE_SECONDS)
+    return metadata
 
 
 def token_for(level_name: str, litellm_key: str) -> str:
@@ -189,8 +192,12 @@ def token_for(level_name: str, litellm_key: str) -> str:
         raise TokenError(404, f"unknown level {level_name!r}; levels: {', '.join(sorted(LEVELS)) or 'none'}")
     if not litellm_key:
         raise TokenError(401, "missing Authorization: Bearer <LiteLLM key>")
-    if level_name not in _cached_grants(litellm_key):
+    metadata = _cached_metadata(litellm_key)
+    if level_name not in (metadata.get("github_levels") or []):
         raise TokenError(403, f"this agent has not been granted {level_name}")
+    # Allow-list: only an agent's own key qualifies, so a workspace key or any future role is refused.
+    if level.agent_only and not (metadata.get("hermes_agent") and "hermes_role" not in metadata):
+        raise TokenError(403, "level is for agents only")
     if not level.configured:
         raise TokenError(503, f"{level_name} has no GitHub App credentials (see secrets/github-app.env)")
     with _lock:

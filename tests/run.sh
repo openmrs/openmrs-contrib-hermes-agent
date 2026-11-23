@@ -237,7 +237,7 @@ openssl rsa -in "$TEST_WORK/github-app.pem" -pubout -out "$TEST_WORK/github-app.
 # All levels share the test App. The test-only github_test_write checks that write permissions
 # and repository limits reach GitHub and that grants are enforced per level.
 github_key_base64="$(base64 < "$TEST_WORK/github-app.pem" | tr -d '\n')"
-for prefix in GITHUB_READ GITHUB_PR GITHUB_TEST_WRITE; do
+for prefix in GITHUB_READ GITHUB_PR GITHUB_REVIEW GITHUB_TEST_WRITE; do
   echo "${prefix}_APP_ID=12345"
   echo "${prefix}_INSTALLATION_ID=67890"
   echo "${prefix}_PRIVATE_KEY_BASE64=$github_key_base64"
@@ -281,7 +281,7 @@ compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-to
 
 echo "== 2. Admin tool"
 expect "agent servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read", "onyx_search"]' "$(admin agent servers --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
-expect "agent levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin agent levels --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
+expect "agent levels lists the GitHub access levels" '["github_pr", "github_read", "github_review", "github_test_write"]' "$(admin agent levels --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
 expect_ok "agent add default (atlassian_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
   agent add default --mcp atlassian_read --github github_read --from-stdin
@@ -795,7 +795,7 @@ ws() {
   compose exec -T -u "${HERMES_UID:-10000}" agent-default \
     ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-default "$1"
 }
-expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_test_write: configured" \
+expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_review: configured github_test_write: configured" \
   "$(compose exec -T github-token python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/healthz").read().decode())' 2>&1 |
     tr '\n' ' ' | sed 's/ *$//')"
 expect "workspace gh is the pinned version" "2.103.3" \
@@ -829,6 +829,13 @@ token_request() {
     fi'
 
 }
+# github_review is for agent keys only: granted to writer, its agent key gets a token and its
+# workspace key doesn't.
+expect_ok "agent edit writer github_test_write, github_review" admin agent edit writer --github github_test_write,github_review
+expect "a workspace key is refused an agent-only level (403)" "403" "$(token_request "$(workspace_key writer)" github_review)"
+expect "an agent key gets an agent-only level" "200" "$(token_request "$writer_key" github_review)"
+expect "github_review token: pull_requests write, metadata read, the three repositories" "1" \
+  "$(log_count_fixed fake-github 'permissions={"metadata":"read","pull_requests":"write"} repositories=["openmrs-esm-patient-chart","openmrs-esm-patient-management","openmrs-core"]')"
 expect "a granted write level gets a token" "200" "$(token_request "$writer_key" github_test_write)"
 expect "write token: write permissions, limited to the level's repositories" "1" \
   "$(log_count_fixed fake-github 'permissions={"contents":"write","metadata":"read","pull_requests":"write"} repositories=["openmrs-test-repo"]')"
@@ -838,7 +845,7 @@ expect "no key is refused (401)" "401" "$(token_request "" github_read)"
 expect "an unknown key is refused (401)" "401" "$(token_request "sk-not-a-key" github_read)"
 expect "a revoked key is refused even though it had the grant (401)" "401" "$(token_request "$new_nobody_key" github_read)"
 expect "an unknown level is refused (404)" "404" "$(token_request "$reader_key" github_admin)"
-expect "github-token asked GitHub for exactly two tokens" "2" "$(log_count fake-github "^mint ")"
+expect "github-token asked GitHub for exactly three tokens" "3" "$(log_count fake-github "^mint ")"
 # A line of the PEM and a stretch of its base64 form, from the middle where they're unique to
 # this key.
 github_key_markers="$(sed -n 5p "$TEST_WORK/github-app.pem")
