@@ -25,7 +25,7 @@ ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306
 COPY fetch_gh.py /fetch_gh.py
 RUN python3 /fetch_gh.py
 
-FROM python:3.12.15-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
+FROM python:3.12.15-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS workspace
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git ca-certificates curl openssh-server \
   && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*
@@ -57,3 +57,31 @@ COPY supervisor.py /app/supervisor.py
 ENV PYTHONUNBUFFERED=1
 # Root, to run sshd and kill and clean up after the workspace user.
 ENTRYPOINT ["python", "/app/supervisor.py"]
+
+# The reviewer's workspace: the above plus Chromium and agent-browser, to check a PR's UI. Chromium
+# comes from a fixed Debian snapshot, so the exact version stays installable on amd64 and arm64;
+# chromium-common is pinned too, as the base image's trixie-security source may have a newer one.
+# To update: a snapshot timestamp whose trixie has the new version, and the version.
+#
+# agent-browser's settings are in a wrapper because Docker's ENV doesn't reach SSH sessions (see
+# supervisor.py). Chromium runs without its own sandbox, which needs privileges the container drops;
+# the container is the sandbox. No version check: it calls Google and suggests `agent-browser
+# install`, which would download another browser.
+FROM workspace AS reviewer
+ARG CHROMIUM_SNAPSHOT=20261121T225354Z
+ARG CHROMIUM_VERSION=156.0.8078.79-1~deb13u1
+ARG AGENT_BROWSER_VERSION=0.43.0
+RUN echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$CHROMIUM_SNAPSHOT/ trixie main" \
+    > /etc/apt/sources.list.d/chromium-snapshot.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends "chromium=$CHROMIUM_VERSION" "chromium-common=$CHROMIUM_VERSION" \
+  && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/chromium-snapshot.list
+RUN npm install -g --cache /tmp/npm-cache "agent-browser@$AGENT_BROWSER_VERSION" \
+  && rm -rf /tmp/npm-cache \
+  && ln -s "$(readlink -f /usr/local/bin/agent-browser)" /usr/local/lib/agent-browser \
+  && rm /usr/local/bin/agent-browser \
+  && printf '%s\n' '#!/bin/sh' \
+    'export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium AGENT_BROWSER_ARGS=--no-sandbox AGENT_BROWSER_NO_VERSION_CHECK=1' \
+    'exec /usr/local/lib/agent-browser "$@"' > /usr/local/bin/agent-browser \
+  && chmod 755 /usr/local/bin/agent-browser \
+  && agent-browser --version

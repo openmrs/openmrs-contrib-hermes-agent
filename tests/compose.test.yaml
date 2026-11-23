@@ -74,7 +74,7 @@ services:
 
   # Like workspace-default; 2 GB because the production 8 GB doesn't fit next to the test stack.
   workspace-reviewer:
-    image: hermes-workspace:test-${TEST_SLOT}
+    image: hermes-workspace-reviewer:test-${TEST_SLOT}
     mem_limit: 2g
     environment:
       WORKSPACE_IDLE_MINUTES: "0.25"

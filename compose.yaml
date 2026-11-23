@@ -96,7 +96,7 @@ x-hermes-agent: &hermes-agent
 # Each agent's workspace, where all its commands run (see workspace/supervisor.py). Its only secret
 # is a LiteLLM key that can get GitHub tokens for the agent's granted levels.
 x-workspace: &workspace
-  build: ./workspace
+  build: {context: ./workspace, target: workspace}
   image: hermes-workspace:local
   restart: unless-stopped
   logging: *logging
@@ -481,6 +481,8 @@ services:
   # builds and a browser.
   workspace-reviewer:
     <<: *workspace
+    build: {context: ./workspace, target: reviewer}
+    image: hermes-workspace-reviewer:local
     environment:
       <<: *workspace-environment
       # A fallback; the reviewer also resets its workspace before each review.

@@ -40,13 +40,15 @@
 #      tokens carry each level's permissions and repository limits, are reused, and need a valid,
 #      unrevoked key; the App key never reaches the agent or workspace; commits are authored as
 #      the bot.
-#  10. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
-#      run as an unprivileged user on a read-only root filesystem, with each JDK; a branch and a pull
-#      request clone from a local git server; the workspace can't read its configuration or reach
-#      LiteLLM or Postgres, and holds no agent secrets; going idle kills its processes and deletes
-#      its files except the caches, or with WORKSPACE_KEEP_FILES keeps /work, also across restarts.
-#      Then purging the agents removes all of their data.
+#  10. Workspaces: the default one has no browser; only the agent's key logs in, and the agent
+#      refuses a different host key; commands run as an unprivileged user on a read-only root
+#      filesystem, with each JDK; a branch and a pull request clone from a local git server; the
+#      workspace can't read its configuration or reach LiteLLM or Postgres, and holds no agent
+#      secrets; going idle kills its processes and deletes its files except the caches, or with
+#      WORKSPACE_KEEP_FILES keeps /work, also across restarts. Then purging the agents removes all
+#      of their data.
 #  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
+#      its workspace opens a page with agent-browser over SSH;
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
 #      commit the webhook prompt bound the session to, only after the workspace is prepared, and
 #      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible, and
@@ -895,6 +897,8 @@ expect "workspace environment and files hold no GitHub App key (markers, files)"
     rm /tmp/markers /tmp/workspace-env' || echo error)"
 
 echo "== 10. Workspaces"
+expect "workspace-default has no browser or agent-browser" "" \
+  "$(ws 'command -v agent-browser; command -v chromium; true' 2>&1)"
 expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \
   "$(ws 'id -u; touch /etc/x 2>/dev/null || echo read-only' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 expect "workspace has each JDK, 21 by default, and Maven and Node" "21.0 1.8 11.0 17.0 21.0 ok" \
@@ -996,6 +1000,20 @@ if compose up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null &&
 else
   fail "reviewer services start"
 fi
+# Over SSH, as the agent runs commands: Docker's ENV doesn't reach login sessions.
+expect "reviewer's workspace opens a page with agent-browser" "Workspace browser check" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+    ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer '
+    mkdir -p ~/site && echo "<title>Workspace browser check</title>" > ~/site/index.html
+    python3 -m http.server 8765 --bind 127.0.0.1 -d ~/site >/dev/null 2>&1 &
+    server=$!
+    for _ in $(seq 1 20); do
+      python3 -c "import socket; socket.create_connection((\"127.0.0.1\", 8765), timeout=1)" 2>/dev/null && break
+      sleep 0.5
+    done
+    agent-browser open http://127.0.0.1:8765/ >/dev/null 2>&1 && agent-browser get title 2>/dev/null
+    agent-browser close >/dev/null 2>&1
+    kill $server; rm -rf ~/site' 2>/dev/null)"
 # The gateway gets this far only with the read-only skills and plugin mounts in place.
 context=""
 for _ in $(seq 1 60); do
