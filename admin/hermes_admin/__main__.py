@@ -274,7 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    f"{', '.join(BOARD_MCP_SERVERS)}, on its own budget.")
     p.add_argument("name", nargs="?", help=pick_agent)
     board_mcp = p.add_mutually_exclusive_group()
-    board_mcp.add_argument("--mcp", help=f"comma-separated read-only MCP servers ({', '.join(BOARD_MCP_SERVERS)})")
+    board_mcp.add_argument("--mcp", help=f"comma-separated read-only MCP servers ({', '.join(BOARD_MCP_SERVERS)}; "
+                                         "default: unchanged, or none for a new page, also after --revoke)")
     board_mcp.add_argument("--no-mcp", action="store_true", help="remove all MCP access")
     p.add_argument("--budget", type=float,
                    help=f"monthly spend limit in USD (default: unchanged, or {DEFAULT_BOARD_BUDGET:g} for a new page)")

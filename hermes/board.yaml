@@ -50,7 +50,9 @@ auxiliary:
 
 # The chat's tools: the Kanban tools (reading and changing the boards, as the page's users can anyway),
 # clarifying questions, and the MCP servers below. Everything else is off; disabled_toolsets wins over
-# any other selection, and the chat refuses tools it wasn't given, also through tool_call.
+# any other selection, and the chat refuses tools it wasn't given, also through tool_call. These keep
+# the chat on task, but aren't a boundary: users can run shell commands here anyway (the chat's `!`),
+# so the page's key and networks are what limit them (see README.md, "Board pages").
 platform_toolsets:
   cli: [kanban, clarify]
 agent:

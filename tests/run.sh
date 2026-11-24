@@ -1102,6 +1102,22 @@ expect "board page reaches LiteLLM, but not Postgres, the workspace, github-toke
     python3 -c "import socket, sys; h, p = sys.argv[1].split(\":\"); socket.create_connection((h, int(p)), timeout=3)" \
       $target 2>/dev/null && echo reachable || echo unreachable; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 expect "the board page key gets no GitHub token" "401" "$(token_request "$board_key_default" github_read)"
+# Logged-in users can run commands in the page's container (the chat's `!`), so code there, with the
+# page's own key, must get no more than the key allows.
+expect "code in the board page container, with its key, gets fast and no other model" "200 403 403 403" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" board-default python3 -c '
+import json, urllib.error, urllib.request
+key = next(l.split("=", 1)[1].strip() for l in open("/opt/data/.env") if l.startswith("LITELLM_API_KEY="))
+statuses = []
+for model in ("fast", "auto", "balanced", "strong"):
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}]}).encode()
+    request = urllib.request.Request("http://litellm:4000/v1/chat/completions", data=body,
+                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        statuses.append(urllib.request.urlopen(request, timeout=30).status)
+    except urllib.error.HTTPError as e:
+        statuses.append(e.code)
+print(*statuses)' 2>&1)"
 compose --profile boards stop board-default fake-oidc fake-openai >/dev/null
 
 echo "== 11. Workspaces"

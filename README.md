@@ -115,10 +115,14 @@ drag and drop, comments, each run's history) and lets users create, change, and 
 agent's own gateway runs the tasks assigned to it (`default`), each as a worker: a separate Hermes
 run whose tools run in its workspace like any other.
 
+- **Logged-in users can run commands in the page's container.** Hermes has no roles, so they get the
+  whole dashboard, not just the Kanban tab, and its chat runs any line starting with `!` as a shell
+  command there; its Cron page, file API, and profiles are other ways in. So the page is contained
+  rather than locked down, like a workspace: everything below holds even for code running in it.
 - **Your OIDC provider decides who logs in.** The page binds to a non-loopback address, so Hermes'
   auth gate is always on, with OIDC (`BOARD_OIDC_ISSUER`, a public PKCE client) as its only provider.
-  Hermes has no roles: everyone the provider vouches for gets the whole dashboard, so restrict the
-  client to the same people as `SLACK_ALLOWED_USERS` in the provider (see [Setup](#board-page-setup)).
+  Restrict the client to the same people as `SLACK_ALLOWED_USERS` in the provider (see
+  [Setup](#board-page-setup)): they can direct the agent and run commands in the page's container.
   A user who loses access keeps their session until it expires or the provider revokes it.
 - **Its users direct the agent.** Workers read a task's title, body, and comments as instructions,
   as Slack requests are; `SOUL.md` tells the agent so.
@@ -131,9 +135,9 @@ run whose tools run in its workspace like any other.
   (`hermes/souls/board.md`) are read-only, so the dashboard's settings pages can't save.
 - **It never runs tasks.** Its gateway has no dispatcher, and `kanban.dispatch_profiles: []` also
   stops the dashboard's dispatch button from starting a worker in the page's container.
-- **Its chat is limited** to the Kanban tools, clarifying questions, and the granted read-only MCP
-  servers: no terminal, files, code, web, delegation, schedules, memory, or skills. A model that asks
-  for another tool is refused, including through `tool_call` (tested).
+- **Its chat's tools are defaults, not a boundary.** The chat's model gets the Kanban tools, clarifying
+  questions, and the granted read-only MCP servers, and is refused any other tool, also through
+  `tool_call`. That keeps it on task and cheap; the key and the networks are what limit a user.
 - **Networks.** `boards` (internal: board pages and `litellm`) and `boards-egress` (the host port and
   the OIDC provider). Pages can't reach agents, workspaces, `github-token`, `mcp-atlassian`, or Postgres.
   `boards-egress` has a fixed subnet (`BOARDS_SUBNET`, `BOARDS_GATEWAY`) so pages trust only its
@@ -143,10 +147,11 @@ run whose tools run in its workspace like any other.
   refused (they block the task instead, saying what they'd change). At most two tasks run at once
   (`kanban.max_in_progress`), each capped like any run. Triage cards wait for an administrator
   (`auto_decompose: false`), as do requests for review (`review_dispatch: false`).
-- **Accepted risks.** Logged-in users get the whole dashboard of the page's container, so beyond the
-  boards they can chat (spending the page's budget), schedule chat runs on its Cron page, see its chat
-  sessions and logs, and use its admin pages, whose changes to config, keys, and identity fail on the
-  read-only files. Anything they could run there finds only the page's own key and the boards.
+- **Accepted risks.** Code a logged-in user runs in the page's container can use its key up to its
+  budget, read and change the agent's boards (as the page can anyway), and reach the internet and the
+  other board pages' login screens. It can't change the page's `config.yaml`, `SOUL.md`, or `.env`, but
+  can add Hermes profiles and cron jobs to its home. Board tasks also accept per-task settings, such
+  as a model override, that Slack requests don't; workers still use the agent's key and budget.
 
 ### Data retention
 

@@ -103,13 +103,14 @@ x-hermes-agent: &hermes-agent
     # nothing else of the agent's.
     HERMES_KANBAN_HOME: /opt/data/kanban-shared
     # Kanban tasks' scratch directories. A task's commands run in its directory over SSH, so it must be
-    # a path the workspace can create too (see SOUL.md); the default is under the board, in /opt/data.
+    # a path the workspace can create too (see SOUL.md), unlike the default, inside the agent's home.
     HERMES_KANBAN_WORKSPACES_ROOT: /work/kanban
 
-# Each agent's board page: Hermes' web dashboard, for its Kanban tab and a chat limited to `fast` and
-# read-only tools (hermes/board.yaml). Its OIDC provider (e.g. Keycloak) decides who may log in; Hermes
-# lets in anyone it vouches for. It shares only the agent's boards (<agent home>/kanban-shared) and
-# holds only its own LiteLLM key, from `bin/admin agent board <name>`. Its gateway serves no messaging
+# Each agent's board page: Hermes' web dashboard, for its Kanban tab and a chat (hermes/board.yaml). Its
+# OIDC provider (e.g. Keycloak) decides who may log in; Hermes lets in anyone it vouches for, who can
+# then also run commands in this container (the chat's `!`). So it is contained, not locked down: it
+# shares only the agent's boards (<agent home>/kanban-shared) and holds only its own LiteLLM key (`fast`
+# and read-only MCP servers), from `bin/admin agent board <name>`. Its gateway serves no messaging
 # platform and runs no Kanban dispatcher: only the agent runs tasks. Started only with the `boards`
 # profile (see README.md).
 x-hermes-board: &hermes-board
