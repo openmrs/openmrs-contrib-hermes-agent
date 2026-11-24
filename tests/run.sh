@@ -6,8 +6,8 @@
 #
 # Usage: tests/run.sh
 #
-# Uses fake credentials, mock models, and fake Jev, Atlassian, Anthropic, and GitHub endpoints, so
-# nothing reaches a real provider. Runs as its own Compose project ("hermes-test-N", where N is the
+# Uses fake credentials, mock models, and fake Jev, Atlassian, Anthropic, GitHub, and OIDC endpoints,
+# so nothing reaches a real provider. Runs as its own Compose project ("hermes-test-N", where N is the
 # run's slot) with its own images, and removes its containers and volumes on exit, so a running
 # stack is untouched. Up to ten runs can go at once, e.g. from different worktrees: each claims a
 # free slot (see tests/slot_lock.py) for its project, bridge names, port, and image tags. Needs
@@ -17,12 +17,14 @@
 # What it checks:
 #   1. compose.yaml separates secrets, volumes, and networks; every service has no-new-privileges
 #      and only the capabilities it needs (static).
-#   2. Admin tool: agent add/edit/rotate/slack/delete; key lockdown (no management API, no provider
-#      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
-#      rotation; per-key MCP access with the right credential and only that server's tools;
-#      mcp-atlassian serves exactly the allowed tools and refuses requests without a key; root-only
-#      workspace configuration; the interactive interface.
-#   3. Every Hermes side task, including background review and curator, uses LiteLLM's `fast`.
+#   2. Admin tool: agent add/edit/board/rotate/slack/delete; key lockdown (no management API, no
+#      provider passthroughs, agent models only; workspace keys only /key/info; board page keys only
+#      `fast`, chat, and read-only MCP servers); monthly budgets that survive rotation; per-key MCP
+#      access with the right credential and only that server's tools; mcp-atlassian serves exactly
+#      the allowed tools and refuses requests without a key; root-only workspace configuration; the
+#      interactive interface.
+#   3. Every Hermes side task, including background review and curator, uses LiteLLM's `fast`, for
+#      agents and board pages.
 #   4. `auto` classifier chain: Jev decides; if Jev fails, the LLM classifier does.
 #   5. Hermes end to end: `auto` context length is 768000; chat goes through the router; titles
 #      come from `fast`; the read-only SOUL.md reaches the model; MCP reaches only granted servers;
@@ -39,7 +41,11 @@
 #      tokens carry each level's permissions and repository limits, are reused, and need a valid,
 #      unrevoked key; the App key never reaches the agent or workspace; commits are authored as
 #      the bot.
-#  10. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
+#  10. Board page: only users the OIDC provider logs in reach the dashboard and its API; it shares the
+#      agent's boards, and the agent, not the page, runs their tasks; its chat has only Kanban and
+#      read-only tools and only `fast`; it holds no agent secrets, can't reach the agent's services,
+#      and its cookies are Secure behind an HTTPS proxy.
+#  11. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
 #      run as an unprivileged user on a read-only root filesystem, with each JDK; a branch and a pull
 #      request clone from a local git server; the workspace can't read its configuration or reach
 #      LiteLLM or Postgres, and holds no agent secrets; going idle kills its processes and deletes
@@ -51,6 +57,7 @@
 #   TEST_SLOT          Slot to use, 0-9 (default: the first free one); fails if another run has it
 #   TEST_LITELLM_PORT  Host port the test LiteLLM publishes (default 14000 plus the slot; not used by
 #                      the tests)
+#   TEST_BOARD_PORT    Host port the test board page publishes (default 19119 plus the slot)
 
 set -euo pipefail
 
@@ -63,6 +70,9 @@ if ! read -r TEST_SLOT <&3; then
 fi
 export TEST_SLOT
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-$((14000 + TEST_SLOT))}"
+export TEST_BOARD_PORT="${TEST_BOARD_PORT:-$((19119 + TEST_SLOT))}"
+# boards-egress gets its own subnet per slot, apart from the stack's (compose.yaml's default).
+export BOARDS_SUBNET="172.31.24${TEST_SLOT}.0/24" BOARDS_GATEWAY="172.31.24${TEST_SLOT}.1"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
@@ -81,7 +91,7 @@ compose() {
 }
 
 cleanup() {
-  compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile admin --profile boards down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$TEST_WORK"
 }
 trap cleanup EXIT
@@ -146,6 +156,10 @@ admin_sh() {
 
 agent_key() {
   admin_sh "sed -n 's/^LITELLM_API_KEY=//p' /agents/$1/.env"
+}
+
+board_key() {
+  admin_sh "sed -n 's/^LITELLM_API_KEY=//p' /boards/$1/.env 2>/dev/null"
 }
 
 # Requests LiteLLM; prints the status and leaves the body in $TEST_WORK/body.
@@ -229,7 +243,7 @@ agent_field() {
 }
 
 echo "== Setup"
-compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
+compose --profile admin --profile boards down -v --remove-orphans >/dev/null 2>&1 || true
 python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml"
 # Throwaway GitHub App key pair: github-token signs, fake-github verifies.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
@@ -259,6 +273,22 @@ git -C "$TEST_WORK/git/test-repo" update-ref refs/pull/7/head "$(git_test rev-pa
 git -C "$TEST_WORK/git/test-repo" config uploadpack.allowFilter true
 mkdir -p "$TEST_WORK/check-home"
 cp "$root/hermes/config.yaml" "$TEST_WORK/check-home/config.yaml"
+mkdir -p "$TEST_WORK/board-check-home"
+cp "$root/hermes/board.yaml" "$TEST_WORK/board-check-home/config.yaml"
+# A throwaway certificate authority and certificate for tests/fake_oidc.py: the board page only accepts
+# an https issuer. Python 3.14 needs the key-usage extensions.
+mkdir -p "$TEST_WORK/tls"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TEST_WORK/tls/ca.key" -out "$TEST_WORK/tls/ca.crt" -days 1 \
+  -subj /CN=hermes-test-ca -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+  -addext subjectKeyIdentifier=hash 2>/dev/null
+openssl req -newkey rsa:2048 -nodes -keyout "$TEST_WORK/tls/fake-oidc.key" -out "$TEST_WORK/tls/fake-oidc.csr" \
+  -subj /CN=fake-oidc 2>/dev/null
+printf '%s\n' subjectAltName=DNS:fake-oidc basicConstraints=critical,CA:FALSE \
+  keyUsage=critical,digitalSignature,keyEncipherment extendedKeyUsage=serverAuth subjectKeyIdentifier=hash \
+  authorityKeyIdentifier=keyid > "$TEST_WORK/tls/ext"
+openssl x509 -req -in "$TEST_WORK/tls/fake-oidc.csr" -CA "$TEST_WORK/tls/ca.crt" -CAkey "$TEST_WORK/tls/ca.key" \
+  -CAcreateserial -out "$TEST_WORK/tls/fake-oidc.crt" -days 1 -extfile "$TEST_WORK/tls/ext" 2>/dev/null
+chmod 644 "$TEST_WORK"/tls/*
 
 echo "== 1. compose.yaml isolation (static)"
 # Resolved against placeholder secrets (see tests/compose_isolation.py), so real secrets/*.env
@@ -465,6 +495,8 @@ old_nobody_workspace_key="$(workspace_key nobody)"
 old_nobody_ssh_key="$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 256)"
 # Agents created before admin wrote the workspace host to .env get it from rotate.
 admin_sh 'grep -v ^TERMINAL_SSH_HOST= /agents/nobody/.env > /agents/nobody/.env.new && cat /agents/nobody/.env.new > /agents/nobody/.env && rm /agents/nobody/.env.new'
+expect_ok "agent board nobody" admin agent board nobody
+old_nobody_board_key="$(board_key nobody)"
 expect_refused "agent rotate needs confirmation without --yes" admin agent rotate nobody </dev/null
 expect "agent rotate without confirmation keeps the key" "$nobody_key" "$(agent_key nobody)"
 expect_ok "agent rotate nobody" admin agent rotate nobody --yes
@@ -480,6 +512,10 @@ expect "agent rotate revokes the old key" "401" "$(request GET /v1/models "$nobo
 expect "rotate's new key works" "200" "$(request GET /v1/models "$new_nobody_key")"
 expect "agent rotate leaves one key" "1" "$(agent_field nobody keys)"
 expect "agent rotate keeps GitHub grants" "github_read" "$(agent_field nobody github_levels)"
+expect "agent rotate replaces the board page key in its .env, revoking the old one" "401 1 new" \
+  "$(request GET /v1/models "$old_nobody_board_key") $(agent_field nobody board_keys) $(
+    [ -n "$(board_key nobody)" ] && [ "$(board_key nobody)" != "$old_nobody_board_key" ] && echo new || echo same)"
+new_nobody_board_key="$(board_key nobody)"
 
 # The budget is on the agent's LiteLLM user, so rotating keys can't reset spend. LiteLLM answers
 # 422 once spend reaches it.
@@ -507,11 +543,61 @@ expect "agent slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_
   "$(admin_sh 'grep -E "^SLACK_(ALLOWED_USERS|BOT_TOKEN)=" /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
 expect "agent slack keeps the agent's key" "$reader_key" "$(agent_key default)"
 
+# Board pages: their chat's key may only use `fast`, chat, and read-only MCP servers, on its own budget.
+expect_refused "agent board refuses a write MCP server" admin agent board default --mcp atlassian_jira_write
+expect_refused "agent board refuses an unknown agent" admin agent board typo
+expect_refused "agent board refuses --revoke with other changes" admin agent board default --revoke --budget 5 --yes
+expect "a refused agent board changes nothing" "0" "$(agent_field default board_keys)"
+expect_ok "agent board default (atlassian_read)" admin agent board default --mcp atlassian_read
+board_key_default="$(board_key default)"
+expect "board page .env: mode 600, owned by the Hermes user, holding only its key" "600 10000 LITELLM_API_KEY" \
+  "$(admin_sh 'stat -c "%a %u" /boards/default/.env; cut -d= -f1 /boards/default/.env' | tr '\n' ' ' | sed 's/ $//')"
+expect "board page home and the agent's board directory are the Hermes user's" "755 10000 755 10000" \
+  "$(admin_sh 'stat -c "%a %u" /boards/default /agents/default/kanban-shared' | tr '\n' ' ' | sed 's/ $//')"
+expect "board page key: one, not the agent's, granted atlassian_read" "1 different atlassian_read True" \
+  "$(agent_field default board_keys) $([ -n "$board_key_default" ] && [ "$board_key_default" != "$reader_key" ] && echo different || echo same) $(agent_field default board_mcp_servers) $(agent_field default has_board_page)"
+expect "board page budget: the default, on its own LiteLLM user, apart from the agent's" "50.0 1mo 1000.0" \
+  "$(request GET /user/info?user_id=hermes-board-default "$master_key" >/dev/null
+     python3 -c 'import json, sys; u = json.load(open(sys.argv[1]))["user_info"]; print(u["max_budget"], u["budget_duration"])' \
+     "$TEST_WORK/body") $(agent_field default budget)"
+expect "board page key lists only fast" "fast" \
+  "$(request GET /v1/models "$board_key_default" >/dev/null; python3 -c 'import json, sys; print(" ".join(sorted(m["id"] for m in json.load(open(sys.argv[1]))["data"])))' "$TEST_WORK/body")"
+expect "board page key can use fast" "200" \
+  "$(request POST /v1/chat/completions "$board_key_default" '{"model": "fast", "messages": [{"role": "user", "content": "hi"}]}')"
+for model in auto balanced strong; do
+  status="$(request POST /v1/chat/completions "$board_key_default" "{\"model\": \"$model\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}")"
+  if [ "$status" = 200 ]; then fail "board page key can't use $model (got HTTP 200)"; else pass "board page key can't use $model (HTTP $status)"; fi
+done
+for route in "GET /key/info" "POST /key/generate" "POST /key/update" "GET /v1/mcp/server" "POST /anthropic/v1/messages" \
+  "POST /v1/messages" "POST /v1/responses" "POST /v1/embeddings"; do
+  # shellcheck disable=SC2086 # split "METHOD PATH"
+  expect_route_denied "board page key" "$board_key_default" $route
+done
+expect "board page key -> atlassian_read uses the read account" "read" "$(atlassian_call "$board_key_default" "$atlassian_read_id")"
+expect "board page key -> atlassian_jira_write denied" "denied" "$(atlassian_call "$board_key_default" "$atlassian_jira_write_id")"
+expect "board page key -> atlassian_read can't call a write tool" "error" \
+  "$(atlassian_call "$board_key_default" "$atlassian_read_id" jira_add_comment | cut -d' ' -f1)"
+expect_ok "agent board changes the page's servers and budget" admin agent board default --mcp atlassian_read,onyx_search --budget 20
+expect "agent board changes take effect without a new key" "$board_key_default 20.0 atlassian_read,onyx_search" \
+  "$(board_key default) $(agent_field default board_budget) $(agent_field default board_mcp_servers)"
+expect "agent board leaves the agent's grants and budget unchanged" "atlassian_read 1000.0" \
+  "$(agent_field default mcp_servers) $(agent_field default budget)"
+expect_ok "agent board writer (no MCP servers)" admin agent board writer
+writer_board_key="$(board_key writer)"
+expect "a board page with no MCP servers is denied atlassian_read" "denied" "$(atlassian_call "$writer_board_key" "$atlassian_read_id")"
+expect_refused "agent board --revoke needs confirmation without --yes" admin agent board writer --revoke </dev/null
+expect_ok "agent board writer --revoke" admin agent board writer --revoke --yes
+expect "agent board --revoke revokes the key and removes it from the page's .env, keeping the budget" "401 0 False  50.0" \
+  "$(request GET /v1/models "$writer_board_key") $(agent_field writer board_keys) $(agent_field writer has_board_page) $(
+    board_key writer) $(agent_field writer board_budget)"
+
 expect_refused "agent delete needs confirmation without --yes" admin agent delete nobody </dev/null
 expect_refused "agent delete refuses an answer other than y" admin_stdin 'n\n' agent delete nobody
 # Without a TTY (bin/admin passes -T when output is redirected), the answer still comes from stdin.
 expect_ok "agent delete nobody (keep data), confirmed on stdin" admin_stdin 'y\n' agent delete nobody
 expect "agent delete revokes the key" "401" "$(request GET /v1/models "$new_nobody_key")"
+expect "agent delete revokes the board page key and removes it from the page's .env" "401 0 " \
+  "$(request GET /v1/models "$new_nobody_board_key") $(agent_field nobody board_keys) $(board_key nobody)"
 expect "agent delete keeps the agent's data" "False True" "$(agent_field nobody provisioned) $(agent_field nobody has_data)"
 expect "agent delete keeps the agent's budget" "1000.0" "$(agent_field nobody budget)"
 expect "agent delete removes secrets from .env" "" "$(admin_sh 'grep -E "^(LITELLM_API_KEY|SLACK_)" /agents/nobody/.env || true')"
@@ -522,6 +608,8 @@ expect_ok "agent add re-creates a deleted agent, reusing its data" admin agent a
 expect_ok "agent delete nobody --purge" admin agent delete nobody --purge --yes
 expect "purge removes the agent's data" "absent" "$(admin_sh 'test -e /agents/nobody && echo present || echo absent')"
 expect "purge removes the agent's LiteLLM user" "404" "$(request GET /user/info?user_id=hermes-agent-nobody "$master_key")"
+expect "purge removes the board page's home and LiteLLM user" "absent 404" \
+  "$(admin_sh 'test -e /boards/nobody && echo present || echo absent') $(request GET /user/info?user_id=hermes-board-nobody "$master_key")"
 expect "unmanaged key untouched" "200" "$(request GET /v1/models "$unmanaged_key")"
 
 # `admin agent compose` must match compose.yaml's agent-default block, and its block for a new agent
@@ -572,6 +660,14 @@ if compose run --rm --no-deps -T -e HERMES_HOME=/check-home -e LITELLM_API_KEY=s
   pass "all side tasks route to litellm/fast"
 else
   fail "side task routing (see output above)"
+fi
+if compose run --rm --no-deps -T -e HERMES_HOME=/check-home -e LITELLM_API_KEY=sk-placeholder \
+  -v "$TEST_WORK/board-check-home:/check-home" -v "$root/tests/hermes_side_tasks.py:/check.py:ro" \
+  --entrypoint sh agent-default -c \
+  '/opt/hermes/.venv/bin/python /check.py; status=$?; find /check-home -mindepth 1 -delete; exit $status'; then
+  pass "all side tasks route to litellm/fast with hermes/board.yaml"
+else
+  fail "side task routing with hermes/board.yaml (see output above)"
 fi
 
 echo "== 4. Classifier chain"
@@ -854,7 +950,161 @@ expect "workspace environment and files hold no GitHub App key (markers, files)"
     echo "$(grep -c . /tmp/markers) $(grep -rlF -f /tmp/markers /tmp/workspace-env /config /run /work | wc -l | tr -d " ")"
     rm /tmp/markers /tmp/workspace-env' || echo error)"
 
-echo "== 10. Workspaces"
+echo "== 10. Board page"
+# agent-default is running (section 9); default's board page key is from section 2.
+compose --profile boards up -d --wait --wait-timeout 180 fake-oidc fake-openai board-default >/dev/null
+# From fake-oidc, on boards-egress like a user's proxy: is the dashboard serving yet?
+board_ready=no
+for _ in $(seq 1 60); do
+  if compose exec -T fake-oidc /opt/hermes/.venv/bin/python -c \
+    'import urllib.request; urllib.request.urlopen("http://board-default:9119/api/status", timeout=5)' >/dev/null 2>&1; then
+    board_ready=yes
+    break
+  fi
+  sleep 3
+done
+expect "board page starts, with the OIDC provider as its only way in" "yes" "$board_ready"
+task_title="board page task $$"
+compose exec -T fake-oidc /opt/hermes/.venv/bin/python /tests/board_page_checks.py http://board-default:9119 "$task_title" \
+  > "$TEST_WORK/board-page" 2>&1 || true
+board_check() { sed -n "s|^$1: ||p" "$TEST_WORK/board-page"; }
+for path in /api/plugins/kanban/board /api/env /api/config /api/sessions /api/cron/jobs; do
+  expect "board page refuses $path without a login" "401" "$(board_check "anonymous $path")"
+done
+expect "board page refuses to create a task without a login" "401" "$(board_check "anonymous create")"
+expect "board page sends a visitor without a login to log in" "302" "$(board_check "anonymous page")"
+expect "a user the provider denies gets no session" "none 401" "$(board_check "denied session") $(board_check "denied board")"
+expect "a user the provider logs in reaches the board" "302 / | 200 board-user@example.org | 200" \
+  "$(board_check login) | $(board_check me) | $(board_check board)"
+board_task="$(board_check task)"
+expect "a logged-in user creates and comments on a task" "200  200" "$(board_check create) $(board_check comment)"
+expect "the page's dispatch button starts nothing: the page claims no tasks" "200 spawned=0 skipped=True" \
+  "$(board_check dispatch)"
+expect "logging out ends the session" "401" "$(board_check "after logout")"
+case "$board_task" in
+  t_*) ;;
+  *) sed 's/^/    /' "$TEST_WORK/board-page" >&2 ;;
+esac
+
+# Prints the profiles that ran a task, as `hermes kanban runs --json` in service $1 reports them.
+task_run_profiles() {
+  compose exec -T "$1" hermes kanban runs "$2" --json 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+runs = data.get("runs", []) if isinstance(data, dict) else data
+print(" ".join(sorted({run.get("profile") or "?" for run in runs})))' 2>/dev/null || true
+}
+# Prints fields of a task, as `hermes kanban show --json` in agent-default reports them.
+task_fields() {
+  compose exec -T agent-default hermes kanban show "$1" --json 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+task = data.get("task", data)
+print(*(task.get(field) for field in sys.argv[1:]))' "${@:2}" 2>&1
+}
+# The agent shares the board, and it, not the page, runs the task.
+expect "the agent sees the page's task, assigned to it" "$task_title default" "$(task_fields "$board_task" title assignee)"
+compose exec -T agent-default hermes kanban dispatch >/dev/null 2>&1 || true
+board_runs=""
+for _ in $(seq 1 40); do
+  board_runs="$(task_run_profiles agent-default "$board_task")"
+  [ -n "$board_runs" ] && break
+  sleep 3
+done
+expect "the agent's dispatcher ran the page's task as the agent" "default" "$board_runs"
+expect "the task's scratch directory is under /work/kanban, which the workspace can create too" \
+  "/work/kanban/$board_task 1777 700 20000" \
+  "$(task_fields "$board_task" workspace_path) $(compose exec -T agent-default stat -c %a /work/kanban) $(
+    ws 'stat -c "%a %u" /work/kanban' 2>&1)"
+expect "the page sees the agent's run" "default" "$(task_run_profiles board-default "$board_task")"
+
+# Behind an HTTPS proxy on the host, connections come from the boards-egress gateway, which the page
+# trusts to report the scheme; a client inside the network isn't trusted. Prints whether the login's
+# PKCE cookie was marked Secure.
+pkce_cookie_script='
+import sys, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
+request = urllib.request.Request(sys.argv[1] + "/auth/login?provider=self-hosted",
+                                 headers={"Host": "board-default:9119", "X-Forwarded-Proto": "https"})
+try:
+    response = opener.open(request, timeout=30)
+except urllib.error.HTTPError as e:
+    response = e
+# Secure cookies get the __Host- prefix.
+cookie = [c for c in response.headers.get_all("Set-Cookie") or [] if c.split("=")[0].endswith("hermes_session_pkce")]
+print("secure" if cookie and "secure" in cookie[0].lower() else f"not secure ({response.status})")'
+expect "board page cookies are Secure behind an HTTPS proxy on the host" "secure" \
+  "$(python3 -c "$pkce_cookie_script" "http://127.0.0.1:$TEST_BOARD_PORT" 2>&1)"
+expect "board page ignores X-Forwarded-Proto from other clients" "not secure (302)" \
+  "$(compose exec -T fake-oidc /opt/hermes/.venv/bin/python -c "$pkce_cookie_script" http://board-default:9119 2>&1)"
+
+# The chat: `fast` through LiteLLM with the page's own key, read-only MCP servers, Kanban tools only.
+board_chat="$(compose exec -T board-default hermes chat -q "hello" 2>&1 || true)"
+expect "board page chat answers with fast" "yes" \
+  "$(case "$board_chat" in *fast-model-answered*) echo yes ;; *) echo "no: $(printf '%s' "$board_chat" | tail -n 3)" ;; esac)"
+mcp="$(compose exec -T board-default hermes mcp test atlassian_read 2>&1 || true)"
+if printf '%s' "$mcp" | grep -q "jira_get_issue"; then
+  pass "board page chat reaches atlassian_read"
+else
+  fail "board page chat reaches atlassian_read (output: $(printf '%s' "$mcp" | tail -n 6))"
+fi
+mcp="$(compose exec -T board-default hermes mcp test atlassian_jira_write 2>&1 || true)"
+if printf '%s' "$mcp" | grep -q "jira_add_comment"; then
+  fail "board page has no Jira write server (output: $(printf '%s' "$mcp" | tail -n 6))"
+else
+  pass "board page has no Jira write server"
+fi
+compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes board-default /opt/hermes/.venv/bin/python - \
+  < "$root/tests/board_chat_checks.py" > "$TEST_WORK/board-chat" 2>&1 || true
+chat_check() { sed -n "s/^$1: //p" "$TEST_WORK/board-chat"; }
+expect "board page chat has only the Kanban, clarify, and granted MCP toolsets" "atlassian_read clarify kanban onyx_search" \
+  "$(chat_check toolsets)"
+expect "board page chat has no command, file, web, delegation, or memory tools" "none" "$(chat_check forbidden)"
+expect "board page chat has the Kanban tools" "True" "$(chat_check kanban)"
+case "$(chat_check terminal)" in
+  "tool-result: Tool 'terminal' does not exist"*) pass "board page chat refuses terminal" ;;
+  *) fail "board page chat refuses terminal (got: $(chat_check terminal); $(tail -n 3 "$TEST_WORK/board-chat"))" ;;
+esac
+case "$(chat_check "tool_call terminal")" in
+  *"'terminal' is not available"*) pass "board page chat refuses terminal through tool_call" ;;
+  *) fail "board page chat refuses terminal through tool_call (got: $(chat_check "tool_call terminal"))" ;;
+esac
+case "$(chat_check kanban_list)" in
+  *"$board_task"*) pass "board page chat lists the agent's tasks" ;;
+  *) fail "board page chat lists the agent's tasks (got: $(chat_check kanban_list | cut -c1-200))" ;;
+esac
+
+# What the page holds and reaches.
+expect "board page config.yaml and SOUL.md are the repository's" \
+  "$(cat "$root/hermes/board.yaml" "$root/hermes/souls/board.md" | shasum -a 256 | cut -d' ' -f1)" \
+  "$(compose exec -T board-default cat /opt/data/config.yaml /opt/data/SOUL.md | shasum -a 256 | cut -d' ' -f1)"
+expect_refused "board page can't write its config.yaml" compose exec -T board-default sh -c 'echo changed >> /opt/data/config.yaml'
+expect_refused "board page can't write its SOUL.md" compose exec -T board-default sh -c 'echo changed >> /opt/data/SOUL.md'
+expect_refused "board page can't write its .env" compose exec -T board-default sh -c 'echo X=1 >> /opt/data/.env'
+expect "board page claims no tasks and runs no dispatcher" "[] false" \
+  "$(compose exec -T board-default sh -c 'echo $(hermes config get kanban.dispatch_profiles) $(hermes config get kanban.dispatch_in_gateway)' 2>&1)"
+board_markers="$(printf '%s\n' "$reader_key" "$default_workspace_key" xoxb-test xapp-test "$secrets")"
+expect "board page environment and files hold no agent, workspace, LiteLLM, master, or Postgres secrets (checked, leaked)" \
+  "$(printf '%s\n' "$board_markers" | wc -l | tr -d ' ') 0" \
+  "$(printf '%s\n' "$board_markers" | compose exec -T board-default sh -c '
+    env > /tmp/board-env; checked=0; leaked=0
+    while read -r s; do
+      checked=$((checked + 1))
+      if grep -rqF -- "$s" /tmp/board-env /opt/data /opt/kanban; then leaked=$((leaked + 1)); fi
+    done
+    rm /tmp/board-env; echo "$checked $leaked"' || true)"
+expect "board page reaches LiteLLM, but not Postgres, the workspace, github-token, or mcp-atlassian" \
+  "reachable unreachable unreachable unreachable unreachable" \
+  "$(compose exec -T board-default sh -c 'for target in litellm:4000 postgres:5432 workspace-default:2222 github-token:8080 mcp-atlassian:9000; do
+    python3 -c "import socket, sys; h, p = sys.argv[1].split(\":\"); socket.create_connection((h, int(p)), timeout=3)" \
+      $target 2>/dev/null && echo reachable || echo unreachable; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
+expect "the board page key gets no GitHub token" "401" "$(token_request "$board_key_default" github_read)"
+compose --profile boards stop board-default fake-oidc fake-openai >/dev/null
+
+echo "== 11. Workspaces"
 expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \
   "$(ws 'id -u; touch /etc/x 2>/dev/null || echo read-only' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 expect "workspace has each JDK, 21 by default, and Maven and Node" "21.0 1.8 11.0 17.0 21.0 ok" \

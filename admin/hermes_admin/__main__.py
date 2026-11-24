@@ -15,15 +15,17 @@ import json
 import sys
 from typing import Any, Callable
 
-from .agents import DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, Settings, validate_name
+from .agents import (BOARD_MCP_SERVERS, DEFAULT_BOARD_BUDGET, DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent,
+                     AgentError, Agents, Settings, validate_name)
 from .litellm import LiteLLMError
-from .messages import (DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE, ROTATE_HINT,
-                       ROTATE_WARNING, SLACK_HINT, START_HINT)
+from .messages import (BOARD_EDIT_HINT, BOARD_HINT, BOARD_REVOKED, DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED,
+                       PURGED, ROTATE_DONE, ROTATE_HINT, ROTATE_WARNING, SLACK_HINT, START_HINT)
 from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, OnyxSettings,
                    SourceType, format_errors, source_settings)
 
-# The agent-<name> and workspace-<name> services for compose.yaml. tests/run.sh checks that
-# compose.yaml has this output for `default` and that the output passes the compose isolation checks.
+# The agent-<name>, workspace-<name>, and board-<name> services for compose.yaml. tests/run.sh checks
+# that compose.yaml has this output for `default` and that the output passes the compose isolation
+# checks. {var} is the name for host settings (BOARD_<VAR>_URL), {port} the board page's default port.
 COMPOSE_SERVICE = """\
   agent-{name}:
     <<: *hermes-agent
@@ -64,6 +66,36 @@ COMPOSE_SERVICE = """\
       - workspace-cache:/cache
       # Emptied whenever the workspace resets.
       - /work
+
+  board-{name}:
+    <<: *hermes-board
+    environment:
+      <<: *board-environment
+      # The page's address as users reach it, e.g. https://board.example.org; its /auth/callback must be
+      # a redirect URI of the OIDC client.
+      HERMES_DASHBOARD_PUBLIC_URL: ${{BOARD_{var}_URL:-http://127.0.0.1:{port}}}
+    # Host-only; put a TLS reverse proxy in front.
+    ports:
+      - "127.0.0.1:${{BOARD_{var}_PORT:-{port}}}:9119"
+    volumes:
+      - type: volume
+        source: board-homes
+        target: /opt/data
+        volume:
+          subpath: {name}
+      - type: volume
+        source: board-homes
+        target: /opt/data/.env
+        read_only: true
+        volume:
+          subpath: {name}/.env
+      - type: volume
+        source: agents-data
+        target: /opt/kanban
+        volume:
+          subpath: {name}/kanban-shared
+      - ./hermes/souls/board.md:/opt/data/SOUL.md:ro
+      - ./hermes/board.yaml:/opt/data/config.yaml:ro
 """
 
 COMPOSE_STEPS = """\
@@ -71,7 +103,9 @@ Next steps:
   1. Add the blocks above under `services:` in compose.yaml.
   2. Write the agent's identity in hermes/souls/{name}.md.
   3. docker compose run --rm admin agent add {name} ...  (if not done yet)
-  4. docker compose up -d agent-{name}"""
+  4. docker compose up -d agent-{name}
+  5. For its board page: docker compose run --rm admin agent board {name}, set BOARD_{var}_URL (and
+     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose --profile boards up -d board-{name}"""
 
 CANCELLED = "Cancelled (use --yes to skip confirmation)."
 
@@ -94,6 +128,11 @@ def _agent_json(agent: Agent) -> dict:
         "has_data": agent.has_data,
         "has_workspace": agent.has_workspace,
         "env_set": agent.env_set,
+        "board_keys": len(agent.board_key_hashes),
+        "board_mcp_servers": agent.board_mcp_servers,
+        "board_budget": agent.board_budget,
+        "board_spend": agent.board_spend,
+        "has_board_page": agent.has_board_page,
     }
 
 
@@ -104,6 +143,12 @@ def _describe(agent: Agent) -> str:
     workspace = agent.workspace_status
     if workspace not in ("ready", "none"):
         workspace += ": run `agent rotate`"
+    board = agent.board_status
+    if board == "ready":
+        board += (f"; MCP servers: {', '.join(agent.board_mcp_servers) or 'none'}; "
+                  f"budget: {agent.describe_board_budget()}")
+    elif board != "none":
+        board += ": run `agent board`" if board == "no page" else ": run `agent rotate`"
     return "\n".join([
         f"{agent.name}",
         f"  Status:      {status}",
@@ -112,6 +157,7 @@ def _describe(agent: Agent) -> str:
         f"  Budget:      {agent.describe_budget()}",
         f"  Workspace:   {workspace}",
         f"  Slack:       {agent.slack_status}",
+        f"  Board page:  {board}",
         f"  Data:        {'present' if agent.has_data else 'none'}",
     ])
 
@@ -223,8 +269,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help=pick_agent)
     p.add_argument("--purge", action="store_true", help="also delete the agent's data (sessions, memories, skills)")
     p.add_argument("--yes", action="store_true", help=no_confirm)
+    p = sub.add_parser("board", help="set up or change an agent's board page (its key, MCP servers, budget)",
+                       description="The board page's chat may only use `fast` and the read-only MCP servers "
+                                   f"{', '.join(BOARD_MCP_SERVERS)}, on its own budget.")
+    p.add_argument("name", nargs="?", help=pick_agent)
+    board_mcp = p.add_mutually_exclusive_group()
+    board_mcp.add_argument("--mcp", help=f"comma-separated read-only MCP servers ({', '.join(BOARD_MCP_SERVERS)})")
+    board_mcp.add_argument("--no-mcp", action="store_true", help="remove all MCP access")
+    p.add_argument("--budget", type=float,
+                   help=f"monthly spend limit in USD (default: unchanged, or {DEFAULT_BOARD_BUDGET:g} for a new page)")
+    p.add_argument("--revoke", action="store_true", help="revoke the page's key, keeping the boards and chats")
+    p.add_argument("--yes", action="store_true", help=no_confirm + " (with --revoke)")
     p = sub.add_parser("compose", help="print the agent's service blocks for compose.yaml")
     p.add_argument("name")
+    p.add_argument("--board-port", type=int, default=9119,
+                   help="the board page's default host port (default: 9119; each page needs its own)")
     p = sub.add_parser("servers", help="list MCP servers agents can be granted")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("levels", help="list GitHub access levels agents can be granted")
@@ -304,8 +363,12 @@ def run_agent(args: argparse.Namespace, agents: Agents) -> int:
         print(START_HINT.format(name=agent.name))
         return 0
     if command == "compose":
-        print(COMPOSE_SERVICE.format(name=validate_name(args.name)), end="")
-        print(COMPOSE_STEPS.format(name=args.name), file=sys.stderr)
+        name = validate_name(args.name)
+        if not 1 <= args.board_port <= 65535:
+            raise AgentError(f"invalid port {args.board_port}")
+        fields = {"name": name, "var": name.upper().replace("-", "_"), "port": args.board_port}
+        print(COMPOSE_SERVICE.format(**fields), end="")
+        print(COMPOSE_STEPS.format(**fields), file=sys.stderr)
         return 0
 
     if command == "edit":
@@ -313,6 +376,10 @@ def run_agent(args: argparse.Namespace, agents: Agents) -> int:
         github = [] if args.no_github else None if args.github is None else _split(args.github)
         if mcp is None and github is None and args.budget is None:
             raise AgentError("nothing to change: give --mcp/--no-mcp, --github/--no-github, and/or --budget")
+    if command == "board":
+        mcp = [] if args.no_mcp else None if args.mcp is None else _split(args.mcp)
+        if args.revoke and (mcp is not None or args.budget is not None):
+            raise AgentError("--revoke can't be combined with --mcp, --no-mcp, or --budget")
     name = _name(args, "agent", lambda: [a.name for a in agents.list()])
     if name is None:
         return 1
@@ -324,6 +391,19 @@ def run_agent(args: argparse.Namespace, agents: Agents) -> int:
         _print_warnings(agents)
         print(_describe(agent))
         print(EDIT_HINT)
+    elif command == "board":
+        if args.revoke:
+            if not args.yes and not _confirm(f"Revoke {name}'s board page key? Its chat stops working. [y/N]"):
+                print(CANCELLED)
+                return 1
+            agents.revoke_board(name)
+            print(BOARD_REVOKED.format(name=name))
+            return 0
+        had_page = bool(agents.get(name).board_key_hashes)
+        agent = agents.board(name, mcp, args.budget)
+        _print_warnings(agents)
+        print(_describe(agent))
+        print((BOARD_EDIT_HINT if had_page else BOARD_HINT).format(name=name))
     elif command == "slack":
         values = _read_stdin(SLACK_VARS) if args.from_stdin else _prompt_slack(True)
         if not values:

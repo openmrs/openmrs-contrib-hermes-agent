@@ -188,7 +188,8 @@ def remove_user_files() -> None:
 def reset() -> None:
     kill_user_processes()
     remove_user_files()
-    for path in (HOME, WORK / "tmp"):
+    # /work/kanban holds Kanban tasks' directories, which the agent creates as it starts each task.
+    for path in (HOME, WORK / "tmp", WORK / "kanban"):
         if not path.is_dir():
             path.mkdir(mode=0o700)
             os.chown(path, UID, GID)

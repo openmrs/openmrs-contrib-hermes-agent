@@ -5,7 +5,9 @@ local [LiteLLM](https://github.com/BerriAI/litellm) gateway. LiteLLM holds every
 providers and MCP integrations such as Jira and Confluence); each agent holds only a LiteLLM virtual key
 and its own Slack tokens. Everything an agent runs (its terminal, file tools, and code execution)
 runs in its own workspace container, which holds none of those. A `github-token` service hands out
-short-lived GitHub App tokens, and an on-demand admin container manages agents.
+short-lived GitHub App tokens, and an on-demand admin container manages agents. Optionally, each agent
+has a *board page*: Hermes' web dashboard behind your OIDC provider (e.g. Keycloak), where
+administrators give the agent work as Kanban tasks and follow its progress (see [Board pages](#board-pages)).
 
 ```
                     agents network (internet egress)
@@ -36,6 +38,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
     LiteLLM sends the granted server's Atlassian key with each request.
   - An agent's LiteLLM key and Slack tokens → its `.env` in its own `agents-data` subdirectory,
     which only it (and `admin`) mounts.
+  - A board page's LiteLLM key → its `.env` in its own `board-homes` subdirectory. It holds no
+    agent secret.
 - **Agents run nothing themselves.** Hermes' `ssh` terminal backend sends the terminal, file tools,
   and `execute_code` to the agent's workspace, so building a pull request (running its author's
   code) can't read the agent's tokens. See [Workspaces](#workspaces).
@@ -103,6 +107,47 @@ and `gh`.
   later work in that workspace. Hermes copies skills to the workspace and back, so code there could
   plant a skill that appears in later prompts.
 
+### Board pages
+
+Each agent `<name>` can have a `board-<name>` service (only started with the `boards` Compose
+profile): Hermes' web dashboard, whose Kanban tab shows the agent's boards (columns per status,
+drag and drop, comments, each run's history) and lets users create, change, and unblock tasks. The
+agent's own gateway runs the tasks assigned to it (`default`), each as a worker: a separate Hermes
+run whose tools run in its workspace like any other.
+
+- **Your OIDC provider decides who logs in.** The page binds to a non-loopback address, so Hermes'
+  auth gate is always on, with OIDC (`BOARD_OIDC_ISSUER`, a public PKCE client) as its only provider.
+  Hermes has no roles: everyone the provider vouches for gets the whole dashboard, so restrict the
+  client to the same people as `SLACK_ALLOWED_USERS` in the provider (see [Setup](#board-page-setup)).
+  A user who loses access keeps their session until it expires or the provider revokes it.
+- **Its users direct the agent.** Workers read a task's title, body, and comments as instructions,
+  as Slack requests are; `SOUL.md` tells the agent so.
+- **It holds only its own key**, which may use only `fast`, chat routes, and the read-only MCP servers
+  `atlassian_read` and `onyx_search` (`BOARD_MCP_SERVERS` in `admin/hermes_admin/agents.py`), with its
+  own monthly budget ($50 default) on the LiteLLM user `hermes-board-<name>`. It can't get GitHub
+  tokens (no `/key/info`).
+- **It shares only the agent's boards**, `<agent home>/kanban-shared` (`HERMES_KANBAN_HOME`), not the
+  agent's `.env`, SSH key, sessions, or memories. Its `config.yaml` (`hermes/board.yaml`) and `SOUL.md`
+  (`hermes/souls/board.md`) are read-only, so the dashboard's settings pages can't save.
+- **It never runs tasks.** Its gateway has no dispatcher, and `kanban.dispatch_profiles: []` also
+  stops the dashboard's dispatch button from starting a worker in the page's container.
+- **Its chat is limited** to the Kanban tools, clarifying questions, and the granted read-only MCP
+  servers: no terminal, files, code, web, delegation, schedules, memory, or skills. A model that asks
+  for another tool is refused, including through `tool_call` (tested).
+- **Networks.** `boards` (internal: board pages and `litellm`) and `boards-egress` (the host port and
+  the OIDC provider). Pages can't reach agents, workspaces, `github-token`, `mcp-atlassian`, or Postgres.
+  `boards-egress` has a fixed subnet (`BOARDS_SUBNET`, `BOARDS_GATEWAY`) so pages trust only its
+  gateway, where the host port's connections come from, to report HTTPS (`X-Forwarded-Proto`): behind
+  an HTTPS proxy on the host, cookies are `Secure`.
+- **Worker limits.** Workers can't answer Slack approvals, so their Jira and Confluence writes are
+  refused (they block the task instead, saying what they'd change). At most two tasks run at once
+  (`kanban.max_in_progress`), each capped like any run. Triage cards wait for an administrator
+  (`auto_decompose: false`), as do requests for review (`review_dispatch: false`).
+- **Accepted risks.** Logged-in users get the whole dashboard of the page's container, so beyond the
+  boards they can chat (spending the page's budget), schedule chat runs on its Cron page, see its chat
+  sessions and logs, and use its admin pages, whose changes to config, keys, and identity fail on the
+  read-only files. Anything they could run there finds only the page's own key and the boards.
+
 ### Data retention
 
 - **LiteLLM** keeps per-request metadata (key, model, tokens, cost) for 120 days
@@ -111,6 +156,8 @@ and `gh`.
 - **Hermes** deletes a session (every message and tool call) 30 days after its last activity, but
   only once the session has ended (`sessions` in `hermes/config.yaml`). Slack sessions don't end
   when idle or when the agent restarts, so most are kept indefinitely.
+- **Kanban** keeps tasks, comments, runs, and their events until a task is deleted (archiving keeps
+  them), in `<agent home>/kanban-shared`. A board page's own chat sessions are deleted like agents'.
 - **Container logs** are capped at 30 MB per container.
 
 ## Prerequisites
@@ -204,6 +251,32 @@ whichever is available.
 
 LiteLLM's admin UI is at http://127.0.0.1:4000/ui (host-only); log in with the master key.
 
+### Board page setup
+
+Optional, per agent. Uses any OIDC provider; Keycloak is shown.
+
+1. **OIDC client.** Create a client, e.g. `hermes-board`: OpenID Connect, standard flow (authorization
+   code) only, client authentication off (public; Hermes uses PKCE S256), and as valid redirect URI
+   the page's address plus `/auth/callback`, e.g. `https://board.example.org/auth/callback`. Turn off
+   direct access grants.
+2. **Who may log in.** By default every user in the realm can log in to every client, so restrict
+   this one, e.g. with a client role (`hermes-board`) granted to a group of the same people as
+   `SLACK_ALLOWED_USERS`: copy the browser flow, add a conditional sub-flow with "Condition - user
+   role" (that role, negated) followed by "Deny access", and set the copy as the client's browser flow
+   override. Check that a user without the role is refused. To remove someone, take the role away and
+   sign out their sessions.
+3. **Host settings** in `./.env`: `BOARD_OIDC_ISSUER` (the realm, e.g.
+   `https://keycloak.example.org/realms/openmrs`), `BOARD_OIDC_CLIENT_ID` if not `hermes-board`, and
+   per agent `BOARD_<NAME>_URL` (e.g. `BOARD_DEFAULT_URL=https://board.example.org`) and, if 9119 is
+   taken, `BOARD_<NAME>_PORT`. `<NAME>` is the agent's name in capitals, dashes as underscores.
+4. **The page's key:** `bin/admin agent board default --mcp atlassian_read,onyx_search` (or no `--mcp`).
+5. **Start it:** `docker compose --profile boards up -d board-default`, then point an HTTPS reverse
+   proxy on the host at `http://127.0.0.1:9119`, passing the original `Host` and setting
+   `X-Forwarded-Proto: https`.
+
+In the dashboard, open the Kanban tab. Assign tasks to `default` (the agent). A task's commands run in
+the agent's workspace, so leave its workspace as scratch or use a directory under `/work` there.
+
 ### Atlassian keys
 
 Keys are scoped when created and can't be changed, so create each with all of its scopes. An
@@ -244,6 +317,11 @@ Read from the environment or a `.env` file next to `compose.yaml` (git-ignored).
 | `LITELLM_HOST_PORT` | `4000` | Host port for LiteLLM's admin UI, on 127.0.0.1 |
 | `ONYX_UI_HOST_PORT` | `3000` | Host port for Onyx's web UI, on 127.0.0.1 |
 | `HERMES_UID`, `HERMES_GID` | `10000` | User and group agents run as and own their files |
+| `BOARD_OIDC_ISSUER` | (none) | Board pages' OIDC issuer, e.g. a Keycloak realm. Pages refuse to start without it |
+| `BOARD_OIDC_CLIENT_ID` | `hermes-board` | Board pages' OIDC client (public, PKCE) |
+| `BOARD_<NAME>_URL` | `http://127.0.0.1:9119` | Agent `<name>`'s board page address, as users reach it |
+| `BOARD_<NAME>_PORT` | `9119` | Host port for agent `<name>`'s board page, on 127.0.0.1 |
+| `BOARDS_SUBNET`, `BOARDS_GATEWAY` | `172.31.250.0/24`, `.1` | The `boards-egress` network; change both if the subnet is taken |
 | `GIT_BOT_NAME`, `GIT_BOT_EMAIL` | (none) | Author of agents' commits (the `github_pr` App's bot). Commits fail until both are set |
 
 ## Managing agents
@@ -263,10 +341,12 @@ bin/admin agent add <name> --mcp a,b [--github x,y] [--budget USD] [--slack]
 bin/admin agent edit [<name>] --mcp a,b         # or --no-mcp; immediate
 bin/admin agent edit [<name>] --github x,y      # or --no-github; within a minute
 bin/admin agent edit [<name>] --budget USD      # immediate
+bin/admin agent board [<name>] [--mcp a,b | --no-mcp] [--budget USD]  # board page key; changes immediate
+bin/admin agent board [<name>] --revoke [--yes] # revoke the board page's key, keeping boards and chats
 bin/admin agent slack [<name>]                  # prompts; blank keeps current values
 bin/admin agent rotate [<name>] [--yes]         # new agent, workspace, and SSH keys; old keys revoked
 bin/admin agent delete [<name>] [--purge] [--yes]
-bin/admin agent compose <name>                  # agent-<name> and workspace-<name> blocks for compose.yaml
+bin/admin agent compose <name> [--board-port N] # agent-, workspace-, and board-<name> blocks for compose.yaml
 
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
@@ -297,16 +377,20 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   `SLACK_*=...` lines on stdin (`agent add <name> --from-stdin`, `agent slack <name> --from-stdin`); Onyx
   source settings likewise (`onyx add ... --from-stdin`, `onyx edit <name> --from-stdin`).
 - **Restarts:** Slack changes need `docker compose restart agent-<name>`; `agent rotate`
-  needs `docker compose restart workspace-<name> agent-<name>`. Admin has no Docker socket to do it.
-- **`agent delete`** revokes the keys and removes the agent's secrets (`.env` values, SSH key, workspace
-  config) but keeps its sessions, memories, skills, and spend, so `agent add` can bring it back.
-  `--purge` also deletes its data and LiteLLM user.
+  needs `docker compose restart workspace-<name> agent-<name>`, plus `board-<name>` if the agent has a
+  board page; a new board page needs `docker compose --profile boards up -d board-<name>`. Admin has
+  no Docker socket to do it.
+- **`agent delete`** revokes the keys (including its board page's) and removes the agent's secrets
+  (`.env` values, SSH key, workspace config) but keeps its sessions, memories, skills, boards, and
+  spend, so `agent add` can bring it back. `--purge` also deletes its data, its board page's home, and
+  both LiteLLM users.
 
-To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`,
-write `hermes/souls/<name>.md`, run `bin/admin agent add <name> ...`, set up its Slack app (Setup
-step 6), then `docker compose up -d agent-<name>`.
+To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`
+(give each board page its own `--board-port`), write `hermes/souls/<name>.md`, run
+`bin/admin agent add <name> ...`, set up its Slack app (Setup step 6), then
+`docker compose up -d agent-<name>`. For its board page, see [Board page setup](#board-page-setup).
 
-To remove one: delete its blocks from `compose.yaml`, run `docker compose up -d --remove-orphans`,
+To remove one: delete its blocks from `compose.yaml`, run `docker compose --profile boards up -d --remove-orphans`,
 then `bin/admin agent delete <name> --purge` (or without `--purge` to keep its data), and delete its
 `SOUL.md` and Slack app.
 
@@ -325,9 +409,10 @@ Images are pinned by tag and digest, in `compose.yaml` and the Dockerfiles. Chan
 digest of the tag's multi-platform index (`docker buildx imagetools inspect <image>:<tag>`), run
 `tests/run.sh`, then `docker compose build && docker compose up -d`.
 
-- **Hermes:** `HERMES_IMAGE` and `image:` under `x-hermes-agent`. Follow the checklist in
-  `hermes/config.yaml`: new side tasks must be routed to `fast`, and `_config_version` must match
-  the image, because agents can't write their `config.yaml`.
+- **Hermes:** `HERMES_IMAGE` and `image:` under `x-hermes-image`. Follow the checklist in
+  `hermes/config.yaml`, for it and `hermes/board.yaml`: new side tasks must be routed to `fast`, and
+  `_config_version` must match the image, because agents and board pages can't write their
+  `config.yaml`.
 - **LiteLLM:** the `litellm` image. `litellm/tier_classifier.py` depends on its internals (tested).
 - **mcp-atlassian:** the `mcp-atlassian` image.
 - **Onyx:** `x-onyx-backend` and `onyx-web` together. Check that the web UI still logs in: it
@@ -376,6 +461,6 @@ tests/run.sh                          # uses "docker compose"
 COMPOSE=docker-compose tests/run.sh   # e.g. with Podman
 ```
 
-It uses fake credentials and fake model, Jev, Atlassian, Anthropic, and GitHub endpoints, runs as a
+It uses fake credentials and fake model, Jev, Atlassian, Anthropic, GitHub, and OIDC endpoints, runs as a
 separate Compose project that cleans up after itself, and takes about 5 minutes. CI runs it on every
 pull request and push to `main` that changes more than `README.md`.

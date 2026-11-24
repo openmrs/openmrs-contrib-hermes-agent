@@ -1,0 +1,104 @@
+# Configuration of every agent's board page (board-<name> in compose.yaml): Hermes' web dashboard, for
+# the agent's Kanban boards and a chat about them. Shared by every board page and mounted read-only, so
+# neither the page's users nor its chat can change it; the dashboard's settings pages fail to save.
+# Changes apply on restart.
+
+# Keep at the compose.yaml image's version, as in hermes/config.yaml.
+_config_version: 51
+
+# The chat's model. The page's LiteLLM key can only use `fast`, whatever is configured here.
+model:
+  provider: litellm
+  default: fast
+  # Hermes can't look up `fast`'s window (see hermes/config.yaml).
+  context_length: 768000
+  # Must match providers.litellm.base_url, or Hermes ignores context_length.
+  base_url: http://litellm:4000/v1
+
+providers:
+  litellm:
+    base_url: http://litellm:4000/v1
+    key_env: LITELLM_API_KEY
+    session_affinity_header: x-litellm-session-id
+
+# Side tasks use `fast` too; the key refuses anything else. Keep this list in step with
+# hermes/config.yaml's (tests/run.sh checks both).
+auxiliary:
+  vision: &fast
+    provider: litellm
+    model: fast
+  approval: *fast
+  background_review: *fast
+  call: *fast
+  compression: *fast
+  curator: *fast
+  goal_judge: *fast
+  kanban_decomposer: *fast
+  kanban_estimator: *fast
+  mcp: *fast
+  memory_query_rewrite: *fast
+  moa_aggregator: *fast
+  moa_reference: *fast
+  monitor: *fast
+  profile_describer: *fast
+  review: *fast
+  skills_hub: *fast
+  title_generation: *fast
+  triage_specifier: *fast
+  tts_audio_tags: *fast
+  voice_chat: *fast
+
+# The chat's tools: the Kanban tools (reading and changing the boards, as the page's users can anyway),
+# clarifying questions, and the MCP servers below. Everything else is off; disabled_toolsets wins over
+# any other selection, and the chat refuses tools it wasn't given, also through tool_call.
+platform_toolsets:
+  cli: [kanban, clarify]
+agent:
+  max_turns: 20
+  budget_warning_ratio: 0.8
+  disabled_toolsets: [terminal, file, code_execution, browser, web, search, x_search, delegation, cronjob,
+                      computer_use, image_gen, video_gen, video, tts, vision, skills, memory, todo,
+                      session_search, connections, project, bot_room, debugging, discord, discord_admin,
+                      yuanbao, feishu_doc, feishu_drive, desktop_ui, onboarding, catalog]
+
+# No memory between chats: the page is shared by every user it lets in.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+sessions:
+  auto_prune: true
+  retention_days: 30
+
+# Read-only servers only. The page's key is granted at most these (`bin/admin agent board --mcp`); an
+# ungranted one fails to connect. `trust: untrusted` makes any tool not annotated read-only ask first.
+mcp_servers:
+  atlassian_read:
+    url: http://litellm:4000/mcp/atlassian_read
+    strict_redirect_headers: true
+    trust: untrusted
+    headers:
+      x-litellm-api-key: "Bearer ${LITELLM_API_KEY}"
+  onyx_search:
+    url: http://litellm:4000/mcp/onyx_search
+    strict_redirect_headers: true
+    trust: untrusted
+    headers:
+      x-litellm-api-key: "Bearer ${LITELLM_API_KEY}"
+
+# The page never runs tasks: its gateway has no dispatcher, and dispatch_profiles (empty: claim
+# nothing) also stops the dashboard's "Nudge dispatcher" button from starting workers here. The agent
+# runs them. No notifications either: the page has no messaging platform.
+kanban:
+  dispatch_in_gateway: false
+  dispatch_profiles: []
+  notify_in_gateway: false
+  auto_decompose: false
+
+dashboard:
+  # The OIDC provider is set in compose.yaml (HERMES_DASHBOARD_OIDC_*); it decides who may log in.
+  oauth:
+    provider: self-hosted
+  # The boards-egress gateway, which every connection through the host port comes from, may report the
+  # original scheme (X-Forwarded-Proto), so cookies are Secure behind an HTTPS proxy.
+  trusted_proxies: ["${BOARD_TRUSTED_PROXY}"]

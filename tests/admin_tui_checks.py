@@ -14,8 +14,8 @@ from unittest import mock
 from hermes_admin.__main__ import build_parser, run_onyx
 from hermes_admin.agents import Agents, Settings
 from hermes_admin.onyx import Onyx, OnyxError, OnyxSettings
-from hermes_admin.tui import (AdminApp, ConfirmDialog, EditAgentDialog, ErrorsScreen, IndexDialog, OnyxScreen,
-                              SourceDialog)
+from hermes_admin.tui import (AdminApp, BoardDialog, ConfirmDialog, EditAgentDialog, ErrorsScreen, IndexDialog,
+                              OnyxScreen, SourceDialog)
 from textual.widgets import DataTable, Input, SelectionList, Static
 
 NAME = "tui-check"
@@ -474,6 +474,26 @@ async def main():
               (granted.mcp_servers, granted.github_levels, granted.budget))
 
         select_row(app, NAME)
+        await pilot.press("b")
+        await pilot.pause()
+        check("b opens the board page dialog", isinstance(app.screen, BoardDialog), app.screen)
+        offered = [option.value for option in app.screen.query_one("#mcp", SelectionList).options]
+        check("board page dialog offers only read-only servers", offered == ["atlassian_read", "onyx_search"], offered)
+        app.screen.query_one("#mcp", SelectionList).select("atlassian_read")
+        app.screen.query_one("#budget", Input).value = "15"
+        app.screen.query_one("#confirm").scroll_visible(animate=False)
+        await pilot.pause()
+        await pilot.click("#confirm")
+        await settle(app, pilot)
+        board = agents.get(NAME)
+        check("board page dialog sets up the page's key, servers, and budget",
+              (board.board_status, board.board_mcp_servers, board.board_budget) == ("ready", ["atlassian_read"], 15),
+              (board.board_status, board.board_mcp_servers, board.board_budget))
+        table = app.query_one("#agents", DataTable)
+        row = table.get_row_at(table.get_row_index(NAME))
+        check("table shows the board page", row[AdminApp.COLUMNS.index("Board page")] == "ready", row)
+
+        select_row(app, NAME)
         await pilot.press("d")
         await pilot.pause()
         await pilot.click("#purge")
@@ -487,6 +507,7 @@ async def main():
         await pilot.click("#confirm")
         await settle(app, pilot)
         check("purge removes the agent", NAME not in {a.name for a in agents.list()})
+        check("purge removes the board page's LiteLLM user", agents.api.user_info(f"hermes-board-{NAME}") is None)
 
     await onyx_checks(agents)
     onyx_cleanup_checks(agents)

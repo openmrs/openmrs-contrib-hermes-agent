@@ -13,10 +13,16 @@ workspace can't spend the agent's budget or use its MCP grants.
 The monthly budget is on the agent's LiteLLM user (`hermes-agent-<name>`), not a key, so spend
 survives `agent rotate`.
 
+Each agent may have a board page (board-<name>), whose chat has its own key (`hermes_role: board`):
+only `fast`, chat routes, and the read-only MCP servers in BOARD_MCP_SERVERS, with its own budget on
+the LiteLLM user `hermes-board-<name>`, so the page's users can't spend the agent's.
+
 `<agents_dir>/<name>` is the agent's Hermes home (/opt/data), mounted only by that agent. Its `.env`
 holds the LiteLLM key, Slack tokens, and workspace host name; `ssh/` holds the agent's SSH key and the workspace's host
-key. `<workspaces_dir>/<name>` holds the workspace's authorized key, host key, and workspace key,
-root-only and mounted only by that workspace. Both are read at startup, so changes need a restart.
+key; `kanban-shared/` holds its Kanban boards, which its board page also mounts. `<workspaces_dir>/<name>`
+holds the workspace's authorized key, host key, and workspace key, root-only and mounted only by that
+workspace. `<boards_dir>/<name>` is the board page's Hermes home; its `.env` holds the page's key. All
+are read at startup, so changes need a restart.
 """
 
 from __future__ import annotations
@@ -65,6 +71,16 @@ SLACK_VARS = (*SLACK_REQUIRED_VARS, "SLACK_HOME_CHANNEL")
 KEY_VAR = "LITELLM_API_KEY"
 SECRET_VARS = (KEY_VAR, *SLACK_VARS)
 
+# Board pages' keys: the chat's model, chat and MCP routes (no /key/info, so no GitHub tokens), and at
+# most the read-only MCP servers below. Each new read-only server must be added here explicitly.
+BOARD_ROLE = "board"
+BOARD_MODELS = ["fast"]
+BOARD_ROUTES = ["/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "mcp_inference_routes"]
+BOARD_MCP_SERVERS = ("atlassian_read", "onyx_search")
+DEFAULT_BOARD_BUDGET = 50.0
+# The agent's boards, inside its home; compose.yaml's HERMES_KANBAN_HOME and board-<name> mount match.
+BOARD_SUBDIR = "kanban-shared"
+
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 # Monthly spend limit, in USD, for agents created without an explicit budget.
@@ -82,6 +98,7 @@ class Settings:
     master_key: str
     agents_dir: Path
     workspaces_dir: Path
+    boards_dir: Path
     github_levels_file: Path
     uid: int
     gid: int
@@ -93,6 +110,7 @@ class Settings:
             master_key=os.environ.get("LITELLM_MASTER_KEY", ""),
             agents_dir=Path(os.environ.get("AGENTS_DIR", "/agents")),
             workspaces_dir=Path(os.environ.get("WORKSPACES_DIR", "/workspaces")),
+            boards_dir=Path(os.environ.get("BOARDS_DIR", "/boards")),
             github_levels_file=Path(os.environ.get("GITHUB_LEVELS_FILE", "/templates/github-levels.json")),
             uid=int(os.environ.get("HERMES_UID", "10000")),
             gid=int(os.environ.get("HERMES_GID", "10000")),
@@ -112,6 +130,11 @@ class Agent:
     has_data: bool = False
     has_workspace: bool = False
     env_set: dict[str, bool] = field(default_factory=dict)
+    board_key_hashes: list[str] = field(default_factory=list)
+    board_mcp_servers: list[str] = field(default_factory=list)
+    board_budget: float | None = None
+    board_spend: float = 0.0
+    has_board_page: bool = False
 
     @property
     def provisioned(self) -> bool:
@@ -142,6 +165,22 @@ class Agent:
         if all(self.env_set.get(var) for var in SLACK_REQUIRED_VARS):
             return "set"
         return "partial" if any(self.env_set.get(var) for var in SLACK_VARS) else "not set"
+
+    @property
+    def board_status(self) -> str:
+        """`ready` (one key, written to the page's .env), `none`, `no page` when its files are missing,
+        or `N keys` (an interrupted rotation)."""
+        keys = len(self.board_key_hashes)
+        if not keys:
+            return "none"
+        if keys > 1:
+            return f"{keys} keys"
+        return "ready" if self.has_board_page else "no page"
+
+    def describe_board_budget(self) -> str:
+        if self.board_budget is None:
+            return "none"
+        return f"${self.board_spend:,.2f} of ${self.board_budget:,.2f}"
 
     def describe_budget(self, short: bool = False) -> str:
         """Spend against the monthly budget; `short` leaves out the period and reset date."""
@@ -222,6 +261,11 @@ class Agents:
             if metadata.get("hermes_role") == WORKSPACE_ROLE:
                 agent.workspace_key_hashes.append(key["token"])
                 continue
+            if metadata.get("hermes_role") == BOARD_ROLE:
+                agent.board_key_hashes.append(key["token"])
+                servers = (key.get("object_permission") or {}).get("mcp_servers") or []
+                agent.board_mcp_servers = sorted(s for s in servers if s != NO_MCP_SERVERS)
+                continue
             agent.key_hashes.append(key["token"])
             servers = (key.get("object_permission") or {}).get("mcp_servers") or []
             agent.mcp_servers = sorted(s for s in servers if s != NO_MCP_SERVERS)
@@ -247,6 +291,9 @@ class Agents:
         agent.budget = user.get("max_budget")
         agent.spend = user.get("spend") or 0.0
         agent.budget_resets = user.get("budget_reset_at")
+        board_user = self.api.user_info(self._board_user_id(agent.name)) or {}
+        agent.board_budget = board_user.get("max_budget")
+        agent.board_spend = board_user.get("spend") or 0.0
 
     def _add_local_state(self, agent: Agent) -> None:
         home = self._home(agent.name)
@@ -255,6 +302,8 @@ class Agents:
                                and (home / "ssh" / "id_ed25519").exists())
         values = env_values(home / ".env")
         agent.env_set = {var: bool(values.get(var)) for var in SECRET_VARS}
+        agent.has_board_page = (bool(env_values(self._board_home(agent.name) / ".env").get(KEY_VAR))
+                                and (home / BOARD_SUBDIR).is_dir())
 
     # -- changes -------------------------------------------------------------------------------
 
@@ -323,13 +372,58 @@ class Agents:
         agent = self._existing(name)
         key, key_hash = self._issue_key(name, agent.mcp_servers, agent.github_levels)
         workspace_key, workspace_key_hash = self._issue_workspace_key(name, agent.github_levels)
+        new_hashes = [key_hash, workspace_key_hash]
         try:
             self._write_env(name, {KEY_VAR: key})
             self._write_workspace(name, workspace_key)
+            if agent.board_key_hashes:
+                board_key, board_key_hash = self._issue_board_key(name, agent.board_mcp_servers)
+                new_hashes.append(board_key_hash)
+                self._write_board_page(name, board_key)
         except Exception:
-            self.api.delete_keys([key_hash, workspace_key_hash])
+            self.api.delete_keys(new_hashes)
             raise
-        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes)
+        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes + agent.board_key_hashes)
+        return self.get(name)
+
+    def board(self, name: str, mcp: list[str] | None = None, budget: float | None = None) -> Agent:
+        """Give the agent's board page its key and home, or change the key's MCP servers (only
+        BOARD_MCP_SERVERS) and/or the page's monthly budget (None leaves that unchanged; a new page gets
+        no servers and DEFAULT_BOARD_BUDGET). Also creates the agent's board directory, which the page
+        mounts. MCP and budget changes take effect immediately; a new key once the page (re)starts."""
+        if budget is not None:
+            validate_budget(budget)
+        self.warnings = []
+        agent = self._existing(name)
+        servers = None if mcp is None else self._checked_board_servers(mcp)
+        if budget is not None or agent.board_budget is None:
+            self._set_budget(name, DEFAULT_BOARD_BUDGET if budget is None else budget, self._board_user_id(name))
+        if not agent.board_key_hashes or not agent.has_board_page:
+            # A new page, or one whose .env lost its key: issue one, revoking any old ones.
+            key, key_hash = self._issue_board_key(name, agent.board_mcp_servers if servers is None else servers)
+            try:
+                self._write_board_page(name, key)
+            except Exception:
+                self.api.delete_keys([key_hash])
+                raise
+            self.api.delete_keys(agent.board_key_hashes)
+            return self.get(name)
+        self._prepare_board_page(name)
+        changes: dict = {"metadata": self._metadata(name, [], BOARD_ROLE), "user_id": self._board_user_id(name),
+                         "models": BOARD_MODELS, "allowed_routes": BOARD_ROUTES}
+        if servers is not None:
+            changes["object_permission"] = {"mcp_servers": servers or [NO_MCP_SERVERS]}
+        for key_hash in agent.board_key_hashes:
+            self.api.update_key(key_hash, changes)
+        return self.get(name)
+
+    def revoke_board(self, name: str) -> Agent:
+        """Revoke the board page's key and remove it from the page's .env. The boards, the page's chat
+        history, and its budget are kept."""
+        agent = self.get(name)
+        self.api.delete_keys(agent.board_key_hashes)
+        if (self._board_home(name) / ".env").exists():
+            self._write_env(name, {KEY_VAR: None}, self._board_home(name) / ".env")
         return self.get(name)
 
     def set_slack(self, name: str, values: dict[str, str]) -> Agent:
@@ -344,21 +438,25 @@ class Agents:
         """Revoke the agent's and its workspace's keys and remove their secrets. `purge` also deletes
         its data and LiteLLM user (budget and spend); otherwise both are kept for `agent add`."""
         agent = self.get(name)
-        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes)
+        self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes + agent.board_key_hashes)
         home = self._home(name)
         shutil.rmtree(self._workspace_config(name), ignore_errors=True)
         if purge:
-            if self.api.user_info(self._user_id(name)) is not None:
-                self.api.delete_user(self._user_id(name))
+            for user_id in (self._user_id(name), self._board_user_id(name)):
+                if self.api.user_info(user_id) is not None:
+                    self.api.delete_user(user_id)
             try:
                 shutil.rmtree(home, onexc=_ignore_missing)
+                shutil.rmtree(self._board_home(name), onexc=_ignore_missing)
             except OSError as e:
-                raise AgentError(f"couldn't delete all of {name}'s data ({e}); stop agent-{name} and run "
-                                 "`agent delete --purge` again") from e
+                raise AgentError(f"couldn't delete all of {name}'s data ({e}); stop agent-{name} and board-{name} "
+                                 "and run `agent delete --purge` again") from e
             return
         shutil.rmtree(home / "ssh", ignore_errors=True)
         if (home / ".env").exists():
             self._write_env(name, {var: None for var in SECRET_VARS})
+        if (self._board_home(name) / ".env").exists():
+            self._write_env(name, {KEY_VAR: None}, self._board_home(name) / ".env")
 
     # -- helpers -------------------------------------------------------------------------------
 
@@ -384,6 +482,15 @@ class Agents:
                              for s, fault in sorted(faults.items()) if fault)
         return servers
 
+    def _checked_board_servers(self, mcp: list[str]) -> list[str]:
+        """Like _checked_servers, but only BOARD_MCP_SERVERS: a board page's chat may only read."""
+        servers = sorted({s.strip() for s in mcp if s.strip()})
+        refused = [s for s in servers if s not in BOARD_MCP_SERVERS]
+        if refused:
+            raise AgentError(f"board pages may only use the read-only MCP servers {list(BOARD_MCP_SERVERS)}, "
+                             f"not {refused}")
+        return self._checked_servers(servers)
+
     def _server_faults(self, ids: dict[str, str]) -> dict[str, str | None]:
         return {name: self.api.mcp_server_fault(server_id) for name, server_id in ids.items()}
 
@@ -400,12 +507,16 @@ class Agents:
         return f"hermes-agent-{name}"
 
     @staticmethod
+    def _board_user_id(name: str) -> str:
+        return f"hermes-board-{name}"
+
+    @staticmethod
     def _metadata(name: str, github_levels: list[str], role: str | None = None) -> dict:
         metadata = {"managed_by": MANAGED_BY, "hermes_agent": name, "github_levels": github_levels}
         return {**metadata, "hermes_role": role} if role else metadata
 
-    def _set_budget(self, name: str, budget: float) -> None:
-        user_id = self._user_id(name)
+    def _set_budget(self, name: str, budget: float, user_id: str | None = None) -> None:
+        user_id = user_id or self._user_id(name)
         limits = {"max_budget": budget, "budget_duration": BUDGET_DURATION}
         if self.api.user_info(user_id) is None:
             self.api.new_user({"user_id": user_id, **limits})
@@ -436,6 +547,36 @@ class Agents:
             "metadata": self._metadata(name, github_levels, WORKSPACE_ROLE),
         })
         return response["key"], response["token"]
+
+    def _issue_board_key(self, name: str, servers: list[str]) -> tuple[str, str]:
+        """Returns the new board page key and its hash."""
+        response = self.api.generate_key({
+            "key_alias": f"hermes-{name}-board-{time.strftime('%Y%m%d%H%M%S')}",
+            "user_id": self._board_user_id(name),
+            "models": BOARD_MODELS,
+            "allowed_routes": BOARD_ROUTES,
+            "object_permission": {"mcp_servers": servers or [NO_MCP_SERVERS]},
+            "metadata": self._metadata(name, [], BOARD_ROLE),
+        })
+        return response["key"], response["token"]
+
+    def _board_home(self, name: str) -> Path:
+        return self.settings.boards_dir / name
+
+    def _prepare_board_page(self, name: str) -> None:
+        """Create the page's home and the agent's board directory, which the page mounts (Compose
+        refuses to start a container whose volume subpath is missing)."""
+        self._prepare_home(name)
+        uid, gid = self.settings.uid, self.settings.gid
+        for path in (self._home(name) / BOARD_SUBDIR, self._board_home(name)):
+            path.mkdir(exist_ok=True)
+            os.chown(path, uid, gid)
+            # Hermes refuses a home others can write to.
+            os.chmod(path, 0o755)
+
+    def _write_board_page(self, name: str, key: str) -> None:
+        self._prepare_board_page(name)
+        self._write_env(name, {KEY_VAR: key}, self._board_home(name) / ".env")
 
     def _home(self, name: str) -> Path:
         return self.settings.agents_dir / name
@@ -489,9 +630,9 @@ class Agents:
         home.mkdir(parents=True, exist_ok=True)
         os.chown(home, self.settings.uid, self.settings.gid)
 
-    def _write_env(self, name: str, changes: dict[str, str | None]) -> None:
-        """Set (or, for None, remove) variables in the agent's .env, keeping all other lines."""
-        path = self._home(name) / ".env"
+    def _write_env(self, name: str, changes: dict[str, str | None], path: Path | None = None) -> None:
+        """Set (or, for None, remove) variables in the agent's .env (or `path`), keeping all other lines."""
+        path = path or self._home(name) / ".env"
         for var, value in changes.items():
             if value is not None and ("\n" in value or "\r" in value):
                 raise AgentError(f"{var} must be a single line")

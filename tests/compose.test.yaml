@@ -1,8 +1,9 @@
 # Compose override for tests/run.sh: tests/fixtures secrets, the generated mock LiteLLM config,
-# fake Jev, Atlassian, Anthropic, and GitHub endpoints, and a git server standing in for GitHub for the
-# workspace. TEST_WORK is run.sh's temporary directory and TEST_SLOT its slot (0-9), which keeps
-# concurrent runs' bridge names and images apart. Images built from this repository get per-slot
-# tags so a run never uses another run's build, or overwrites the running stack's.
+# fake Jev, Atlassian, Anthropic, and GitHub endpoints, a git server standing in for GitHub for the
+# workspace, and a fake OIDC provider (standing in for Keycloak) and model for the board page.
+# TEST_WORK is run.sh's temporary directory and TEST_SLOT its slot (0-9), which keeps concurrent runs'
+# bridge names and images apart. Images built from this repository get per-slot tags so a run never
+# uses another run's build, or overwrites the running stack's.
 
 services:
   postgres:
@@ -56,6 +57,20 @@ services:
   agent-default:
     image: hermes-agent:test-${TEST_SLOT}
 
+  # Logs in through tests/fake_oidc.py, whose certificate authority it trusts, at an address the
+  # check script (run in fake-oidc) can reach. The board page and fake-oidc are on boards-egress.
+  board-default:
+    image: hermes-agent:test-${TEST_SLOT}
+    environment:
+      HERMES_DASHBOARD_OIDC_ISSUER: https://fake-oidc:8443
+      HERMES_DASHBOARD_PUBLIC_URL: http://board-default:9119
+      SSL_CERT_FILE: /tls/ca.crt
+    ports: !override
+      - "127.0.0.1:${TEST_BOARD_PORT:-19119}:9119"
+    volumes:
+      - ${TEST_WORK}/tls/ca.crt:/tls/ca.crt:ro
+      - ./tests:/tests:ro
+
   # A 15-second idle limit, so run.sh can watch a reset.
   workspace-default:
     image: hermes-workspace:test-${TEST_SLOT}
@@ -97,6 +112,22 @@ services:
       - ./tests/fake_onyx.py:/app/fake_onyx.py:ro
     command: ["python", "-u", "/app/fake_onyx.py"]
 
+  fake-oidc:
+    image: hermes-agent:test-${TEST_SLOT}
+    networks: [boards-egress]
+    volumes:
+      - ./tests:/tests:ro
+      - ${TEST_WORK}/tls:/tls:ro
+    entrypoint: ["/opt/hermes/.venv/bin/python", "-u", "/tests/fake_oidc.py"]
+
+  # The board chat checks' model, reached directly rather than through LiteLLM (tests/board_chat_checks.py).
+  fake-openai:
+    image: python:3.12-slim
+    networks: [boards]
+    volumes:
+      - ./tests/fake_openai.py:/app/fake_openai.py:ro
+    command: ["python", "-u", "/app/fake_openai.py"]
+
   fake-anthropic:
     image: python:3.12-slim
     networks: [agents]
@@ -135,3 +166,8 @@ networks:
     driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-egress"}
   onyx-ui:
     driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-ui"}
+  boards:
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-boards"}
+  # run.sh sets BOARDS_SUBNET and BOARDS_GATEWAY per slot, apart from the stack's.
+  boards-egress:
+    driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-boards-eg"}

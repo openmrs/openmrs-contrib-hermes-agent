@@ -16,11 +16,11 @@ from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, SelectionList, Static
 
-from .agents import (DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, validate_budget,
-                     validate_name)
+from .agents import (BOARD_MCP_SERVERS, DEFAULT_BOARD_BUDGET, DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent,
+                     AgentError, Agents, validate_budget, validate_name)
 from .litellm import LiteLLMError
-from .messages import (DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE, ROTATE_HINT,
-                       ROTATE_WARNING, SLACK_HINT, START_HINT)
+from .messages import (BOARD_EDIT_HINT, BOARD_HINT, DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE,
+                       ROTATE_HINT, ROTATE_WARNING, SLACK_HINT, START_HINT)
 from .onyx import DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, format_errors, source_settings
 
 DIALOG_CSS = """
@@ -146,6 +146,37 @@ class EditAgentDialog(_Dialog):
             "mcp": list(self.query_one("#mcp", SelectionList).selected),
             "github": list(self.query_one("#github", SelectionList).selected),
         })
+
+
+class BoardDialog(_Dialog):
+    """An agent's board page: its chat's read-only MCP servers and its monthly budget."""
+
+    def __init__(self, agent: Agent, servers: list[str]) -> None:
+        super().__init__()
+        self._agent = agent
+        # Only the read-only servers LiteLLM has.
+        self._servers = [s for s in BOARD_MCP_SERVERS if s in servers]
+
+    def compose(self) -> ComposeResult:
+        new = not self._agent.board_key_hashes
+        with Vertical(id="dialog"):
+            yield Label(f"{'Set up' if new else 'Edit'} {self._agent.name}'s board page", classes="title")
+            yield Label("Its chat only uses `fast`. Read-only MCP servers (space to toggle):")
+            yield SelectionList[str](
+                *[(s, s, s in self._agent.board_mcp_servers) for s in self._servers], id="mcp")
+            current = "" if new else f"; currently {self._agent.describe_board_budget()}"
+            budget = self._agent.board_budget if self._agent.board_budget is not None else DEFAULT_BOARD_BUDGET
+            yield Label(f"Monthly budget (USD{current}):")
+            yield Input(value=f"{budget:g}", id="budget")
+            yield Static("", classes="error", id="error")
+            yield self._buttons("Set up" if new else "Save")
+
+    @on(Button.Pressed, "#confirm")
+    def _on_confirm(self) -> None:
+        budget = self._budget()
+        if budget is None:
+            return
+        self.dismiss({"budget": budget, "mcp": list(self.query_one("#mcp", SelectionList).selected)})
 
 
 class SlackDialog(_Dialog):
@@ -480,14 +511,15 @@ class AdminApp(App):
         Binding("a", "add", "Add"),
         Binding("e", "edit", "Edit"),
         Binding("s", "slack", "Slack"),
+        Binding("b", "board", "Board page"),
         Binding("r", "rotate", "Rotate"),
         Binding("d", "delete", "Delete"),
         Binding("o", "onyx", "Onyx"),
         Binding("f5", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
-    COLUMNS = ("Agent", "Status", "MCP servers", "GitHub", "Budget", "Workspace", "Slack", "Data")
-    AGENT_ACTIONS = {"add", "edit", "slack", "rotate", "delete", "refresh", "onyx"}
+    COLUMNS = ("Agent", "Status", "MCP servers", "GitHub", "Budget", "Workspace", "Slack", "Board page", "Data")
+    AGENT_ACTIONS = {"add", "edit", "slack", "board", "rotate", "delete", "refresh", "onyx"}
 
     def __init__(self, agents: Agents, onyx: Onyx | None = None) -> None:
         super().__init__()
@@ -534,6 +566,7 @@ class AdminApp(App):
                 a.describe_budget(short=True),
                 a.workspace_status,
                 a.slack_status,
+                a.board_status,
                 "present" if a.has_data else "none",
                 key=a.name,
             )
@@ -598,6 +631,19 @@ class AdminApp(App):
                           f"Updated {agent.name}'s Slack settings. {SLACK_HINT.format(name=agent.name)}")
 
         self.push_screen(SlackDialog(agent), saved)
+
+    def action_board(self) -> None:
+        agent = self._selected()
+        if not agent:
+            return
+        hint = BOARD_EDIT_HINT if agent.board_key_hashes else BOARD_HINT.format(name=agent.name)
+
+        def saved(result: dict | None) -> None:
+            if result is not None:
+                self._run("Board page", lambda: self.agents.board(agent.name, result["mcp"], result["budget"]),
+                          f"Updated {agent.name}'s board page. {hint}")
+
+        self.push_screen(BoardDialog(agent, self._servers), saved)
 
     def action_rotate(self) -> None:
         agent = self._selected()

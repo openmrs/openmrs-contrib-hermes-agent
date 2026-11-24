@@ -72,6 +72,21 @@ terminal:
   ssh_key: /opt/data/ssh/id_ed25519
   cwd: /work/home
 
+# Kanban: the agent's boards (HERMES_KANBAN_HOME in compose.yaml), which administrators manage on its
+# board page. The gateway's dispatcher runs each ready task assigned to `default` (this agent) as a
+# worker: a separate Hermes run with this config, its tools running in the workspace like any other.
+# Workers can't answer Slack approvals, so their Jira and Confluence writes are refused.
+kanban:
+  # Only this agent's own profile; the board page, which shares the boards, claims nothing.
+  dispatch_profiles: [default]
+  # At most this many tasks run at once, each with its own model calls.
+  max_in_progress: 2
+  # Triage cards stay put until an administrator decomposes or promotes them, rather than an LLM
+  # fanning them out on its own.
+  auto_decompose: false
+  # A worker's request for review waits in Review for an administrator, rather than a review run.
+  review_dispatch: false
+
 # USER.md is one profile per agent, not per person, added to every prompt; in shared Slack spaces
 # anything saved about one person would reach everyone, so it's off. MEMORY.md (agent notes) stays
 # on; SOUL.md limits what goes in.

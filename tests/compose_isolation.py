@@ -10,14 +10,22 @@ secret files can't be checked by path. `write-secrets` writes placeholder secret
 one marker variable, and the checks look for markers in each service's environment. Run `config` in
 a directory holding only those placeholders, so any other required env file makes it fail.
 
-Every `agent-*` and `workspace-*` service is checked, so newly added agents are covered.
+Every `agent-*`, `workspace-*`, and `board-*` service is checked, so newly added agents are covered.
 """
 
 import json
 import os
 import sys
 
-AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT"}
+AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT", "HERMES_KANBAN_HOME",
+                     "HERMES_KANBAN_WORKSPACES_ROOT"}
+# The agent's boards, which its board page also mounts: in its own home, nowhere else.
+AGENT_KANBAN_HOME = "/opt/data/kanban-shared"
+# A board page gets no secrets in its environment (its key is in its .env) and no auth provider but the
+# OIDC one: e.g. HERMES_DASHBOARD_BASIC_AUTH_* or HERMES_DASHBOARD_OAUTH_CLIENT_ID would add another way in.
+BOARD_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_DASHBOARD", "HERMES_DASHBOARD_PORT",
+                     "HERMES_DASHBOARD_PUBLIC_URL", "HERMES_DASHBOARD_OIDC_ISSUER", "HERMES_DASHBOARD_OIDC_CLIENT_ID",
+                     "HERMES_KANBAN_HOME", "BOARD_TRUSTED_PROXY"}
 WORKSPACE_ENV_ALLOWED = {"WORKSPACE_IDLE_MINUTES", "WORKSPACE_KEEP_FILES", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
                          "GIT_COMMITTER_EMAIL"}
 # Secret files and the only services allowed to receive them.
@@ -88,6 +96,9 @@ for name, service in sorted(agents.items()):
           sorted(network_names(service)))
     check(f"{name}: has a workspace-{expected_subpath} service", f"workspace-{expected_subpath}" in services,
           sorted(services))
+    check(f"{name}: Kanban boards are in its home, at {AGENT_KANBAN_HOME}",
+          (service.get("environment") or {}).get("HERMES_KANBAN_HOME") == AGENT_KANBAN_HOME,
+          (service.get("environment") or {}).get("HERMES_KANBAN_HOME"))
     service_mounts = mounts(service)
     agents_data = [m for m in service_mounts if m.get("source") == "agents-data"]
     data = [m for m in agents_data if m.get("target") == "/opt/data"]
@@ -118,6 +129,44 @@ for name, service in sorted(agents.items()):
         check(f"{name}: agents-data subpath not shared", subpath not in subpaths,
               f"{subpath!r} also used by {subpaths.get(subpath)}")
         subpaths[subpath] = name
+
+boards = {name: s for name, s in services.items() if name.startswith("board-")}
+for name, service in sorted(boards.items()):
+    agent_name = name[len("board-"):]
+    environment = service.get("environment") or {}
+    check(f"{name}: has an agent-{agent_name} service", f"agent-{agent_name}" in agents, sorted(agents))
+    extra = set(environment) - BOARD_ENV_ALLOWED
+    check(f"{name}: no extra environment variables (secrets, other auth providers)", not extra, sorted(extra))
+    check(f"{name}: OIDC is the dashboard's only auth provider", "HERMES_DASHBOARD_OIDC_ISSUER" in environment,
+          sorted(environment))
+    check(f"{name}: only on the boards and boards-egress networks", network_names(service) == {"boards", "boards-egress"},
+          sorted(network_names(service)))
+    check(f"{name}: host port bound to 127.0.0.1 only",
+          all(p.get("host_ip") == "127.0.0.1" for p in service.get("ports") or []), service.get("ports"))
+    check(f"{name}: not started by default (profile)", bool(service.get("profiles")), service.get("profiles"))
+    service_mounts = mounts(service)
+    homes = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data"]
+    envs = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data/.env"]
+    shared = [m for m in service_mounts if m.get("source") == "agents-data" and m.get("target") == "/opt/kanban"]
+    souls = [m for m in service_mounts if m.get("target") == "/opt/data/SOUL.md"]
+    configs = [m for m in service_mounts if m.get("target") == "/opt/data/config.yaml"]
+    check(f"{name}: mounts only its own board-homes subdirectory and .env, the agent's boards, SOUL.md, and config.yaml",
+          len(service_mounts) == 5 and len(homes) == 1 and len(envs) == 1 and len(shared) == 1 and len(souls) == 1
+          and len(configs) == 1, service_mounts)
+    check(f"{name}: board-homes subdirectory is {agent_name!r}",
+          len(homes) == 1 and (homes[0].get("volume") or {}).get("subpath") == agent_name, homes)
+    check(f"{name}: .env is {agent_name}/.env in board-homes, read-only",
+          len(envs) == 1 and envs[0].get("read_only") is True
+          and (envs[0].get("volume") or {}).get("subpath") == f"{agent_name}/.env", envs)
+    check(f"{name}: of agents-data, only {agent_name}/kanban-shared, as Kanban's home",
+          len(shared) == 1 and (shared[0].get("volume") or {}).get("subpath") == f"{agent_name}/kanban-shared"
+          and environment.get("HERMES_KANBAN_HOME") == "/opt/kanban", shared)
+    check(f"{name}: SOUL.md is hermes/souls/board.md, read-only",
+          len(souls) == 1 and souls[0].get("type") == "bind" and souls[0].get("read_only") is True
+          and str(souls[0].get("source", "")).replace("\\", "/").endswith("/hermes/souls/board.md"), souls)
+    check(f"{name}: config.yaml is hermes/board.yaml, read-only",
+          len(configs) == 1 and configs[0].get("type") == "bind" and configs[0].get("read_only") is True
+          and str(configs[0].get("source", "")).replace("\\", "/").endswith("/hermes/board.yaml"), configs)
 
 workspaces = {name: s for name, s in services.items() if name.startswith("workspace-")}
 check("one workspace per agent", sorted(workspaces) == sorted(f"workspace-{a[len('agent-'):]}" for a in agents),
@@ -153,8 +202,18 @@ for name, service in services.items():
     check(f"{name}: drops all capabilities", "ALL" in (service.get("cap_drop") or []), service.get("cap_drop"))
     check(f"{name}: not privileged", not service.get("privileged"))
     for m in mounts(service):
-        if m.get("source") == "agents-data" and not (m.get("volume") or {}).get("subpath"):
+        subpath = (m.get("volume") or {}).get("subpath")
+        if m.get("source") == "agents-data" and not subpath:
             check(f"{name}: whole agents-data volume mounted only by admin", name == "admin", m)
+        if m.get("source") == "agents-data" and subpath:
+            owner = subpath.split("/")[0]
+            check(f"{name}: agents-data {subpath!r} mounted only by agent-{owner} or, its boards, board-{owner}",
+                  (name == f"agent-{owner}" and subpath in (owner, f"{owner}/.env"))
+                  or (name == f"board-{owner}" and subpath == f"{owner}/kanban-shared"), m)
+        if m.get("source") == "board-homes":
+            check(f"{name}: board-homes mounted only by admin (whole) or a board page (its own)",
+                  (name == "admin" and not subpath)
+                  or (subpath and name == f"board-{subpath.split('/')[0]}" and subpath.count("/") <= 1), m)
         if m.get("source") == "workspace-config" and not (m.get("volume") or {}).get("subpath"):
             check(f"{name}: whole workspace-config volume mounted only by admin", name == "admin", m)
         if str(m.get("source", "")).endswith("docker.sock"):
@@ -235,6 +294,11 @@ check("onyx-backend network: only Onyx services", members("onyx-backend") == ony
 check("onyx-egress network: only onyx-api and onyx-background",
       members("onyx-egress") == ["onyx-api", "onyx-background"], members("onyx-egress"))
 check("onyx-ui network: only onyx-web and onyx-api", members("onyx-ui") == ["onyx-api", "onyx-web"], members("onyx-ui"))
+check("boards network is internal", networks.get("boards", {}).get("internal") is True, networks.get("boards"))
+check("boards network: only litellm and board pages",
+      all(name == "litellm" or name.startswith("board-") for name in members("boards")), members("boards"))
+check("boards-egress network: only board pages",
+      all(name.startswith("board-") for name in members("boards-egress")), members("boards-egress"))
 check("litellm-db network is internal", networks.get("litellm-db", {}).get("internal") is True, networks.get("litellm-db"))
 
 sys.exit(1 if failures else 0)
