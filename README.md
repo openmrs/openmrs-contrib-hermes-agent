@@ -5,7 +5,8 @@ local [LiteLLM](https://github.com/BerriAI/litellm) gateway. LiteLLM holds every
 providers and MCP integrations such as Jira and Confluence); each agent holds only a LiteLLM virtual key
 and its own Slack tokens. Everything an agent runs (its terminal, file tools, and code execution)
 runs in its own workspace container, which holds none of those. A `github-token` service hands out
-short-lived GitHub App tokens, and an on-demand admin container manages agents.
+short-lived GitHub App tokens, and an on-demand admin container manages agents. A `reviewer` agent
+reviews pull requests when GitHub's webhook starts it (see [PR reviewer](#pr-reviewer)).
 
 ```
                     agents network (internet egress)
@@ -23,6 +24,9 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
  │ workspace key    │ ── gh ──▶ github-token (App keys) ──▶ api.github.com
  │ (GitHub only)    │           checks grants via litellm /key/info
  └──────────────────┘ ── workspace-egress ──▶ github.com, Maven Central, npm, ...
+
+ GitHub ── webhook, HTTP :8644 (signed) ──▶ agent-reviewer ──▶ workspace-reviewer (browser)
+                                            └─ github_review token ─▶ github-token ─▶ one PR review
 ```
 
 ## Security model
@@ -34,7 +38,7 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
   - `secrets/github-app.env` (GitHub App private keys) → `github-token`.
   - `secrets/atlassian.env` (the Atlassian site) → `mcp-atlassian`, which holds no credentials:
     LiteLLM sends the granted server's Atlassian key with each request.
-  - An agent's LiteLLM key and Slack tokens → its `.env` in its own `agents-data` subdirectory,
+  - An agent's LiteLLM key, Slack tokens, and (reviewer only) webhook secret → its `.env` in its own `agents-data` subdirectory,
     which only it (and `admin`) mounts.
 - **Agents run nothing themselves.** Hermes' `ssh` terminal backend sends the terminal, file tools,
   and `execute_code` to the agent's workspace, so building a pull request (running its author's
@@ -44,8 +48,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
 - **Agents can't change their instructions or configuration.** `SOUL.md` and `config.yaml` are
   read-only mounts of repo files; Hermes doesn't protect them itself, and `config.yaml` decides where
   requests go.
-- **Runs are capped at 50 model calls** (`agent.max_turns`), so one runaway task can't spend the
-  monthly budget.
+- **Runs are capped at 50 model calls** (`agent.max_turns`; 150 for the reviewer), so one runaway
+  task can't spend the monthly budget.
 - **Agent keys are narrowly scoped:** `allowed_routes` is chat completions, model listing, MCP
   inference, and `/key/info`; `models` is `auto`, `fast`, `balanced`, `strong`. So no management
   API (an agent can't mint a broader key) and no raw provider passthroughs (`/anthropic/*`, ...),
@@ -54,8 +58,8 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
   doesn't reset spend. Every request with the agent's key counts, including the router's classifier
   calls. Over budget, LiteLLM refuses requests until the 1st (UTC).
 - **GitHub access is per level, with short-lived tokens.** `github-token/levels.json` defines each
-  level's permissions and optional repository limit: `github_read` and `github_pr` (push branches,
-  open pull requests). Each level should have its own GitHub App, installed only where needed.
+  level's permissions and optional repository limit: `github_read`, `github_pr` (push branches,
+  open pull requests), and `github_review` (post pull request reviews; agent keys only). Each level should have its own GitHub App, installed only where needed.
   - `gh` in the workspace asks `github-token` for a token on every run, sending the workspace's key.
     `github-token` checks the key with LiteLLM and issues a token only for a level in its
     `github_levels` metadata. Revoked keys get nothing; grant changes apply within a minute.
@@ -68,6 +72,11 @@ short-lived GitHub App tokens, and an on-demand admin container manages agents.
     could still edit Releases, send `repository_dispatch`, and comment on, review, retitle, or close
     any pull request. Pushes to `apollo/*` run workflows that trigger on every branch, so check none
     pass secrets to build steps. Never give the App the Workflows permission.
+  - **`github_review` is limited to one review by the reviewer's plugin, not by GitHub.** GitHub has
+    no comment-only permission, so the App (Pull requests write, three repositories, no Contents)
+    can also edit or close pull requests there. Only the `github-review` plugin limits the reviewer to
+    one COMMENT review on the run's bound PR and head commit. `github-token` issues the level only to
+    agent keys (never workspace keys).
 - **MCP access is per server.** Each server in `litellm/config.yaml` has its own credential, and
   each key lists the servers it may use. Name servers `<integration>_<level>` with a separately
   scoped key each (e.g. `atlassian_read`, `atlassian_jira_write`, `atlassian_confluence_write`). 
@@ -101,7 +110,55 @@ and `gh`.
   removed. Tell that agent in its `SOUL.md` that its workspace isn't wiped.
 - **Accepted risks.** Until the next reset, a malicious build's processes and files can tamper with
   later work in that workspace. Hermes copies skills to the workspace and back, so code there could
-  plant a skill that appears in later prompts.
+  plant a skill that appears in later prompts. The reviewer's skills are a read-only mount, so this
+  can't happen to it (tested: a changed skill file and a new file next to it don't come back).
+
+### PR reviewer
+
+The `reviewer` agent reviews pull requests in `openmrs-esm-patient-chart`,
+`openmrs-esm-patient-management`, and `openmrs-core`. GitHub's `pull_request` webhook (opened or
+ready for review; not drafts or bots) hits a signed route on the agent, which starts a run. The run
+checks the PR out in `workspace-reviewer`, builds and tests it and opens its UI in a browser if the
+diff looks safe to build, and posts one COMMENT review.
+
+- **Config and tools.** Its managed config (`hermes/reviewer/config.yaml`, read-only) turns off tool
+  search (plugin tools are listed directly), memory, background review, the curator, and all MCP
+  servers. Its skills (`hermes/reviewer/skills`) are a read-only mount, so `hermes skills list`
+  fails for it. The `github-review` plugin gives it `prepare_workspace` and `post_pr_review`, and
+  blocks a review's other tool calls until `prepare_workspace` has given it the workspace, and after
+  another review has taken the workspace from it.
+- **Profile.** `agent-reviewer` and `workspace-reviewer` are in the `reviewer` Compose profile, so a
+  plain `docker compose up -d` doesn't start them. Commands that should include them, such as the
+  update steps in [Upgrading](#upgrading), need `--profile reviewer` or `COMPOSE_PROFILES=reviewer`.
+- **One review at a time.** `prepare_workspace` resets the workspace and takes a lock. A review waits
+  up to 2 hours for it; a holder with no activity for 45 minutes loses it, and none keeps it over 3
+  hours. A failed run doesn't fire `on_session_end`, so its lock is freed only once it goes stale
+  and another review is waiting. `prepare_workspace` has its own tool deadline of about 2 hours.
+  It refuses a PR and commit already reviewed.
+- **Browser.** Only `openmrsinfra/hermes-workspace-reviewer` (the `reviewer` stage of
+  `workspace/Dockerfile`) has Chromium and `agent-browser`. Chromium is pinned to a build from a
+  `debian-security` snapshot; bump the pin periodically (see the Dockerfile) so it isn't behind
+  security fixes.
+- **Accepted risks.**
+  - Webhook events arrive over plain HTTP, so anyone on the network path can read them (public PR
+    data). The secret is never sent, only a signature over the body. The signature doesn't cover the
+    delivery ID, so a captured body can be resent; each resend can start a run. If the first review
+    of that PR and commit is done, `prepare_workspace` refuses the resend at once. If it still runs,
+    the resend waits in `prepare_workspace` (up to 2 hours) and is refused when it gets the
+    workspace. Hermes limits each route to 30 requests a minute.
+  - The Hermes webhook server on 8644 is reachable from the internet and from every workspace on
+    the `workspaces` network. Every route needs a valid signature.
+  - The reviewer's Maven and npm cache (`reviewer-cache`) survives resets, so a PR build can poison
+    it for later reviews.
+  - Files a PR build writes next to the cache files Hermes syncs to the workspace can come back into
+    the agent's `/opt/data/cache` and go to the next review's workspace. They are data there;
+    nothing runs them.
+  - Workspace egress is open.
+  - `github_review` can also edit or close PRs in the three repositories (see
+    [Security model](#security-model)).
+- **Repository list.** It is in three places: `github-token/levels.json`, `ALLOWED_REPOS` in
+  `hermes/plugins/github-review/__init__.py`, and the route filter in `hermes/reviewer/config.yaml`.
+  Change all three together.
 
 ### Data retention
 
@@ -204,6 +261,28 @@ whichever is available.
 
 LiteLLM's admin UI is at http://127.0.0.1:4000/ui (host-only); log in with the master key.
 
+### PR reviewer setup
+
+Optional; needs the `github_read` App from step 4 above.
+
+1. **GitHub App:** create "Apollo Review" with Repository permissions Pull requests Read and write
+   (GitHub adds Metadata read) and no Contents: the reviewer reads code with `github_read`.
+   Webhook URL `http://<server address>:8644/webhooks/github-pr`, secret from step 3, event
+   "Pull request". Install it only on the three repositories.
+2. **Secrets:** add the App's `GITHUB_REVIEW_*` values to `secrets/github-app.env` (see the example).
+3. **Create the agent and secret:**
+   ```sh
+   bin/admin agent add reviewer --github github_read,github_review --budget <USD>
+   bin/admin agent webhook reviewer     # prints the webhook secret once
+   ```
+   Paste the secret into the App.
+4. **Start:** open port 8644 in the server's firewall, then
+   `docker compose --profile reviewer up -d agent-reviewer workspace-reviewer`. Later commands that
+   should include the reviewer (such as the update in [Upgrading](#upgrading)) need
+   `--profile reviewer`, or set `COMPOSE_PROFILES=reviewer` in `./.env`.
+5. **Test:** open a PR in one of the three repositories and watch
+   `docker compose logs -f agent-reviewer`.
+
 ### Atlassian keys
 
 Keys are scoped when created and can't be changed, so create each with all of its scopes. An
@@ -267,6 +346,7 @@ bin/admin agent slack [<name>]                  # prompts; blank keeps current v
 bin/admin agent rotate [<name>] [--yes]         # new agent, workspace, and SSH keys; old keys revoked
 bin/admin agent delete [<name>] [--purge] [--yes]
 bin/admin agent compose <name>                  # agent-<name> and workspace-<name> blocks for compose.yaml
+bin/admin agent webhook [<name>] [--yes]        # new webhook secret, printed once (reviewer)
 
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
@@ -298,8 +378,8 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   source settings likewise (`onyx add ... --from-stdin`, `onyx edit <name> --from-stdin`).
 - **Restarts:** Slack changes need `docker compose restart agent-<name>`; `agent rotate`
   needs `docker compose restart workspace-<name> agent-<name>`. Admin has no Docker socket to do it.
-- **`agent delete`** revokes the keys and removes the agent's secrets (`.env` values, SSH key, workspace
-  config) but keeps its sessions, memories, skills, and spend, so `agent add` can bring it back.
+- **`agent delete`** revokes the keys and removes the agent's secrets (`.env` values including
+  `WEBHOOK_SECRET`, SSH key, workspace config) but keeps its sessions, memories, skills, and spend, so `agent add` can bring it back.
   `--purge` also deletes its data and LiteLLM user.
 
 To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`,
@@ -323,7 +403,8 @@ keep it short. Hermes reads it when a session starts: use `/new` in Slack, or re
 
 Images are pinned by tag and digest, in `compose.yaml` and the Dockerfiles. Change both, using the
 digest of the tag's multi-platform index (`docker buildx imagetools inspect <image>:<tag>`), run
-`tests/run.sh`, then `docker compose build && docker compose up -d`.
+`tests/run.sh`, then `docker compose build && docker compose up -d` (with the reviewer, add
+`--profile reviewer` to both, or set `COMPOSE_PROFILES=reviewer`).
 
 - **Hermes:** `HERMES_IMAGE` and `image:` under `x-hermes-agent`. Follow the checklist in
   `hermes/config.yaml`: new side tasks must be routed to `fast`, and `_config_version` must match
@@ -334,6 +415,7 @@ digest of the tag's multi-platform index (`docker buildx imagetools inspect <ima
   reaches `onyx-api` through a route Onyx calls development-only (see `onyx-web`).
 - **Python:** the base image in the `admin/`, `github-token/`, and `workspace/` Dockerfiles.
 - **Workspace toolchain:** the JDK, Node, Maven, and GitHub CLI pins in `workspace/Dockerfile`.
+  The reviewer's Chromium pin (a `debian-security` snapshot) needs a periodic bump too.
 - **Postgres:** a major version also needs `pg_upgrade` or a dump and restore; the volume is
   mounted at `/var/lib/postgresql` so `pg_upgrade --link` works.
 
@@ -343,7 +425,8 @@ Never change `LITELLM_SALT_KEY` after first start: it encrypts credentials LiteL
 
 GitHub Actions publishes images for `linux/amd64` and `linux/arm64` to Docker Hub:
 `openmrsinfra/hermes` (`hermes/image`), `openmrsinfra/hermes-admin`,
-`openmrsinfra/hermes-github-token`, and `openmrsinfra/hermes-workspace`.
+`openmrsinfra/hermes-github-token`, `openmrsinfra/hermes-workspace`, and
+`openmrsinfra/hermes-workspace-reviewer`.
 
 - **Pushes to `main`** publish `:nightly` and `:<short sha>` once `tests/run.sh` passes. Pull
   requests only run the tests.
