@@ -64,7 +64,8 @@ services:
     image: hermes-agent:test-${TEST_SLOT}
     environment:
       HERMES_DASHBOARD_OIDC_ISSUER: https://fake-oidc:8443
-      HERMES_DASHBOARD_PUBLIC_URL: http://board-default:8080
+      # run.sh sets TEST_BOARD_URL to a loopback address once, to check that the page then refuses everyone.
+      HERMES_DASHBOARD_PUBLIC_URL: ${TEST_BOARD_URL:-http://board-default:8080}
       SSL_CERT_FILE: /tls/ca.crt
     ports: !override
       - "127.0.0.1:${TEST_BOARD_PORT:-19119}:8080"

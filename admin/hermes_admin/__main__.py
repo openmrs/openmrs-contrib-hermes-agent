@@ -122,7 +122,7 @@ Next steps:
   3. docker compose run --rm admin agent add {name} ...  (if not done yet)
   4. docker compose up -d agent-{name}
   5. For its board page: docker compose run --rm admin agent board {name}, set BOARD_{var}_URL (and
-     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose --profile boards up -d kanban-web-{name}"""
+     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose up -d board-{name} kanban-web-{name}"""
 
 CANCELLED = "Cancelled (use --yes to skip confirmation)."
 

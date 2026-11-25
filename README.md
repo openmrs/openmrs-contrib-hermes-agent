@@ -109,8 +109,9 @@ and `gh`.
 
 ### Board pages
 
-Each agent `<name>` can have a board page (only started with the `boards` Compose profile): two
-services that share a network namespace.
+Each agent `<name>` has a board page, which starts with the rest of the stack but refuses everyone
+until it is set up (see [Board page setup](#board-page-setup)): two services that share a network
+namespace.
 
 - `board-<name>`: Hermes' web dashboard, whose Kanban tab shows the agent's boards (columns per
   status, drag and drop, comments, each run's history) and lets users create, change, and unblock
@@ -268,7 +269,8 @@ LiteLLM's admin UI is at http://127.0.0.1:4000/ui (host-only); log in with the m
 
 ### Board page setup
 
-Optional, per agent. Uses any OIDC provider; Keycloak is shown.
+Per agent; until then, its page answers every request with 503. Uses any OIDC provider; Keycloak is
+shown.
 
 1. **OIDC client.** Create a client, e.g. `hermes-board`: OpenID Connect, standard flow (authorization
    code) only, client authentication off (public; Hermes uses PKCE S256), and as valid redirect URI
@@ -285,8 +287,8 @@ Optional, per agent. Uses any OIDC provider; Keycloak is shown.
    per agent `BOARD_<NAME>_URL` (e.g. `BOARD_DEFAULT_URL=https://board.example.org`) and, if 9119 is
    taken, `BOARD_<NAME>_PORT`. `<NAME>` is the agent's name in capitals, dashes as underscores.
 4. **The page's key:** `bin/admin agent board default --mcp atlassian_read,onyx_search` (or no `--mcp`).
-5. **Start it:** `docker compose --profile boards up -d kanban-web-default` (which starts
-   `board-default` too), then point an HTTPS reverse proxy on the host at `http://127.0.0.1:9119`,
+5. **Restart it** to pick up its keys and settings: `docker compose up -d --force-recreate board-default
+   kanban-web-default`, then point an HTTPS reverse proxy on the host at `http://127.0.0.1:9119`,
    passing the original `Host` and setting `X-Forwarded-Proto: https`.
 
 Open `/kanban` for the board and `/board-chat` for the chat; the dashboard's other pages are refused.
@@ -393,8 +395,8 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   source settings likewise (`onyx add ... --from-stdin`, `onyx edit <name> --from-stdin`).
 - **Restarts:** Slack changes need `docker compose restart agent-<name>`; `agent rotate`
   needs `docker compose restart workspace-<name> agent-<name>`, plus `board-<name> kanban-web-<name>`
-  if the agent has a board page; a new board page needs `docker compose --profile boards up -d
-  kanban-web-<name>`. Admin has
+  if the agent has a board page; a new board page needs `docker compose up -d --force-recreate
+  board-<name> kanban-web-<name>`. Admin has
   no Docker socket to do it.
 - **`agent delete`** revokes the keys (including its board page's) and removes the agent's secrets
   (`.env` values, SSH key, workspace config) but keeps its sessions, memories, skills, boards, and
@@ -406,7 +408,7 @@ To add an agent: add the output of `bin/admin agent compose <name>` under `servi
 `bin/admin agent add <name> ...`, set up its Slack app (Setup step 6), then
 `docker compose up -d agent-<name>`. For its board page, see [Board page setup](#board-page-setup).
 
-To remove one: delete its blocks from `compose.yaml`, run `docker compose --profile boards up -d --remove-orphans`,
+To remove one: delete its blocks from `compose.yaml`, run `docker compose up -d --remove-orphans`,
 then `bin/admin agent delete <name> --purge` (or without `--purge` to keep its data), and delete its
 `SOUL.md` and Slack app.
 
@@ -420,6 +422,11 @@ a matching `http://litellm:4000/mcp/<server>` entry with `strict_redirect_header
 keep it short. Hermes reads it when a session starts: use `/new` in Slack, or restart the agent.
 
 ## Upgrading
+
+**From before board pages:** every agent's page starts with the stack, and needs directories admin
+creates. Before `docker compose up -d`, run `bin/admin agent edit <name> --budget <its budget>` (or
+`agent board`, `agent rotate`, or `agent slack`) for each agent; otherwise Compose refuses to start its
+`board-<name>` (`cannot access path .../board-homes/_data/<name>`).
 
 Images are pinned by tag and digest, in `compose.yaml` and the Dockerfiles. Change both, using the
 digest of the tag's multi-platform index (`docker buildx imagetools inspect <image>:<tag>`), run

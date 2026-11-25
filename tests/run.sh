@@ -91,7 +91,7 @@ compose() {
 }
 
 cleanup() {
-  compose --profile admin --profile boards down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$TEST_WORK"
 }
 trap cleanup EXIT
@@ -243,7 +243,7 @@ agent_field() {
 }
 
 echo "== Setup"
-compose --profile admin --profile boards down -v --remove-orphans >/dev/null 2>&1 || true
+compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
 python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml"
 # Throwaway GitHub App key pair: github-token signs, fake-github verifies.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
@@ -346,6 +346,10 @@ expect "default's .env: mode 600, owned by the Hermes user" "600 10000" "$(admin
 expect "default's .env has key, Slack settings, and workspace host" \
   "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN TERMINAL_SSH_HOST" \
   "$(admin_sh 'cut -d= -f1 /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
+expect "agent add prepares a board page without keys, so compose.yaml can start it" \
+  "600 10000 0 700 10000 755 10000 none" \
+  "$(admin_sh 'stat -c "%a %u %s" /boards/writer/.env; stat -c "%a %u" /boards/writer/web /agents/writer/kanban-shared' |
+    tr '\n' ' ' | sed 's/ $//') $(admin agent show writer | sed -n 's/^  Board page: *//p')"
 expect "agent add gives the agent a workspace key, not a second agent key" "1 1 True" \
   "$(agent_field default keys) $(agent_field default workspace_keys) $(agent_field default has_workspace)"
 expect "default's SSH key: mode 600, owned by the Hermes user; known_hosts pins workspace-default" \
@@ -963,7 +967,38 @@ expect "workspace environment and files hold no GitHub App key (markers, files)"
 echo "== 10. Board page"
 # agent-default is running (section 9); default's board page key is from section 2. kanban-web-default
 # brings up board-default, in whose network namespace it runs.
-compose --profile boards up -d --wait --wait-timeout 180 fake-oidc fake-openai kanban-web-default >/dev/null
+# A page whose address is a loopback one runs its dashboard without a login: kanban-web must refuse
+# everything then, and not pass on the unprotected dashboard. (Here the address is the only thing
+# missing; a page with no OIDC settings at all has no dashboard, so kanban-web refuses everything too.)
+# Prints the statuses of a page and the Kanban API through kanban-web, once kanban-web answers.
+page_statuses() {
+  for _ in $(seq 1 60); do
+    statuses="$(compose exec -T fake-oidc /opt/hermes/.venv/bin/python -c '
+import urllib.error, urllib.request
+statuses = []
+for path in ("/", "/api/plugins/kanban/board"):
+    try:
+        statuses.append(urllib.request.urlopen("http://board-default:8080" + path, timeout=5).status)
+    except urllib.error.HTTPError as e:
+        statuses.append(e.code)
+print(*statuses)' 2>/dev/null || true)"
+    [ -n "$statuses" ] && { echo "$statuses"; return; }
+    sleep 3
+  done
+  echo "no answer"
+}
+compose up -d --wait --wait-timeout 180 fake-oidc fake-openai >/dev/null
+TEST_BOARD_URL=http://127.0.0.1:8080 compose up -d --wait --wait-timeout 180 kanban-web-default >/dev/null
+# Its dashboard takes a while to start; refusing before that would prove nothing.
+for _ in $(seq 1 60); do
+  compose exec -T board-default python3 -c \
+    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9119/api/status", timeout=5)' >/dev/null 2>&1 && break
+  sleep 3
+done
+# kanban-web checks the dashboard at most every 30 seconds, so the answer below is about the running one.
+sleep 31
+expect "a page whose dashboard has no login refuses everything" "503 503" "$(page_statuses)"
+compose up -d --wait --wait-timeout 180 --force-recreate board-default kanban-web-default >/dev/null
 # From fake-oidc, on boards-egress like a user's proxy: is the page serving yet?
 board_ready=no
 for _ in $(seq 1 60); do
@@ -1146,7 +1181,7 @@ for model in ("fast", "auto", "balanced", "strong"):
     except urllib.error.HTTPError as e:
         statuses.append(e.code)
 print(*statuses)' 2>&1)"
-compose --profile boards stop kanban-web-default board-default fake-oidc fake-openai >/dev/null
+compose stop kanban-web-default board-default fake-oidc fake-openai >/dev/null
 
 echo "== 11. Workspaces"
 expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \

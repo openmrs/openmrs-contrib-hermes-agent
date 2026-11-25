@@ -115,13 +115,12 @@ x-hermes-agent: &hermes-agent
 # slash commands). The OIDC provider (e.g. Keycloak) decides who may log in. The page shares only the
 # agent's boards (<agent home>/kanban-shared) and holds only its own LiteLLM key (`fast` and read-only
 # MCP servers), from `bin/admin agent board <name>`. Its gateway serves no messaging platform and runs
-# no Kanban dispatcher: only the agent runs tasks. Started only with the `boards` profile (see
-# README.md).
+# no Kanban dispatcher: only the agent runs tasks. Until `bin/admin agent board <name>` and the OIDC
+# settings (see README.md), it has no keys and kanban-web refuses every request.
 x-hermes-board: &hermes-board
   <<: *hermes-image
   restart: unless-stopped
   logging: *logging
-  profiles: [boards]
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID]
@@ -150,7 +149,6 @@ x-kanban-web: &kanban-web
   <<: *hermes-image
   restart: unless-stopped
   logging: *logging
-  profiles: [boards]
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
   read_only: true
@@ -465,7 +463,7 @@ services:
   #   agent-<name>      its own agents-data subdirectory, SOUL.md (identity prompt), and the shared
   #                     hermes/config.yaml
   #   workspace-<name>  its own workspace-config subdirectory and the shared caches
-  #   board-<name>      its board page (only with the `boards` profile): its own board-homes
+  #   board-<name>      its board page: its own board-homes
   #                     subdirectory, the agent's kanban-shared directory, and the shared
   #                     hermes/board.yaml and hermes/souls/board.md
   #   kanban-web-<name> the board page's proxy, in its network namespace: board-web/ and the API

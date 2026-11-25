@@ -151,7 +151,6 @@ for name, service in sorted(boards.items()):
           bool(service.get("ports")) and all(p.get("host_ip") == "127.0.0.1" and int(p.get("target")) == 8080
                                              for p in service.get("ports")), service.get("ports"))
     check(f"{name}: has a kanban-web-{agent_name} service", f"kanban-web-{agent_name}" in services, sorted(services))
-    check(f"{name}: not started by default (profile)", bool(service.get("profiles")), service.get("profiles"))
     service_mounts = mounts(service)
     homes = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data"]
     envs = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data/.env"]
@@ -188,7 +187,6 @@ for name, service in sorted(webs.items()):
     check(f"{name}: read-only root filesystem, not root", service.get("read_only") is True
           and str(service.get("user", "")).split(":")[0] not in ("", "0", "root"), (service.get("read_only"), service.get("user")))
     check(f"{name}: no published ports of its own", not service.get("ports"), service.get("ports"))
-    check(f"{name}: not started by default (profile)", bool(service.get("profiles")), service.get("profiles"))
     service_mounts = mounts(service)
     code = [m for m in service_mounts if m.get("target") == "/app"]
     keys = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/run/board-web"]
