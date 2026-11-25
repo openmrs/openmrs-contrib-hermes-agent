@@ -20,12 +20,23 @@ dependencies; a malicious build could poison it but finds nothing worth reading 
 Only logins and logged-in sessions count as activity, so a leftover build process can't block a
 reset. Hermes
 holds its connection open while commands run and for five minutes after.
+
+The agent can also ask for a reset (the reviewer does before each review): as the workspace user it
+puts a 32-hex-digit nonce in /run/workspace-reset/request. The supervisor checks for one every
+POLL_SECONDS, resets, and then writes the nonce to /reset-status/reset-done, which only root can
+write, so the agent knows the reset happened. /reset-status is a volume the agent mounts read-only
+and reads directly, not over SSH, where the workspace user's ~/.bashrc could fake the answer; a
+workspace without it is reset on request but writes no answer. A request that isn't a small regular file of the
+workspace user's holding a nonce (a symlink to a secret, say) is deleted and logged, never read
+through.
 """
 
 import os
 import pwd
+import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -40,6 +51,11 @@ KEEP_FILES = os.environ.get("WORKSPACE_KEEP_FILES", "false").strip().lower() in 
 POLL_SECONDS = float(os.environ.get("WORKSPACE_POLL_SECONDS", "10"))
 CONFIG = Path("/config")
 RUN = Path("/run/workspace")
+RESET_REQUESTS = Path("/run/workspace-reset")
+RESET_REQUEST = RESET_REQUESTS / "request"
+RESET_STATUS = Path("/reset-status")
+RESET_DONE = RESET_STATUS / "reset-done"
+NONCE = re.compile(rb"([0-9a-f]{32})\n?")
 WORK = Path("/work")
 HOME = WORK / "home"
 CACHE = Path("/cache")
@@ -118,6 +134,78 @@ def setup_sshd() -> None:
     write(RUN / "sshd_config", SSHD_CONFIG + set_env, 0o600)
 
 
+def setup_reset_requests() -> None:
+    """A fresh directory where the workspace user can create a request but not list or remove
+    anyone else's (root-owned, sticky, write-and-search only)."""
+    remove(RESET_REQUESTS)
+    RESET_REQUESTS.mkdir()
+    os.chown(RESET_REQUESTS, 0, 0)
+    os.chmod(RESET_REQUESTS, 0o1733)
+    if RESET_STATUS.is_dir():
+        os.chown(RESET_STATUS, 0, 0)
+        os.chmod(RESET_STATUS, 0o755)
+
+
+def remove(path: Path) -> None:
+    """Deletes a file, symlink (not its target), or directory tree, if there is one. Never follows a
+    symlink, not even to check what it points to (in a sticky directory, the kernel refuses root
+    that too)."""
+    try:
+        if stat.S_ISDIR(path.lstat().st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def take_reset_request() -> str | None:
+    """Deletes whatever is at RESET_REQUEST, and returns its nonce if it is a valid request. Reads
+    only through the descriptor it checked, never following a symlink or blocking on a FIFO."""
+    reason, nonce = None, None
+    try:
+        fd = os.open(RESET_REQUEST, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        fd, reason = None, f"can't open it ({e.strerror})"
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                reason = "not a regular file"
+            elif info.st_uid != UID:
+                reason = f"owned by uid {info.st_uid}"
+            elif info.st_size > 64:
+                reason = "larger than 64 bytes"
+            else:
+                match = NONCE.fullmatch(os.read(fd, 65))
+                if match:
+                    nonce = match.group(1).decode()
+                else:
+                    reason = "not a nonce"
+        except OSError as e:
+            reason = f"can't read it ({e.strerror})"
+        finally:
+            os.close(fd)
+    try:
+        remove(RESET_REQUEST)
+    except OSError as e:
+        log(f"can't delete the reset request: {e}")
+    if reason:
+        log(f"rejected a reset request: {reason}")
+    return nonce
+
+
+def write_reset_done(nonce: str) -> None:
+    if not RESET_STATUS.is_dir():
+        log(f"no {RESET_STATUS}, so the reset isn't confirmed")
+        return
+    tmp = RESET_STATUS / ".reset-done"
+    write(tmp, nonce + "\n", 0o644)
+    os.replace(tmp, RESET_DONE)
+
+
 def logged_in_sessions() -> int:
     """Counts sshd's root-owned monitor processes for the workspace user, which that user can't fake."""
     count = 0
@@ -188,6 +276,10 @@ def remove_user_files() -> None:
 def reset() -> None:
     kill_user_processes()
     remove_user_files()
+    # Whatever the workspace user left with the reset requests, so it can't reach a later review.
+    if RESET_REQUESTS.is_dir():
+        for entry in RESET_REQUESTS.iterdir():
+            remove(entry)
     for path in (HOME, WORK / "tmp"):
         if not path.is_dir():
             path.mkdir(mode=0o700)
@@ -219,6 +311,7 @@ def relay_sshd_log(stream) -> None:
 
 def main() -> int:
     setup_sshd()
+    setup_reset_requests()
     prepare_cache()
     reset()
     sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(RUN / "sshd_config")], stderr=subprocess.PIPE)
@@ -227,6 +320,13 @@ def main() -> int:
     last_active, used, seen_login = time.monotonic(), False, 0.0
     while sshd.poll() is None:
         time.sleep(POLL_SECONDS)
+        nonce = take_reset_request()
+        if nonce:
+            reset()
+            write_reset_done(nonce)
+            used = False
+            log("reset on request")
+            continue
         with _login_lock:
             login = _last_login
         if logged_in_sessions() or login > seen_login:

@@ -15,7 +15,7 @@ import json
 import sys
 from typing import Any, Callable
 
-from .agents import DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, Agent, AgentError, Agents, Settings, validate_name
+from .agents import DEFAULT_BUDGET, SLACK_TOKEN_VARS, SLACK_VARS, WEBHOOK_VAR, Agent, AgentError, Agents, Settings, validate_name
 from .litellm import LiteLLMError
 from .messages import (DELETED, EDIT_HINT, INDEX_BUSY, INDEX_QUEUED, PURGED, ROTATE_DONE, ROTATE_HINT,
                        ROTATE_WARNING, SLACK_HINT, START_HINT)
@@ -216,6 +216,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help=pick_agent)
     p.add_argument("--from-stdin", action="store_true",
                    help="read the settings to change as SLACK_*=... lines from stdin instead of asking")
+    p = sub.add_parser("webhook", help="set an agent's webhook secret and print it once")
+    p.add_argument("name", nargs="?", help=pick_agent)
+    p.add_argument("--yes", action="store_true", help=no_confirm)
     p = sub.add_parser("rotate", help="replace an agent's and its workspace's keys")
     p.add_argument("name", nargs="?", help=pick_agent)
     p.add_argument("--yes", action="store_true", help=no_confirm)
@@ -331,6 +334,12 @@ def run_agent(args: argparse.Namespace, agents: Agents) -> int:
             return 0
         agents.set_slack(name, values)
         print(SLACK_HINT.format(name=name))
+    elif command == "webhook":
+        if (agents.get(name).env_set.get(WEBHOOK_VAR) and not args.yes
+                and not _confirm(f"{name} already has a webhook secret. Replace it? [y/N]")):
+            print(CANCELLED)
+            return 1
+        print(agents.set_webhook_secret(name))
     elif command == "rotate":
         if not args.yes and not _confirm(f"Issue new keys for {name} and revoke the old ones? {ROTATE_WARNING} [y/N]"):
             print(CANCELLED)

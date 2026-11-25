@@ -13,7 +13,7 @@ services:
     ports: !override
       - "127.0.0.1:${TEST_LITELLM_PORT:-14000}:4000"
     volumes:
-      - ${TEST_WORK:?run tests/run.sh}/litellm.yaml:/app/config.yaml:ro
+      - ${TEST_WORK:?run tests/run.sh}/${TEST_LITELLM_CONFIG:-litellm.yaml}:/app/config.yaml:ro
       - ./tests:/tests:ro
     environment:
       TYPESAFE_API_BASE: http://fake-jev:8001
@@ -62,6 +62,27 @@ services:
     environment:
       WORKSPACE_IDLE_MINUTES: "0.25"
       WORKSPACE_KEEP_FILES: ${TEST_WORKSPACE_KEEP_FILES:-false}
+      WORKSPACE_POLL_SECONDS: "2"
+
+  # Posts reviews to fake-github. Its webhook port is on 127.0.0.1 and per slot, like LiteLLM's.
+  agent-reviewer:
+    image: hermes-agent:test-${TEST_SLOT}
+    ports: !override
+      - "127.0.0.1:${TEST_REVIEWER_PORT:-14644}:8644"
+    environment:
+      GITHUB_API_URL: http://fake-github:8004
+    # The real managed config with a short coalesce window (see run.sh); Compose replaces the mount
+    # with the same target.
+    volumes:
+      - ${TEST_WORK}/reviewer-config.yaml:/etc/hermes/config.yaml:ro
+
+  # Like workspace-default; 2 GB because the production 8 GB doesn't fit next to the test stack.
+  workspace-reviewer:
+    image: hermes-workspace-reviewer:test-${TEST_SLOT}
+    mem_limit: 2g
+    environment:
+      WORKSPACE_IDLE_MINUTES: "0.25"
+      WORKSPACE_KEEP_FILES: "false"
       WORKSPACE_POLL_SECONDS: "2"
 
   # Serves the test repository run.sh creates with git daemon, from the workspace image (which has

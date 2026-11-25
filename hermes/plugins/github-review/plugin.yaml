@@ -1,0 +1,14 @@
+name: github-review
+version: "1.0"
+description: Binds each review session (webhook or review-queue cron job) to one pull request and commit, keeps the review queue, and posts one COMMENT review for it.
+kind: standalone
+provides_tools:
+  - prepare_workspace
+  - post_pr_review
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - on_session_end
+  - post_compaction
+  - pre_api_request
+  - post_tool_call

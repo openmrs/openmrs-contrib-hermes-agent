@@ -35,6 +35,25 @@ SECRET_FILES = {
 # JIRA_API_TOKEN, ATLASSIAN_OAUTH_ACCESS_TOKEN, ALLOW_GLOBAL_CRED_FALLBACK) would let callers act
 # without one.
 MCP_ATLASSIAN_ENV_ALLOWED = {"ATLASSIAN_OAUTH_ENABLE", "TOOLSETS", "ENABLED_TOOLS"}
+# Read-only binds an agent has beyond the four every agent has (target: source in the repository).
+AGENT_EXTRA_BINDS = {
+    "agent-reviewer": {
+        "/etc/hermes/config.yaml": "hermes/reviewer/config.yaml",
+        "/opt/data/plugins/github-review": "hermes/plugins/github-review",
+        "/opt/data/skills": "hermes/reviewer/skills",
+        "/opt/data/scripts": "hermes/reviewer/scripts",
+    },
+}
+# Named volumes an agent mounts read-only, and its workspace mounts read-write, beyond the above
+# (target: volume): the supervisor's answer to a reset request, which the agent reads directly.
+AGENT_EXTRA_VOLUMES = {"agent-reviewer": {"/opt/workspace-reset": "reviewer-reset"}}
+WORKSPACE_EXTRA_VOLUMES = {"workspace-reviewer": {"/reset-status": "reviewer-reset"}}
+# A workspace's cache volume, if not the shared workspace-cache. The reviewer builds untrusted PRs,
+# so it gets its own: a poisoned cache can't reach other agents.
+WORKSPACE_CACHE = {"workspace-reviewer": "reviewer-cache"}
+# Services that only start with a profile: the reviewer needs its agent's data and webhook secret,
+# which a host without a reviewer doesn't have.
+SERVICE_PROFILES = {"agent-reviewer": ["reviewer"], "workspace-reviewer": ["reviewer"]}
 
 
 def marker(secret):
@@ -94,9 +113,25 @@ for name, service in sorted(agents.items()):
     envs = [m for m in agents_data if m.get("target") == "/opt/data/.env"]
     souls = [m for m in service_mounts if m.get("target") == "/opt/data/SOUL.md"]
     configs = [m for m in service_mounts if m.get("target") == "/opt/data/config.yaml"]
-    check(f"{name}: mounts only its own agents-data subdirectory, .env, SOUL.md, and config.yaml",
-          len(service_mounts) == 4 and len(agents_data) == 2 and len(data) == 1 and len(envs) == 1
-          and len(souls) == 1 and len(configs) == 1, service_mounts)
+    extra_binds = AGENT_EXTRA_BINDS.get(name, {})
+    extras = [m for m in service_mounts if m.get("target") in extra_binds]
+    extra_volumes = AGENT_EXTRA_VOLUMES.get(name, {})
+    check(f"{name}: mounts only its own agents-data subdirectory, .env, SOUL.md, and config.yaml"
+          + (f", and {', '.join(sorted([*extra_binds, *extra_volumes]))}" if extra_binds or extra_volumes else ""),
+          len(service_mounts) == 4 + len(extra_binds) + len(extra_volumes) and len(agents_data) == 2 and len(data) == 1
+          and len(envs) == 1 and len(souls) == 1 and len(configs) == 1 and len(extras) == len(extra_binds),
+          service_mounts)
+    for target, volume in sorted(extra_volumes.items()):
+        found = [m for m in service_mounts if m.get("target") == target]
+        check(f"{name}: {target} is the {volume} volume, read-only",
+              len(found) == 1 and found[0].get("type") == "volume" and found[0].get("source") == volume
+              and found[0].get("read_only") is True, found)
+    for target, source in sorted(extra_binds.items()):
+        found = [m for m in extras if m.get("target") == target]
+        check(f"{name}: {target} is {source}, read-only",
+              len(found) == 1 and found[0].get("type") == "bind" and found[0].get("read_only") is True
+              and str(found[0].get("source", "")).replace("\\", "/").endswith(f"/{source}"),
+              found)
     check(f"{name}: agents-data subdirectory is {expected_subpath!r}",
           len(data) == 1 and data[0].get("type") == "volume"
           and (data[0].get("volume") or {}).get("subpath") == expected_subpath,
@@ -131,12 +166,23 @@ for name, service in sorted(workspaces.items()):
           network_names(service) == {"workspaces", "workspace-egress"}, sorted(network_names(service)))
     check(f"{name}: no published ports", not service.get("ports"), service.get("ports"))
     check(f"{name}: read-only root filesystem", service.get("read_only") is True, service.get("read_only"))
+    # The workspace user can write /run (reset requests), so it must not fill the host's memory.
+    run_tmpfs = [t for t in service.get("tmpfs") or [] if str(t).split(":")[0] == "/run"]
+    check(f"{name}: /run tmpfs has a size limit", len(run_tmpfs) == 1 and "size=" in str(run_tmpfs[0]), run_tmpfs)
     service_mounts = mounts(service)
     configs = [m for m in service_mounts if m.get("source") == "workspace-config"]
-    caches = [m for m in service_mounts if m.get("source") == "workspace-cache" and m.get("target") == "/cache"]
+    cache_volume = WORKSPACE_CACHE.get(name, "workspace-cache")
+    caches = [m for m in service_mounts if m.get("source") == cache_volume and m.get("target") == "/cache"]
     work = [m for m in service_mounts if m.get("target") == "/work" and not m.get("source")]
-    check(f"{name}: mounts only its own workspace-config subdirectory, the cache, and an anonymous /work",
-          len(service_mounts) == 3 and len(configs) == 1 and len(caches) == 1 and len(work) == 1, service_mounts)
+    extra_volumes = WORKSPACE_EXTRA_VOLUMES.get(name, {})
+    check(f"{name}: mounts only its own workspace-config subdirectory, the {cache_volume} cache, and an anonymous /work"
+          + (f", and {', '.join(sorted(extra_volumes))}" if extra_volumes else ""),
+          len(service_mounts) == 3 + len(extra_volumes) and len(configs) == 1 and len(caches) == 1 and len(work) == 1,
+          service_mounts)
+    for target, volume in sorted(extra_volumes.items()):
+        found = [m for m in service_mounts if m.get("target") == target]
+        check(f"{name}: {target} is the {volume} volume",
+              len(found) == 1 and found[0].get("type") == "volume" and found[0].get("source") == volume, found)
     check(f"{name}: workspace-config subdirectory is {expected_subpath!r}, read-only",
           len(configs) == 1 and configs[0].get("type") == "volume" and configs[0].get("read_only") is True
           and configs[0].get("target") == "/config"
@@ -146,6 +192,10 @@ for name, service in sorted(workspaces.items()):
         check(f"{name}: workspace-config subpath not shared", subpath not in config_subpaths,
               f"{subpath!r} also used by {config_subpaths.get(subpath)}")
         config_subpaths[subpath] = name
+
+for name, profiles in sorted(SERVICE_PROFILES.items()):
+    check(f"{name}: not started by default (profile {', '.join(profiles)})",
+          (services.get(name) or {}).get("profiles") == profiles, (services.get(name) or {}).get("profiles"))
 
 for name, service in services.items():
     check(f"{name}: no-new-privileges", "no-new-privileges:true" in (service.get("security_opt") or []),
@@ -157,10 +207,24 @@ for name, service in services.items():
             check(f"{name}: whole agents-data volume mounted only by admin", name == "admin", m)
         if m.get("source") == "workspace-config" and not (m.get("volume") or {}).get("subpath"):
             check(f"{name}: whole workspace-config volume mounted only by admin", name == "admin", m)
+        if m.get("source") == "reviewer-reset":
+            check(f"{name}: reviewer-reset mounted only by agent-reviewer and workspace-reviewer",
+                  name in ("agent-reviewer", "workspace-reviewer"), m)
         if str(m.get("source", "")).endswith("docker.sock"):
             check(f"{name}: no Docker socket", False, m)
     for secret in secrets(service):
         check(f"{name}: may receive secrets/{secret}", name in SECRET_FILES[secret])
+
+# GitHub must reach the reviewer's webhook, so its port is the one published on all addresses.
+for name, service in sorted(services.items()):
+    for port in service.get("ports") or []:
+        if port.get("host_ip") != "127.0.0.1":
+            check(f"{name}: a port on all addresses is only agent-reviewer's 8644",
+                  name == "agent-reviewer" and port.get("target") == 8644 and str(port.get("published")) == "8644", port)
+reviewer_ports = services.get("agent-reviewer", {}).get("ports") or []
+check("agent-reviewer: publishes only 8644, on all addresses",
+      [(p.get("host_ip") or "0.0.0.0", p.get("target"), str(p.get("published"))) for p in reviewer_ports]
+      == [("0.0.0.0", 8644, "8644")], reviewer_ports)
 
 admin, litellm, postgres = services.get("admin", {}), services["litellm"], services["postgres"]
 github_token = services.get("github-token", {})

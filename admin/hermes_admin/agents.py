@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -63,7 +64,8 @@ SLACK_TOKEN_VARS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
 SLACK_REQUIRED_VARS = (*SLACK_TOKEN_VARS, "SLACK_ALLOWED_USERS")
 SLACK_VARS = (*SLACK_REQUIRED_VARS, "SLACK_HOME_CHANNEL")
 KEY_VAR = "LITELLM_API_KEY"
-SECRET_VARS = (KEY_VAR, *SLACK_VARS)
+WEBHOOK_VAR = "WEBHOOK_SECRET"
+SECRET_VARS = (KEY_VAR, *SLACK_VARS, WEBHOOK_VAR)
 
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -339,6 +341,13 @@ class Agents:
         self._existing(name)
         self._write_env(name, values)
         return self.get(name)
+
+    def set_webhook_secret(self, name: str) -> str:
+        """Replace the agent's webhook secret with a new random one and return it."""
+        self._existing(name)
+        secret = secrets.token_hex(32)
+        self._write_env(name, {WEBHOOK_VAR: secret})
+        return secret
 
     def delete(self, name: str, purge: bool = False) -> None:
         """Revoke the agent's and its workspace's keys and remove their secrets. `purge` also deletes

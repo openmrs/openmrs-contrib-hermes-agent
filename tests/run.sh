@@ -16,7 +16,8 @@
 #
 # What it checks:
 #   1. compose.yaml separates secrets, volumes, and networks; every service has no-new-privileges
-#      and only the capabilities it needs (static).
+#      and only the capabilities it needs; only the reviewer's webhook port is published beyond
+#      127.0.0.1 (static).
 #   2. Admin tool: agent add/edit/rotate/slack/delete; key lockdown (no management API, no provider
 #      passthroughs, agent models only; workspace keys only /key/info); monthly budgets that survive
 #      rotation; per-key MCP access with the right credential and only that server's tools;
@@ -28,7 +29,7 @@
 #      come from `fast`; the read-only SOUL.md reaches the model; MCP reaches only granted servers;
 #      the terminal, file tools, and execute_code run in the workspace; the agent can't change its
 #      .env but sees admin's changes after a restart; it holds no other secrets and can't reach
-#      Postgres.
+#      Postgres; it has no webhook listener.
 #   6. tier_classifier.py internals: refuses router classifier models, follows Router rebuilds,
 #      declines re-entry.
 #   7. Classifier fallbacks: both fail -> heuristic; classifier model `auto` refused without
@@ -39,18 +40,45 @@
 #      tokens carry each level's permissions and repository limits, are reused, and need a valid,
 #      unrevoked key; the App key never reaches the agent or workspace; commits are authored as
 #      the bot.
-#  10. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
-#      run as an unprivileged user on a read-only root filesystem, with each JDK; a branch and a pull
-#      request clone from a local git server; the workspace can't read its configuration or reach
-#      LiteLLM or Postgres, and holds no agent secrets; going idle kills its processes and deletes
-#      its files except the caches, or with WORKSPACE_KEEP_FILES keeps /work, also across restarts.
-#      Then purging the agents removes all of their data.
+#  10. Workspaces: the default one has no browser; only the agent's key logs in, and the agent
+#      refuses a different host key; commands run as an unprivileged user on a read-only root
+#      filesystem, with each JDK; a branch and a pull request clone from a local git server; the
+#      workspace can't read its configuration or reach LiteLLM or Postgres, and holds no agent
+#      secrets; going idle kills its processes and deletes its files except the caches, or with
+#      WORKSPACE_KEEP_FILES keeps /work, also across restarts. Then purging the agents removes all
+#      of their data.
+#  11. Reviewer: its services start with the managed config, plugin, skills, and SOUL.md mounted;
+#      its workspace opens a page with agent-browser over SSH;
+#      prepare_workspace resets the workspace, also the reset-request directory (the terminal still
+#      works after), for one review at a time, in the order they asked (a waiter takes the workspace
+#      from a holder with no heartbeat, not from a live one; a waiter whose PR has a newer commit
+#      queued stops), with its own longer tool deadline, only for an open PR whose head is still the
+#      bound commit (read from GitHub with the github_review token), never for a PR and commit
+#      already reviewed, and fails when the workspace is down or a planted ~/.bashrc fakes the
+#      reset over SSH; the workspace rejects a reset request that is a symlink; a compacted session keeps its binding and
+#      the workspace;
+#      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
+#      commit the webhook prompt bound the session to, only after the workspace is prepared, and
+#      once per session and per (repository, PR, commit); GitHub's 422 for a line leaves a retry
+#      possible, any other 422 says not to retry, a refused connection records nothing, and
+#      an unknown outcome (a 5xx, an unreadable answer) counts as posted. The github-pr webhook route
+#      needs a valid signature, starts a run only for a ready, human-authored PR to a listed
+#      repository, after its coalesce window and for the newest of a PR's commits in it, and gives the
+#      model the reviewer's SOUL.md, the pr-review skill, and exactly its own tools; the model's first
+#      call, prepare_workspace, resets the workspace. The review queue: a bound session queues its PR;
+#      a newer commit replaces the entry; a post, a closed or draft PR, or a refusal GitHub would
+#      repeat removes it; an entry is free again once its session's stamp is stale (a failed run) unless
+#      a heartbeat renews it, and is dropped after its third session without a review; an unbound
+#      review-queue session can't use tools; the wake script skips entries already reviewed. The review-queue cron job skips the model on an empty queue (its
+#      wake script), and otherwise its session, in the gateway's process, takes the oldest free entry
+#      (never one for an unlisted repository) and prepares the workspace.
 #
 # Environment:
 #   COMPOSE            Compose command (default "docker compose"; e.g. "docker-compose")
 #   TEST_SLOT          Slot to use, 0-9 (default: the first free one); fails if another run has it
 #   TEST_LITELLM_PORT  Host port the test LiteLLM publishes (default 14000 plus the slot; not used by
 #                      the tests)
+#   TEST_REVIEWER_PORT Host port the test reviewer's webhook publishes (default 14644 plus the slot)
 
 set -euo pipefail
 
@@ -63,6 +91,7 @@ if ! read -r TEST_SLOT <&3; then
 fi
 export TEST_SLOT
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-$((14000 + TEST_SLOT))}"
+export TEST_REVIEWER_PORT="${TEST_REVIEWER_PORT:-$((14644 + TEST_SLOT))}"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
@@ -81,7 +110,7 @@ compose() {
 }
 
 cleanup() {
-  compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile admin --profile reviewer down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$TEST_WORK"
 }
 trap cleanup EXIT
@@ -229,15 +258,17 @@ agent_field() {
 }
 
 echo "== Setup"
-compose --profile admin down -v --remove-orphans >/dev/null 2>&1 || true
-python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml"
+compose --profile admin --profile reviewer down -v --remove-orphans >/dev/null 2>&1 || true
+# litellm-upstream.yaml, for the reviewer's webhook checks, sends the tier models to fake-anthropic.
+python3 "$root/tests/make_litellm_config.py" "$root/litellm/config.yaml" "$TEST_WORK/litellm.yaml" \
+  "$TEST_WORK/litellm-upstream.yaml"
 # Throwaway GitHub App key pair: github-token signs, fake-github verifies.
 openssl genrsa -out "$TEST_WORK/github-app.pem" 2048 2>/dev/null
 openssl rsa -in "$TEST_WORK/github-app.pem" -pubout -out "$TEST_WORK/github-app.pub.pem" 2>/dev/null
 # All levels share the test App. The test-only github_test_write checks that write permissions
 # and repository limits reach GitHub and that grants are enforced per level.
 github_key_base64="$(base64 < "$TEST_WORK/github-app.pem" | tr -d '\n')"
-for prefix in GITHUB_READ GITHUB_PR GITHUB_TEST_WRITE; do
+for prefix in GITHUB_READ GITHUB_PR GITHUB_REVIEW GITHUB_TEST_WRITE; do
   echo "${prefix}_APP_ID=12345"
   echo "${prefix}_INSTALLATION_ID=67890"
   echo "${prefix}_PRIVATE_KEY_BASE64=$github_key_base64"
@@ -247,6 +278,12 @@ levels = json.load(open(sys.argv[1]))
 levels["github_test_write"] = {"permissions": {"contents": "write", "metadata": "read", "pull_requests": "write"},
                                "repositories": ["openmrs-test-repo"]}
 json.dump(levels, open(sys.argv[2], "w"), indent=2)' "$root/github-token/levels.json" "$TEST_WORK/github-levels.json"
+# The reviewer's managed config with a 5-second coalesce window (30 at most), so the webhook checks
+# don't wait 15 minutes. Everything else is the real file.
+sed -e 's/^\( *window_seconds:\) 900$/\1 5/' -e 's/^\( *max_wait_seconds:\) 3600$/\1 30/' \
+  "$root/hermes/reviewer/config.yaml" > "$TEST_WORK/reviewer-config.yaml"
+grep -q '^ *window_seconds: 5$' "$TEST_WORK/reviewer-config.yaml" ||
+  { echo "hermes/reviewer/config.yaml has no 'window_seconds: 900' for the tests to shorten" >&2; exit 1; }
 # The workspace's test repository: `main` and a pull request (refs/pull/7/head) that differ in one
 # file, served by fake-git, which allows partial clones as GitHub does.
 git -c init.defaultBranch=main init -q "$TEST_WORK/repo"
@@ -274,14 +311,15 @@ else
 fi
 
 echo "== Starting LiteLLM"
-compose --profile admin build admin agent-default workspace-default github-token >/dev/null
+compose --profile admin --profile reviewer build admin agent-default workspace-default agent-reviewer workspace-reviewer \
+  github-token >/dev/null
 compose up -d --wait --wait-timeout 180 postgres litellm mcp-atlassian github-token fake-jev fake-atlassian \
   fake-onyx fake-anthropic \
   fake-github fake-git >/dev/null
 
 echo "== 2. Admin tool"
 expect "agent servers lists the configured MCP servers" '["atlassian_confluence_write", "atlassian_jira_write", "atlassian_read", "onyx_search"]' "$(admin agent servers --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
-expect "agent levels lists the GitHub access levels" '["github_pr", "github_read", "github_test_write"]' "$(admin agent levels --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
+expect "agent levels lists the GitHub access levels" '["github_pr", "github_read", "github_review", "github_test_write"]' "$(admin agent levels --json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)))')"
 expect_ok "agent add default (atlassian_read, github_read, with Slack)" admin_stdin \
   'SLACK_BOT_TOKEN=xoxb-test\nSLACK_APP_TOKEN=xapp-test\nSLACK_ALLOWED_USERS=U1\n' \
   agent add default --mcp atlassian_read --github github_read --from-stdin
@@ -507,6 +545,19 @@ expect "agent slack keeps the other settings" "SLACK_ALLOWED_USERS=U2 SLACK_BOT_
   "$(admin_sh 'grep -E "^SLACK_(ALLOWED_USERS|BOT_TOKEN)=" /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
 expect "agent slack keeps the agent's key" "$reader_key" "$(agent_key default)"
 
+webhook_secret="$(admin agent webhook default --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "agent webhook prints a 64-character hex secret" "64" "$(printf '%s' "$webhook_secret" | wc -c | tr -d ' ')"
+expect "agent webhook writes the same secret to .env" "$webhook_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+expect_refused "agent webhook asks before replacing a secret" admin agent webhook default </dev/null
+expect "a refused replacement keeps the secret" "$webhook_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+new_webhook_secret="$(admin agent webhook default --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "agent webhook --yes replaces the secret" "different" \
+  "$([ -n "$new_webhook_secret" ] && [ "$new_webhook_secret" != "$webhook_secret" ] && echo different || echo same)"
+expect "the replacement is in .env" "$new_webhook_secret" "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/default/.env")"
+expect "agent webhook keeps the other settings and the agent's key" "$reader_key" "$(agent_key default)"
+
 expect_refused "agent delete needs confirmation without --yes" admin agent delete nobody </dev/null
 expect_refused "agent delete refuses an answer other than y" admin_stdin 'n\n' agent delete nobody
 # Without a TTY (bin/admin passes -T when output is redirected), the answer still comes from stdin.
@@ -706,6 +757,13 @@ if compose exec -T agent-default python3 -c 'import socket; socket.create_connec
 else
   pass "agent can't reach Postgres"
 fi
+# The reviewer's webhook route is in its own managed config only.
+if compose exec -T litellm python3 -c 'import socket; socket.create_connection(("agent-default", 8644), timeout=3)' \
+  >/dev/null 2>&1; then
+  fail "agent-default has no listener on 8644"
+else
+  pass "agent-default has no listener on 8644"
+fi
 # admin replaces .env with a new file, which the agent's mount only picks up on restart.
 expect_ok "agent slack sets the home channel" admin_stdin 'SLACK_HOME_CHANNEL=C0TEST\n' agent slack default --from-stdin
 compose restart agent-default >/dev/null
@@ -795,7 +853,7 @@ ws() {
   compose exec -T -u "${HERMES_UID:-10000}" agent-default \
     ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-default "$1"
 }
-expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_test_write: configured" \
+expect "github-token has credentials for each level" "github_read: configured github_pr: configured github_review: configured github_test_write: configured" \
   "$(compose exec -T github-token python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/healthz").read().decode())' 2>&1 |
     tr '\n' ' ' | sed 's/ *$//')"
 expect "workspace gh is the pinned version" "2.103.3" \
@@ -829,6 +887,13 @@ token_request() {
     fi'
 
 }
+# github_review is for agent keys only: granted to writer, its agent key gets a token and its
+# workspace key doesn't.
+expect_ok "agent edit writer github_test_write, github_review" admin agent edit writer --github github_test_write,github_review
+expect "a workspace key is refused an agent-only level (403)" "403" "$(token_request "$(workspace_key writer)" github_review)"
+expect "an agent key gets an agent-only level" "200" "$(token_request "$writer_key" github_review)"
+expect "github_review token: pull_requests write, metadata read, the three repositories" "1" \
+  "$(log_count_fixed fake-github 'permissions={"metadata":"read","pull_requests":"write"} repositories=["openmrs-esm-patient-chart","openmrs-esm-patient-management","openmrs-core"]')"
 expect "a granted write level gets a token" "200" "$(token_request "$writer_key" github_test_write)"
 expect "write token: write permissions, limited to the level's repositories" "1" \
   "$(log_count_fixed fake-github 'permissions={"contents":"write","metadata":"read","pull_requests":"write"} repositories=["openmrs-test-repo"]')"
@@ -838,7 +903,7 @@ expect "no key is refused (401)" "401" "$(token_request "" github_read)"
 expect "an unknown key is refused (401)" "401" "$(token_request "sk-not-a-key" github_read)"
 expect "a revoked key is refused even though it had the grant (401)" "401" "$(token_request "$new_nobody_key" github_read)"
 expect "an unknown level is refused (404)" "404" "$(token_request "$reader_key" github_admin)"
-expect "github-token asked GitHub for exactly two tokens" "2" "$(log_count fake-github "^mint ")"
+expect "github-token asked GitHub for exactly three tokens" "3" "$(log_count fake-github "^mint ")"
 # A line of the PEM and a stretch of its base64 form, from the middle where they're unique to
 # this key.
 github_key_markers="$(sed -n 5p "$TEST_WORK/github-app.pem")
@@ -855,6 +920,8 @@ expect "workspace environment and files hold no GitHub App key (markers, files)"
     rm /tmp/markers /tmp/workspace-env' || echo error)"
 
 echo "== 10. Workspaces"
+expect "workspace-default has no browser or agent-browser" "" \
+  "$(ws 'command -v agent-browser; command -v chromium; true' 2>&1)"
 expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \
   "$(ws 'id -u; touch /etc/x 2>/dev/null || echo read-only' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 expect "workspace has each JDK, 21 by default, and Maven and Node" "21.0 1.8 11.0 17.0 21.0 ok" \
@@ -941,6 +1008,266 @@ expect_ok "agent delete --purge an agent that has run" admin agent delete defaul
 expect "purge removes all of a run agent's data and its workspace configuration" "absent absent" \
   "$(admin_sh 'for p in /agents/default /workspaces/default; do test -e $p && echo present || echo absent; done' |
     tr '\n' ' ' | sed 's/ $//')"
+
+echo "== 11. Reviewer"
+expect_ok "agent add reviewer (github_read, github_review)" admin agent add reviewer --github github_read,github_review
+reviewer_secret="$(admin agent webhook reviewer --yes | grep -E -x '[0-9a-f]{64}' || true)"
+expect "reviewer's .env holds only its key, the workspace host, and the webhook secret" \
+  "LITELLM_API_KEY TERMINAL_SSH_HOST WEBHOOK_SECRET" \
+  "$(admin_sh 'cut -d= -f1 /agents/reviewer/.env | sort | tr "\n" " "' | sed 's/ $//')"
+expect "reviewer's webhook secret is the one admin printed" "$reviewer_secret" \
+  "$(admin_sh "sed -n 's/^WEBHOOK_SECRET=//p' /agents/reviewer/.env")"
+# The reviewer's services start only with their profile.
+if compose --profile reviewer up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null &&
+  compose --profile reviewer up -d --no-deps agent-reviewer >/dev/null; then
+  pass "reviewer services start"
+else
+  fail "reviewer services start"
+fi
+# Over SSH, as the agent runs commands: Docker's ENV doesn't reach login sessions.
+expect "reviewer's workspace opens a page with agent-browser" "Workspace browser check" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+    ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer '
+    mkdir -p ~/site && echo "<title>Workspace browser check</title>" > ~/site/index.html
+    python3 -m http.server 8765 --bind 127.0.0.1 -d ~/site >/dev/null 2>&1 &
+    server=$!
+    for _ in $(seq 1 20); do
+      python3 -c "import socket; socket.create_connection((\"127.0.0.1\", 8765), timeout=1)" 2>/dev/null && break
+      sleep 0.5
+    done
+    agent-browser open http://127.0.0.1:8765/ >/dev/null 2>&1 && agent-browser get title 2>/dev/null
+    agent-browser close >/dev/null 2>&1
+    kill $server; rm -rf ~/site' 2>/dev/null)"
+# sshd and the supervisor keep their files in /run, which is small because the workspace user can
+# write to it.
+expect "workspace-reviewer's /run is a 16 MB tmpfs, mostly free after a browser run" "16384 yes" \
+  "$(compose exec -T workspace-reviewer df -k /run | awk 'NR == 2 {print $2, ($3 < $2 / 2 ? "yes" : "no (" $3 " KB used)")}')"
+# The gateway gets this far only with the read-only skills and plugin mounts in place.
+context=""
+for _ in $(seq 1 60); do
+  context="$(compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
+    sed -n 's/.*Model context warmed: auto -> \([0-9]*\) tokens.*/\1/p' | tail -n 1 || true)"
+  [ -n "$context" ] && break
+  sleep 3
+done
+expect "reviewer gateway starts (auto context length)" "$expected_context" "$context"
+expect "reviewer's SOUL.md is hermes/souls/reviewer.md" "$(shasum -a 256 < "$root/hermes/souls/reviewer.md" | cut -d' ' -f1)" \
+  "$(compose exec -T agent-reviewer cat /opt/data/SOUL.md | shasum -a 256 | cut -d' ' -f1)"
+expect "reviewer's managed config applies over hermes/config.yaml" "150 false" \
+  "$(compose exec -T agent-reviewer sh -c 'echo $(hermes config get agent.max_turns) $(hermes config get memory.memory_enabled)' 2>&1)"
+# skills_list is the agent's own tool; `hermes skills list` fails on the read-only skills directory.
+expect "reviewer's skills are only hermes/reviewer/skills" "pr-review" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python -c 'import json
+from model_tools import handle_function_call
+print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
+expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
+expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
+expect_refused "reviewer can't write the workspace's reset answer" compose exec -T agent-reviewer sh -c 'echo x > /opt/workspace-reset/reset-done'
+# Ending a terminal session copies changed files in the workspace's .hermes back to the agent
+# (sync_back), also into skills/: a changed skill file, and a new file next to it. The read-only
+# mount makes that copy fail without a trace.
+skill_hash="$(shasum -a 256 < "$root/hermes/reviewer/skills/pr-review/SKILL.md" | cut -d' ' -f1)"
+expect "workspace's copy of the pr-review skill changed and a file planted next to it, session ended" \
+  "pushed=yes changed_in_workspace=yes" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_sync_back.py" 2>/dev/null |
+    tail -n 1)"
+expect "the workspace's changes don't reach the reviewer's skills" "$skill_hash absent" \
+  "$(compose exec -T agent-reviewer sh -c 'echo $(sha256sum < /opt/data/skills/pr-review/SKILL.md | cut -d" " -f1) $(
+    test -e /opt/data/skills/pr-review/planted.md && echo present || echo absent)')"
+# The agent has no healthcheck: it is healthy when it still runs and its webhook listener accepts.
+expect "reviewer is still running, with its webhook listener, after sync_back" "running listening" \
+  "$(compose ps --format '{{.State}}' agent-reviewer) $(compose exec -T agent-reviewer python3 -c \
+    'import socket; socket.create_connection(("127.0.0.1", 8644), timeout=3); print("listening")' 2>/dev/null)"
+# Each successful prepare_workspace below (twenty-six of them) is one reset on request.
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+expect "prepare_workspace and post_pr_review: one review at a time, in order, only for the bound, prepared PR, once; the review queue" \
+  "deadline=extended j=prepared j-reset=clean k=waited s=prepared s-fast=yes s-old=refused p-before=blocked p=prepared p-after=ran p-taken=blocked p-unbound=ran l=refused a0=prepared a=posted b=refused q-unlocked=yes q-second=busy q=posted c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused r=github-422-final r-queue=none t1=unsent t2=posted m1=refused m2=posted n1=refused n2=prepared v=1:review-v v2=2:review-v2 v-end=2:None w1=superseded w2=prepared x=in-order y=posted:none z-gate=wake z0=none:refused z1=pr60 z2=pr61 z3=empty z3-prepare=refused z3-terminal=blocked z-unlisted=dropped z-gate-after=sleep z1-prepare=prepared z1-end=2:None aa=3:review-aa aa-end=none cc-gate=wake cc=pr65 dd-stale=wake dd=sleep ee=sleep ff=1:ff-live bb1=closed:none bb2=superseded:f:0:None bb3=prepared bb4=draft:none bb5=refused:1:review-bb5" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1)"
+expect "workspace-reviewer resets once per prepare_workspace" "26" \
+  "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
+review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
+  'curl -sf -H "Authorization: Bearer $KEY" http://github-token:8080/token/github_review' || true)"
+expect "the reviewer's key gets a github_review token" "yes" \
+  "$(printf '%s' "$review_token" | grep -Eqx 'ghs_test_[0-9]+' && echo yes || echo "no: '$review_token'")"
+expect "review: the bound PR and commit, COMMENT, both comments, a github_review token" "1" \
+  "$(log_count fake-github "^review repo=openmrs/openmrs-esm-patient-chart pr=11 commit=$(printf 'a%.0s' $(seq 40)) event=COMMENT comments=2 token=${review_token}\$")"
+expect "review ignores repo, pr_number, commit_id, and event in the parameters" "1" \
+  "$(log_count fake-github "^review repo=openmrs/openmrs-core pr=13 commit=$(printf 'f%.0s' $(seq 40)) event=COMMENT comments=1 token=${review_token}\$")"
+expect "review is posted again after GitHub's 422" "2" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-management pr=14 commit=$(printf '1%.0s' $(seq 40)) event=COMMENT ")"
+expect "GitHub's 500 and a non-JSON answer each reach GitHub once, with no retry" "1 1" \
+  "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=15 ") $(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=16 ")"
+expect "refused reviews never reach GitHub" "11" "$(log_count fake-github "^review ")"
+expect "prepare_workspace reads the pull request from GitHub with the github_review token" "1" \
+  "$(log_count fake-github "^pull repo=openmrs/openmrs-esm-patient-chart pr=42 token=${review_token}\$")"
+expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "9 ${HERMES_UID:-10000}" \
+  "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
+    echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
+# A build leaves a ~/.bashrc that, before every command sshd runs, makes `mv` swallow the reset
+# request and `cat` print its nonce. prepare_workspace reads the answer from the reviewer-reset
+# volume, not over SSH, so it refuses. Checked within the 15-second idle limit.
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+  ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer \
+  'cat > ~/.bashrc' >/dev/null 2>&1 <<'BASHRC' || true
+mv() { command cp "$2" ~/.nonce; command rm -f "$2"; }
+cat() { command cat ~/.nonce; }
+BASHRC
+expect "a planted .bashrc that fakes the reset: prepare_workspace refuses" "prepare=refused swallowed" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - bashrc < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1) $(compose exec -T workspace-reviewer sh -c 'test -s /work/home/.nonce && echo swallowed || echo "not swallowed"')"
+compose stop workspace-reviewer >/dev/null
+expect "prepare_workspace fails while the workspace is down, so post_pr_review refuses" "prepare=refused post=refused" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - stopped < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1)"
+compose --profile reviewer up -d --wait --wait-timeout 180 workspace-reviewer >/dev/null
+# As the workspace user, a symlink to the workspace's LiteLLM key as the reset request: the
+# supervisor deletes it without following it or resetting. Checked within the 15-second idle limit.
+rejected_before="$(log_count_fixed workspace-reviewer "rejected a reset request")"
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+  ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer \
+  'echo x > ~/kept && ln -s /config/litellm_key /run/workspace-reset/request' >/dev/null 2>&1 || true
+sleep 6
+expect "a symlinked reset request is deleted and logged, without a reset or the key in reset-done" "1 0 deleted /work/home/kept clean" \
+  "$(($(log_count_fixed workspace-reviewer "rejected a reset request") - rejected_before)) $(($(log_count_fixed workspace-reviewer "reset on request") - resets_before)) $(
+    compose exec -T workspace-reviewer sh -c '[ -L /run/workspace-reset/request ] || echo deleted; ls /work/home/kept
+      grep -qF -f /config/litellm_key /reset-status/reset-done 2>/dev/null && echo leaked || echo clean' 2>&1 |
+    tr '\n' ' ' | sed 's/ $//')"
+
+# The webhook route. The tier models now go to fake-anthropic, which logs what the model gets and
+# answers with plain text, so an accepted run ends without calling a tool.
+export TEST_LITELLM_CONFIG=litellm-upstream.yaml
+restart_litellm
+# Prints a pull_request event: action, draft, author type, repository, PR number, and the head
+# commit's repeated character (default c, the head fake-github reports). The PR's title, body, and
+# author carry PR-TEXT-MARKER, which must never reach the model.
+pr_event() {
+  printf '{"action": "%s", "number": %s, "repository": {"full_name": "%s"}, "pull_request": {"number": %s, "draft": %s,
+    "user": {"login": "PR-TEXT-MARKER-login", "type": "%s"}, "head": {"sha": "%s"}, "base": {"ref": "main"},
+    "html_url": "https://github.com/%s/pull/%s", "title": "PR-TEXT-MARKER title", "body": "PR-TEXT-MARKER body"}}' \
+    "$1" "$5" "$4" "$5" "$2" "$3" "$(printf "${6:-c}%.0s" $(seq 40))" "$4" "$5"
+}
+# Sends an event, signed with the reviewer's secret, from inside the agents network; prints the
+# HTTP status and the answer's status and reason.
+webhook() {
+  printf '%s' "$1" | compose exec -T litellm python3 /tests/webhook_post.py \
+    http://agent-reviewer:8644/webhooks/github-pr "$reviewer_secret" pull_request "${@:2}"
+}
+# Requests that offer post_pr_review are the reviewer's own turns; side tasks offer no tools.
+review_requests() {
+  log_count fake-anthropic "anthropic request .* tools=[^ ]*post_pr_review"
+}
+# fake-anthropic answers a review's first request with a prepare_workspace call, and logs its result.
+tool_results() {
+  log_count fake-anthropic "anthropic tool_result "
+}
+chart=openmrs/openmrs-esm-patient-chart
+model_before="$(log_count fake-anthropic "anthropic request")"
+expect "webhook: a draft PR is ignored" "200 ignored filter" "$(webhook "$(pr_event opened true User "$chart" 21)")"
+expect "webhook: a bot's PR is ignored" "200 ignored filter" "$(webhook "$(pr_event opened false Bot "$chart" 22)")"
+expect "webhook: an unlisted repository is ignored" "200 ignored filter" \
+  "$(webhook "$(pr_event opened false User openmrs/openmrs-module-fhir2 23)")"
+expect "webhook: a bad signature is refused" "401" "$(webhook "$(pr_event opened false User "$chart" 25)" --bad-signature)"
+expect "webhook: the published port answers on 127.0.0.1" "401" \
+  "$(pr_event opened false User "$chart" 25 | python3 "$root/tests/webhook_post.py" \
+    "http://127.0.0.1:$TEST_REVIEWER_PORT/webhooks/github-pr" "$reviewer_secret" pull_request --bad-signature)"
+expect "webhook: ignored and refused events reach no model" "$model_before" "$(log_count fake-anthropic "anthropic request")"
+review_before="$(review_requests)"
+results_before="$(tool_results)"
+tool_uses_before="$(log_count fake-anthropic "anthropic tool_use ")"
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+# Every accepted event waits in the route's coalesce window (5 s in the tests), then starts a review.
+expect "webhook: a new PR (opened) is accepted, to start a review after the coalesce window" "202 coalesced" \
+  "$(webhook "$(pr_event opened false User "$chart" 26)")"
+for _ in $(seq 1 60); do
+  [ "$(tool_results)" -gt "$results_before" ] && break
+  sleep 3
+done
+expect "webhook: the review reaches the model, before and after its tool call" "2" "$(($(review_requests) - review_before))"
+expect "webhook: the model's first tool call is prepare_workspace, which succeeds and resets the workspace" \
+  "name=prepare_workspace success=True 1" \
+  "$(grep -E "anthropic tool_use " "$TEST_WORK/fake-anthropic.log" | sed -n "$((tool_uses_before + 1))s/.* //p") $(
+    grep -E "anthropic tool_result " "$TEST_WORK/fake-anthropic.log" | sed -n "$((results_before + 1))s/.* //p") $((
+    $(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
+review_line="$(grep -E "anthropic request .* tools=[^ ]*post_pr_review" "$TEST_WORK/fake-anthropic.log" | tail -n 1 || true)"
+expect "webhook: the model gets the reviewer's SOUL.md and the pr-review skill, but not the PR's title, body, or author" \
+  "soul_marker=True skill_marker=True pr_text_marker=False" \
+  "$(printf '%s' "$review_line" | sed -nE 's/.*(soul_marker=[A-Za-z]+ skill_marker=[A-Za-z]+ pr_text_marker=[A-Za-z]+).*/\1/p')"
+# Exactly the route's toolsets: no memory, skill, MCP, or tool-search tools (tool_search would hide
+# the others behind it).
+expect "webhook: the review has exactly the terminal, file, and github_review tools" \
+  "patch,post_pr_review,prepare_workspace,process_manage,read_file,search_files,terminal,write_file" \
+  "$(printf '%s' "$review_line" | sed -nE 's/.* tools=([^ ]*).*/\1/p' | tr , '\n' | sort | paste -sd , -)"
+expect "webhook: a PR marked ready for review is accepted, to start a review" "202 coalesced" \
+  "$(webhook "$(pr_event ready_for_review false User "$chart" 27)")"
+# Each run ends when the model answers with text, which the route's `deliver: log` writes.
+answered=0
+for _ in $(seq 1 60); do
+  answered="$(compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
+    grep -c "\[webhook\] Response for .*: cache-check-answered" || true)"
+  [ "${answered:-0}" -ge 2 ] && break
+  sleep 3
+done
+expect "webhook: both accepted runs end with the model's answer" "2" "$answered"
+expect "webhook: each run resets the workspace" "2" \
+  "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
+agent_log() {
+  compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/agent.log 2>/dev/null'
+}
+# Two new commits to one PR within the window start one review, for the newer commit (fake-github
+# reports PR 28's head as e...e, so prepare_workspace goes ahead).
+expect "webhook: new commits (synchronize) are accepted and coalesced" "202 coalesced 202 coalesced" \
+  "$(webhook "$(pr_event synchronize false User "$chart" 28 d)") $(webhook "$(pr_event synchronize false User "$chart" 28 e)")"
+for _ in $(seq 1 60); do
+  answered="$(compose exec -T agent-reviewer sh -c 'cat /opt/data/logs/gateway.log 2>/dev/null' |
+    grep -c "\[webhook\] Response for .*: cache-check-answered" || true)"
+  [ "${answered:-0}" -ge 3 ] && break
+  sleep 3
+done
+expect "webhook: two commits in the window start one review, queued for the newer commit, which resets the workspace" \
+  "3 1 1 0 3" \
+  "$answered $(agent_log | grep -cF "coalesce settled group=github-pr|$chart#28 events=2") $(
+    agent_log | grep -cE "github-review: session .* queued $chart#28@e{40}, session 1") $(
+    agent_log | grep -cE "github-review: session .* queued $chart#28@d{40}") $((
+    $(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
+
+# The review-queue cron job, created as README.md says (every minute here, not 15). With an empty
+# queue its wake script skips the model; with a free entry, the job's session takes it, in the
+# gateway's own process (so the same lock), and prepares the workspace.
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer sh -c 'echo "{}" > /opt/data/github-review/queue.json'
+compose exec -T agent-reviewer hermes cron create --name review-queue --skill pr-review \
+  --script review-queue-check.py --deliver local 'every 1m' \
+  'REVIEW-QUEUE-WORKER: review the next pull request in the review queue.' >/dev/null 2>&1
+expect "review-queue job: created, owned by the Hermes user" "${HERMES_UID:-10000}" \
+  "$(compose exec -T agent-reviewer stat -c %u /opt/data/cron/jobs.json 2>&1)"
+for _ in $(seq 1 80); do
+  agent_log | grep -q "Job 'review-queue' (ID: [^)]*): wakeAgent=false, skipping agent run" && break
+  sleep 3
+done
+expect "review-queue job: an empty queue skips the model" "skipped" \
+  "$(agent_log | grep -q "Job 'review-queue' (ID: [^)]*): wakeAgent=false, skipping agent run" && echo skipped)"
+results_before="$(tool_results)"
+resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer python3 -c 'import json, sys
+json.dump({sys.argv[1] + "#29": {"sha": "c" * 40, "queued": 1, "attempts": 0, "owner": None}},
+          open("/opt/data/github-review/queue.json", "w"))' "$chart"
+for _ in $(seq 1 80); do
+  [ "$(tool_results)" -gt "$results_before" ] && break
+  sleep 3
+done
+gateway_pid="$(agent_log | sed -nE "s|.*github-review: session .* \\(pid ([0-9]+)\\) queued $chart#28@.*|\\1|p" | sort -u | paste -sd , -)"
+expect "review-queue job: takes the free entry in the gateway's process, and prepares the workspace" \
+  "1 $gateway_pid success=True 1" \
+  "$(agent_log | grep -cE "github-review: session .* took $chart#29@c{40} from the review queue, session 1") $(
+    agent_log | sed -nE "s|.*github-review: session .* \(pid ([0-9]+)\) took $chart#29@.*|\1|p" | sort -u | paste -sd , -) $(
+    grep -E "anthropic tool_result " "$TEST_WORK/fake-anthropic.log" | sed -n "$((results_before + 1))s/.* //p") $((
+    $(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
+compose exec -T agent-reviewer sh -c 'hermes cron list 2>/dev/null' | sed -nE 's/^ *([0-9a-f]{12}) \[.*/\1/p' |
+  while read -r job; do compose exec -T agent-reviewer hermes cron remove "$job" >/dev/null 2>&1 || true; done
+unset TEST_LITELLM_CONFIG
+restart_litellm
+compose stop agent-reviewer workspace-reviewer >/dev/null
 
 echo
 if [ "$failures" -eq 0 ]; then
