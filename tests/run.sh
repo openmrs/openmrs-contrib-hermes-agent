@@ -41,10 +41,12 @@
 #      tokens carry each level's permissions and repository limits, are reused, and need a valid,
 #      unrevoked key; the App key never reaches the agent or workspace; commits are authored as
 #      the bot.
-#  10. Board page: only users the OIDC provider logs in reach the dashboard and its API; it shares the
-#      agent's boards, and the agent, not the page, runs their tasks; its chat has only Kanban and
-#      read-only tools and only `fast`; it holds no agent secrets, can't reach the agent's services,
-#      and its cookies are Secure behind an HTTPS proxy.
+#  10. Board page: only kanban-web's port is reachable; only users the OIDC provider logs in reach the
+#      Kanban tab and the board chat, and nothing else of the dashboard (secrets, settings, files,
+#      cron, profiles, its terminal chat); it shares the agent's boards, and the agent, not the page,
+#      runs their tasks; the chat has only Kanban and read-only tools, only `fast`, and no commands; the
+#      page holds no agent secrets, can't reach the agent's services, and its cookies are Secure
+#      behind an HTTPS proxy.
 #  11. Workspaces: only the agent's key logs in, and the agent refuses a different host key; commands
 #      run as an unprivileged user on a read-only root filesystem, with each JDK; a branch and a pull
 #      request clone from a local git server; the workspace can't read its configuration or reach
@@ -71,8 +73,6 @@ fi
 export TEST_SLOT
 export TEST_LITELLM_PORT="${TEST_LITELLM_PORT:-$((14000 + TEST_SLOT))}"
 export TEST_BOARD_PORT="${TEST_BOARD_PORT:-$((19119 + TEST_SLOT))}"
-# boards-egress gets its own subnet per slot, apart from the stack's (compose.yaml's default).
-export BOARDS_SUBNET="172.31.24${TEST_SLOT}.0/24" BOARDS_GATEWAY="172.31.24${TEST_SLOT}.1"
 # Exported to override the repository's .env, which Compose also reads.
 export GIT_BOT_NAME="test-app[bot]" GIT_BOT_EMAIL="1+test-app[bot]@users.noreply.github.com"
 master_key="sk-test-master"
@@ -550,10 +550,15 @@ expect_refused "agent board refuses --revoke with other changes" admin agent boa
 expect "a refused agent board changes nothing" "0" "$(agent_field default board_keys)"
 expect_ok "agent board default (atlassian_read)" admin agent board default --mcp atlassian_read
 board_key_default="$(board_key default)"
-expect "board page .env: mode 600, owned by the Hermes user, holding only its key" "600 10000 LITELLM_API_KEY" \
-  "$(admin_sh 'stat -c "%a %u" /boards/default/.env; cut -d= -f1 /boards/default/.env' | tr '\n' ' ' | sed 's/ $//')"
-expect "board page home and the agent's board directory are the Hermes user's" "755 10000 755 10000" \
-  "$(admin_sh 'stat -c "%a %u" /boards/default /agents/default/kanban-shared' | tr '\n' ' ' | sed 's/ $//')"
+expect "board page .env: mode 600, owned by the Hermes user, holding only its LiteLLM and API server keys" \
+  "600 10000 API_SERVER_KEY LITELLM_API_KEY" \
+  "$(admin_sh 'stat -c "%a %u" /boards/default/.env; cut -d= -f1 /boards/default/.env | sort' | tr '\n' ' ' | sed 's/ $//')"
+expect "board page home, its proxy's key, and the agent's board directory are the Hermes user's" \
+  "755 10000 700 10000 600 10000 755 10000" \
+  "$(admin_sh 'stat -c "%a %u" /boards/default /boards/default/web /boards/default/web/api-server-key /agents/default/kanban-shared' |
+    tr '\n' ' ' | sed 's/ $//')"
+expect "the proxy's API server key is the page's" "same" \
+  "$(admin_sh '[ "$(cat /boards/default/web/api-server-key)" = "$(sed -n "s/^API_SERVER_KEY=//p" /boards/default/.env)" ] && echo same || echo different')"
 expect "board page key: one, not the agent's, granted atlassian_read" "1 different atlassian_read True" \
   "$(agent_field default board_keys) $([ -n "$board_key_default" ] && [ "$board_key_default" != "$reader_key" ] && echo different || echo same) $(agent_field default board_mcp_servers) $(agent_field default has_board_page)"
 expect "board page budget: the default, on its own LiteLLM user, apart from the agent's" "50.0 1mo 1000.0" \
@@ -587,9 +592,9 @@ writer_board_key="$(board_key writer)"
 expect "a board page with no MCP servers is denied atlassian_read" "denied" "$(atlassian_call "$writer_board_key" "$atlassian_read_id")"
 expect_refused "agent board --revoke needs confirmation without --yes" admin agent board writer --revoke </dev/null
 expect_ok "agent board writer --revoke" admin agent board writer --revoke --yes
-expect "agent board --revoke revokes the key and removes it from the page's .env, keeping the budget" "401 0 False  50.0" \
+expect "agent board --revoke revokes the key and removes both keys from the page, keeping the budget" "401 0 False  50.0" \
   "$(request GET /v1/models "$writer_board_key") $(agent_field writer board_keys) $(agent_field writer has_board_page) $(
-    board_key writer) $(agent_field writer board_budget)"
+    admin_sh 'cat /boards/writer/.env /boards/writer/web/api-server-key 2>/dev/null') $(agent_field writer board_budget)"
 
 expect_refused "agent delete needs confirmation without --yes" admin agent delete nobody </dev/null
 expect_refused "agent delete refuses an answer other than y" admin_stdin 'n\n' agent delete nobody
@@ -951,28 +956,37 @@ expect "workspace environment and files hold no GitHub App key (markers, files)"
     rm /tmp/markers /tmp/workspace-env' || echo error)"
 
 echo "== 10. Board page"
-# agent-default is running (section 9); default's board page key is from section 2.
-compose --profile boards up -d --wait --wait-timeout 180 fake-oidc fake-openai board-default >/dev/null
-# From fake-oidc, on boards-egress like a user's proxy: is the dashboard serving yet?
+# agent-default is running (section 9); default's board page key is from section 2. kanban-web-default
+# brings up board-default, in whose network namespace it runs.
+compose --profile boards up -d --wait --wait-timeout 180 fake-oidc fake-openai kanban-web-default >/dev/null
+# From fake-oidc, on boards-egress like a user's proxy: is the page serving yet?
 board_ready=no
 for _ in $(seq 1 60); do
   if compose exec -T fake-oidc /opt/hermes/.venv/bin/python -c \
-    'import urllib.request; urllib.request.urlopen("http://board-default:9119/api/status", timeout=5)' >/dev/null 2>&1; then
+    'import urllib.request; urllib.request.urlopen("http://board-default:8080/api/status", timeout=5)' >/dev/null 2>&1; then
     board_ready=yes
     break
   fi
   sleep 3
 done
-expect "board page starts, with the OIDC provider as its only way in" "yes" "$board_ready"
+expect "board page serves through kanban-web" "yes" "$board_ready"
+expect "only kanban-web's port is reachable: the dashboard and API server listen inside the page only" \
+  "reachable unreachable unreachable" \
+  "$(compose exec -T fake-oidc sh -c 'for port in 8080 9119 8642; do
+    /opt/hermes/.venv/bin/python -c "import socket, sys; socket.create_connection((\"board-default\", int(sys.argv[1])), timeout=3)" \
+      $port 2>/dev/null && echo reachable || echo unreachable; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 task_title="board page task $$"
-compose exec -T fake-oidc /opt/hermes/.venv/bin/python /tests/board_page_checks.py http://board-default:9119 "$task_title" \
+compose exec -T fake-oidc /opt/hermes/.venv/bin/python /tests/board_page_checks.py http://board-default:8080 "$task_title" \
   > "$TEST_WORK/board-page" 2>&1 || true
 board_check() { sed -n "s|^$1: ||p" "$TEST_WORK/board-page"; }
-for path in /api/plugins/kanban/board /api/env /api/config /api/sessions /api/cron/jobs; do
-  expect "board page refuses $path without a login" "401" "$(board_check "anonymous $path")"
+expect "board page refuses the board without a login" "401" "$(board_check "anonymous /api/plugins/kanban/board")"
+for path in /api/env /api/config /api/sessions /api/cron/jobs; do
+  expect "kanban-web refuses $path" "404" "$(board_check "anonymous $path")"
 done
 expect "board page refuses to create a task without a login" "401" "$(board_check "anonymous create")"
 expect "board page sends a visitor without a login to log in" "302" "$(board_check "anonymous page")"
+expect "the chat page loads, but the chat refuses a visitor without a login" "200 | 401 Log in to the board page first." \
+  "$(board_check "anonymous chat page") | $(board_check "anonymous chat")"
 expect "a user the provider denies gets no session" "none 401" "$(board_check "denied session") $(board_check "denied board")"
 expect "a user the provider logs in reaches the board" "302 / | 200 board-user@example.org | 200" \
   "$(board_check login) | $(board_check me) | $(board_check board)"
@@ -980,7 +994,17 @@ board_task="$(board_check task)"
 expect "a logged-in user creates and comments on a task" "200  200" "$(board_check create) $(board_check comment)"
 expect "the page's dispatch button starts nothing: the page claims no tasks" "200 spawned=0 skipped=True" \
   "$(board_check dispatch)"
-expect "logging out ends the session" "401" "$(board_check "after logout")"
+expect "the Kanban tab's live updates connect through kanban-web" "connected" "$(board_check "live updates")"
+expect "kanban-web refuses the dashboard's terminal chat" "refused 404" "$(board_check "terminal websocket")"
+expect "kanban-web refuses the rest of the dashboard to a logged-in user (secrets, settings, sessions, files, cron, profiles, hooks, skills, gateway)" \
+  "404 404 404 404 404 404 404 404 404 404 404 404 404 404" "$(board_check refused)"
+expect "kanban-web refuses dot segments and encoded slashes" "400 400 400 400" "$(board_check "refused paths")"
+expect "the board chat answers a logged-in user, with fast through the page's key" "200 fast-model-answered" "$(board_check chat)"
+expect "the board chat refuses slash and shell commands" \
+  "400 Commands (messages starting with / or !) aren't available here. | 400 Commands (messages starting with / or !) aren't available here." \
+  "$(board_check "chat slash command") | $(board_check "chat shell command")"
+expect "logging out ends the session, for the board and the chat" "401 401" \
+  "$(board_check "after logout") $(board_check "after logout chat")"
 case "$board_task" in
   t_*) ;;
   *) sed 's/^/    /' "$TEST_WORK/board-page" >&2 ;;
@@ -1018,9 +1042,9 @@ expect "the task's scratch directory is under /work/kanban, which the workspace 
     ws 'stat -c "%a %u" /work/kanban' 2>&1)"
 expect "the page sees the agent's run" "default" "$(task_run_profiles board-default "$board_task")"
 
-# Behind an HTTPS proxy on the host, connections come from the boards-egress gateway, which the page
-# trusts to report the scheme; a client inside the network isn't trusted. Prints whether the login's
-# PKCE cookie was marked Secure.
+# Behind an HTTPS proxy on the host, kanban-web passes on X-Forwarded-Proto and the dashboard, which
+# trusts loopback, marks cookies Secure (with the __Host- prefix). Prints whether the login's PKCE
+# cookie was Secure.
 pkce_cookie_script='
 import sys, urllib.error, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1028,28 +1052,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
 request = urllib.request.Request(sys.argv[1] + "/auth/login?provider=self-hosted",
-                                 headers={"Host": "board-default:9119", "X-Forwarded-Proto": "https"})
+                                 headers={"Host": "board-default:8080", "X-Forwarded-Proto": sys.argv[2]})
 try:
     response = opener.open(request, timeout=30)
 except urllib.error.HTTPError as e:
     response = e
-# Secure cookies get the __Host- prefix.
 cookie = [c for c in response.headers.get_all("Set-Cookie") or [] if c.split("=")[0].endswith("hermes_session_pkce")]
 print("secure" if cookie and "secure" in cookie[0].lower() else f"not secure ({response.status})")'
-expect "board page cookies are Secure behind an HTTPS proxy on the host" "secure" \
-  "$(python3 -c "$pkce_cookie_script" "http://127.0.0.1:$TEST_BOARD_PORT" 2>&1)"
-expect "board page ignores X-Forwarded-Proto from other clients" "not secure (302)" \
-  "$(compose exec -T fake-oidc /opt/hermes/.venv/bin/python -c "$pkce_cookie_script" http://board-default:9119 2>&1)"
+expect "board page cookies are Secure behind an HTTPS proxy on the host, not over plain HTTP" "secure not secure (302)" \
+  "$(python3 -c "$pkce_cookie_script" "http://127.0.0.1:$TEST_BOARD_PORT" https 2>&1) $(
+    python3 -c "$pkce_cookie_script" "http://127.0.0.1:$TEST_BOARD_PORT" http 2>&1)"
 
-# The chat: `fast` through LiteLLM with the page's own key, read-only MCP servers, Kanban tools only.
-board_chat="$(compose exec -T board-default hermes chat -q "hello" 2>&1 || true)"
-expect "board page chat answers with fast" "yes" \
-  "$(case "$board_chat" in *fast-model-answered*) echo yes ;; *) echo "no: $(printf '%s' "$board_chat" | tail -n 3)" ;; esac)"
+# The board chat's tools (the API server's): Kanban and the granted read-only MCP servers only.
 mcp="$(compose exec -T board-default hermes mcp test atlassian_read 2>&1 || true)"
 if printf '%s' "$mcp" | grep -q "jira_get_issue"; then
-  pass "board page chat reaches atlassian_read"
+  pass "board page reaches atlassian_read with its key"
 else
-  fail "board page chat reaches atlassian_read (output: $(printf '%s' "$mcp" | tail -n 6))"
+  fail "board page reaches atlassian_read with its key (output: $(printf '%s' "$mcp" | tail -n 6))"
 fi
 mcp="$(compose exec -T board-default hermes mcp test atlassian_jira_write 2>&1 || true)"
 if printf '%s' "$mcp" | grep -q "jira_add_comment"; then
@@ -1059,22 +1078,21 @@ else
 fi
 compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes board-default /opt/hermes/.venv/bin/python - \
   < "$root/tests/board_chat_checks.py" > "$TEST_WORK/board-chat" 2>&1 || true
-chat_check() { sed -n "s/^$1: //p" "$TEST_WORK/board-chat"; }
-expect "board page chat has only the Kanban, clarify, and granted MCP toolsets" "atlassian_read clarify kanban onyx_search" \
-  "$(chat_check toolsets)"
-expect "board page chat has no command, file, web, delegation, or memory tools" "none" "$(chat_check forbidden)"
-expect "board page chat has the Kanban tools" "True" "$(chat_check kanban)"
+chat_check() { sed -n "s|^$1: ||p" "$TEST_WORK/board-chat"; }
+expect "board chat has only the Kanban and granted MCP toolsets" "atlassian_read kanban onyx_search" "$(chat_check toolsets)"
+expect "board chat has no command, file, web, delegation, or memory tools" "none" "$(chat_check forbidden)"
+expect "board chat has the Kanban tools" "True" "$(chat_check kanban)"
 case "$(chat_check terminal)" in
-  "tool-result: Tool 'terminal' does not exist"*) pass "board page chat refuses terminal" ;;
-  *) fail "board page chat refuses terminal (got: $(chat_check terminal); $(tail -n 3 "$TEST_WORK/board-chat"))" ;;
+  "tool-result: Tool 'terminal' does not exist"*) pass "board chat refuses terminal" ;;
+  *) fail "board chat refuses terminal (got: $(chat_check terminal); $(tail -n 3 "$TEST_WORK/board-chat"))" ;;
 esac
 case "$(chat_check "tool_call terminal")" in
-  *"'terminal' is not available"*) pass "board page chat refuses terminal through tool_call" ;;
-  *) fail "board page chat refuses terminal through tool_call (got: $(chat_check "tool_call terminal"))" ;;
+  *"'terminal' is not available"*) pass "board chat refuses terminal through tool_call" ;;
+  *) fail "board chat refuses terminal through tool_call (got: $(chat_check "tool_call terminal"))" ;;
 esac
 case "$(chat_check kanban_list)" in
-  *"$board_task"*) pass "board page chat lists the agent's tasks" ;;
-  *) fail "board page chat lists the agent's tasks (got: $(chat_check kanban_list | cut -c1-200))" ;;
+  *"$board_task"*) pass "board chat lists the agent's tasks" ;;
+  *) fail "board chat lists the agent's tasks (got: $(chat_check kanban_list | cut -c1-200))" ;;
 esac
 
 # What the page holds and reaches.
@@ -1086,6 +1104,8 @@ expect_refused "board page can't write its SOUL.md" compose exec -T board-defaul
 expect_refused "board page can't write its .env" compose exec -T board-default sh -c 'echo X=1 >> /opt/data/.env'
 expect "board page claims no tasks and runs no dispatcher" "[] false" \
   "$(compose exec -T board-default sh -c 'echo $(hermes config get kanban.dispatch_profiles) $(hermes config get kanban.dispatch_in_gateway)' 2>&1)"
+expect "kanban-web runs as the Hermes user on a read-only filesystem" "10000 read-only" \
+  "$(compose exec -T kanban-web-default sh -c 'id -u; touch /app/x 2>/dev/null || echo read-only' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 board_markers="$(printf '%s\n' "$reader_key" "$default_workspace_key" xoxb-test xapp-test "$secrets")"
 expect "board page environment and files hold no agent, workspace, LiteLLM, master, or Postgres secrets (checked, leaked)" \
   "$(printf '%s\n' "$board_markers" | wc -l | tr -d ' ') 0" \
@@ -1102,8 +1122,7 @@ expect "board page reaches LiteLLM, but not Postgres, the workspace, github-toke
     python3 -c "import socket, sys; h, p = sys.argv[1].split(\":\"); socket.create_connection((h, int(p)), timeout=3)" \
       $target 2>/dev/null && echo reachable || echo unreachable; done' 2>&1 | tr '\n' ' ' | sed 's/ $//')"
 expect "the board page key gets no GitHub token" "401" "$(token_request "$board_key_default" github_read)"
-# Logged-in users can run commands in the page's container (the chat's `!`), so code there, with the
-# page's own key, must get no more than the key allows.
+# Even code running in the page's container gets no more than its key allows.
 expect "code in the board page container, with its key, gets fast and no other model" "200 403 403 403" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" board-default python3 -c '
 import json, urllib.error, urllib.request
@@ -1118,7 +1137,7 @@ for model in ("fast", "auto", "balanced", "strong"):
     except urllib.error.HTTPError as e:
         statuses.append(e.code)
 print(*statuses)' 2>&1)"
-compose --profile boards stop board-default fake-oidc fake-openai >/dev/null
+compose --profile boards stop kanban-web-default board-default fake-oidc fake-openai >/dev/null
 
 echo "== 11. Workspaces"
 expect "workspace runs commands as the unprivileged user on a read-only root filesystem" "20000 read-only" \

@@ -21,8 +21,9 @@ the LiteLLM user `hermes-board-<name>`, so the page's users can't spend the agen
 holds the LiteLLM key, Slack tokens, and workspace host name; `ssh/` holds the agent's SSH key and the workspace's host
 key; `kanban-shared/` holds its Kanban boards, which its board page also mounts. `<workspaces_dir>/<name>`
 holds the workspace's authorized key, host key, and workspace key, root-only and mounted only by that
-workspace. `<boards_dir>/<name>` is the board page's Hermes home; its `.env` holds the page's key. All
-are read at startup, so changes need a restart.
+workspace. `<boards_dir>/<name>` is the board page's Hermes home; its `.env` holds the page's LiteLLM key
+and its API server's key, which `web/api-server-key` repeats for its proxy (kanban-web-<name>). All are
+read at startup, so changes need a restart.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -80,6 +82,10 @@ BOARD_MCP_SERVERS = ("atlassian_read", "onyx_search")
 DEFAULT_BOARD_BUDGET = 50.0
 # The agent's boards, inside its home; compose.yaml's HERMES_KANBAN_HOME and board-<name> mount match.
 BOARD_SUBDIR = "kanban-shared"
+# The board page's API server key (in its .env), which its proxy also reads from web/ to call it.
+API_SERVER_KEY_VAR = "API_SERVER_KEY"
+BOARD_WEB_SUBDIR = "web"
+BOARD_WEB_KEY_FILE = "api-server-key"
 
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -302,7 +308,10 @@ class Agents:
                                and (home / "ssh" / "id_ed25519").exists())
         values = env_values(home / ".env")
         agent.env_set = {var: bool(values.get(var)) for var in SECRET_VARS}
-        agent.has_board_page = (bool(env_values(self._board_home(agent.name) / ".env").get(KEY_VAR))
+        board_env = env_values(self._board_home(agent.name) / ".env")
+        web_key = self._board_home(agent.name) / BOARD_WEB_SUBDIR / BOARD_WEB_KEY_FILE
+        agent.has_board_page = (bool(board_env.get(KEY_VAR)) and bool(board_env.get(API_SERVER_KEY_VAR))
+                                and web_key.is_file() and web_key.read_text().strip() == board_env[API_SERVER_KEY_VAR]
                                 and (home / BOARD_SUBDIR).is_dir())
 
     # -- changes -------------------------------------------------------------------------------
@@ -418,12 +427,11 @@ class Agents:
         return self.get(name)
 
     def revoke_board(self, name: str) -> Agent:
-        """Revoke the board page's key and remove it from the page's .env. The boards, the page's chat
-        history, and its budget are kept."""
+        """Revoke the board page's key and remove its keys from its .env and proxy. The boards, the
+        page's chat history, and its budget are kept."""
         agent = self.get(name)
         self.api.delete_keys(agent.board_key_hashes)
-        if (self._board_home(name) / ".env").exists():
-            self._write_env(name, {KEY_VAR: None}, self._board_home(name) / ".env")
+        self._remove_board_secrets(name)
         return self.get(name)
 
     def set_slack(self, name: str, values: dict[str, str]) -> Agent:
@@ -455,8 +463,7 @@ class Agents:
         shutil.rmtree(home / "ssh", ignore_errors=True)
         if (home / ".env").exists():
             self._write_env(name, {var: None for var in SECRET_VARS})
-        if (self._board_home(name) / ".env").exists():
-            self._write_env(name, {KEY_VAR: None}, self._board_home(name) / ".env")
+        self._remove_board_secrets(name)
 
     # -- helpers -------------------------------------------------------------------------------
 
@@ -564,19 +571,29 @@ class Agents:
         return self.settings.boards_dir / name
 
     def _prepare_board_page(self, name: str) -> None:
-        """Create the page's home and the agent's board directory, which the page mounts (Compose
-        refuses to start a container whose volume subpath is missing)."""
+        """Create the page's home, its proxy's directory, and the agent's board directory, which the
+        page mounts (Compose refuses to start a container whose volume subpath is missing)."""
         self._prepare_home(name)
         uid, gid = self.settings.uid, self.settings.gid
-        for path in (self._home(name) / BOARD_SUBDIR, self._board_home(name)):
+        # Hermes refuses a home others can write to.
+        for path, mode in ((self._home(name) / BOARD_SUBDIR, 0o755), (self._board_home(name), 0o755),
+                           (self._board_home(name) / BOARD_WEB_SUBDIR, 0o700)):
             path.mkdir(exist_ok=True)
             os.chown(path, uid, gid)
-            # Hermes refuses a home others can write to.
-            os.chmod(path, 0o755)
+            os.chmod(path, mode)
 
     def _write_board_page(self, name: str, key: str) -> None:
+        """Write the page's LiteLLM key and a new API server key, for the page and its proxy."""
         self._prepare_board_page(name)
-        self._write_env(name, {KEY_VAR: key}, self._board_home(name) / ".env")
+        api_server_key = secrets.token_urlsafe(32)
+        self._write_env(name, {KEY_VAR: key, API_SERVER_KEY_VAR: api_server_key}, self._board_home(name) / ".env")
+        self._write_file(self._board_home(name) / BOARD_WEB_SUBDIR / BOARD_WEB_KEY_FILE, api_server_key + "\n", 0o600,
+                         self.settings.uid, self.settings.gid)
+
+    def _remove_board_secrets(self, name: str) -> None:
+        if (self._board_home(name) / ".env").exists():
+            self._write_env(name, {KEY_VAR: None, API_SERVER_KEY_VAR: None}, self._board_home(name) / ".env")
+        (self._board_home(name) / BOARD_WEB_SUBDIR / BOARD_WEB_KEY_FILE).unlink(missing_ok=True)
 
     def _home(self, name: str) -> Path:
         return self.settings.agents_dir / name

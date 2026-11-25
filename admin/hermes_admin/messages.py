@@ -7,13 +7,14 @@ EDIT_HINT = "MCP and budget changes take effect immediately, GitHub changes with
 SLACK_HINT = "Restart the agent to apply: docker compose restart agent-{name}"
 ROTATE_DONE = "Issued new keys for {name} and its workspace and revoked the old ones."
 ROTATE_HINT = ("Restart the agent and its workspace to apply: docker compose restart workspace-{name} agent-{name} "
-               "(and its board page, if it has one: docker compose --profile boards restart board-{name})")
+               "(and its board page, if it has one: docker compose --profile boards restart board-{name} kanban-web-{name})")
 ROTATE_WARNING = "The agent stops working until it and its workspace are restarted."
-BOARD_HINT = ("Start its board page with: docker compose --profile boards up -d board-{name}. If compose.yaml "
-              "has no board-{name} service yet, see: docker compose run --rm admin agent compose {name}")
+BOARD_HINT = ("Start its board page with: docker compose --profile boards up -d kanban-web-{name}. If compose.yaml "
+              "has no board-{name} and kanban-web-{name} services yet, see: docker compose run --rm admin agent "
+              "compose {name}")
 BOARD_EDIT_HINT = "MCP and budget changes take effect immediately."
 BOARD_REVOKED = ("Revoked {name}'s board page key; its boards and chats are kept. Stop the page with: "
-                 "docker compose --profile boards stop board-{name}")
+                 "docker compose --profile boards stop kanban-web-{name} board-{name}")
 DELETED = "Deleted {name} (data kept)."
 PURGED = "Deleted {name} and its data."
 INDEX_QUEUED = "Queued {what} of {name}."

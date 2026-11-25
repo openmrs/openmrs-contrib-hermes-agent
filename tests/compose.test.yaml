@@ -57,19 +57,23 @@ services:
   agent-default:
     image: hermes-agent:test-${TEST_SLOT}
 
-  # Logs in through tests/fake_oidc.py, whose certificate authority it trusts, at an address the
-  # check script (run in fake-oidc) can reach. The board page and fake-oidc are on boards-egress.
+  # Logs in through tests/fake_oidc.py, whose certificate authority it trusts. Its address is
+  # kanban-web-default's port in its namespace, which the check script (run in fake-oidc, also on
+  # boards-egress) reaches as board-default:8080.
   board-default:
     image: hermes-agent:test-${TEST_SLOT}
     environment:
       HERMES_DASHBOARD_OIDC_ISSUER: https://fake-oidc:8443
-      HERMES_DASHBOARD_PUBLIC_URL: http://board-default:9119
+      HERMES_DASHBOARD_PUBLIC_URL: http://board-default:8080
       SSL_CERT_FILE: /tls/ca.crt
     ports: !override
-      - "127.0.0.1:${TEST_BOARD_PORT:-19119}:9119"
+      - "127.0.0.1:${TEST_BOARD_PORT:-19119}:8080"
     volumes:
       - ${TEST_WORK}/tls/ca.crt:/tls/ca.crt:ro
       - ./tests:/tests:ro
+
+  kanban-web-default:
+    image: hermes-agent:test-${TEST_SLOT}
 
   # A 15-second idle limit, so run.sh can watch a reset.
   workspace-default:
@@ -168,6 +172,5 @@ networks:
     driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-onyx-ui"}
   boards:
     driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-boards"}
-  # run.sh sets BOARDS_SUBNET and BOARDS_GATEWAY per slot, apart from the stack's.
   boards-egress:
     driver_opts: {com.docker.network.bridge.name: "ht${TEST_SLOT}-boards-eg"}

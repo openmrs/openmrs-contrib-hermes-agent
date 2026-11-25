@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board chat</title>
+<style>
+  :root {
+    --bg: #f7f7f8; --panel: #ffffff; --text: #1d1f23; --muted: #5f6570; --border: #d9dce1;
+    --accent: #2f5aa8; --accent-text: #ffffff; --user: #e8eef9; --error: #a12a3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1114; --panel: #161b20; --text: #e0e0e0; --muted: #9aa3ad; --border: #2a323a;
+            --accent: #5b82c9; --accent-text: #0e1114; --user: #1d2733; --error: #e0788a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif;
+         display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--border);
+           background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; flex: 1; }
+  header a, header button { color: var(--accent); background: none; border: none; font: inherit; cursor: pointer;
+                            text-decoration: none; padding: 0; }
+  main { flex: 1; overflow-y: auto; padding: 16px; }
+  .log { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+  .msg { padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--border);
+         white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: var(--user); align-self: flex-end; max-width: 85%; }
+  .msg .tools { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+  .msg.error { color: var(--error); }
+  .hint { color: var(--muted); text-align: center; margin-top: 15vh; }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+  form .wrap { display: flex; gap: 8px; max-width: 760px; margin: 0 auto; width: 100%; }
+  textarea { flex: 1; resize: none; min-height: 44px; max-height: 200px; padding: 10px; border-radius: 8px;
+             border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
+  form button { padding: 0 18px; border: none; border-radius: 8px; background: var(--accent); color: var(--accent-text);
+                font: inherit; cursor: pointer; }
+  form button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Board chat</h1>
+  <button type="button" id="new">New chat</button>
+  <a href="/kanban">Back to the board</a>
+</header>
+<main><div class="log" id="log"><p class="hint" id="hint">Ask about the board: what's running, blocked, or done, or
+  have a task drafted and created. The assistant can read the board, Jira, Confluence, and OpenMRS
+  docs (where granted), and can't run commands.</p></div></main>
+<form id="form">
+  <div class="wrap">
+    <textarea id="input" rows="1" placeholder="Message" autofocus></textarea>
+    <button id="send" type="submit">Send</button>
+  </div>
+</form>
+<script>
+  const log = document.getElementById('log');
+  const input = document.getElementById('input');
+  const send = document.getElementById('send');
+  let messages = [];
+
+  function add(role, text) {
+    document.getElementById('hint')?.remove();
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    const tools = document.createElement('div');
+    tools.className = 'tools';
+    const body = document.createElement('div');
+    body.textContent = text;
+    div.append(tools, body);
+    log.append(div);
+    div.scrollIntoView({ block: 'end' });
+    return { div, tools, body };
+  }
+
+  async function ensureSession() {
+    // Refreshes the session cookie when it has expired; a 401 means logging in again.
+    const response = await fetch('/api/auth/me', { credentials: 'same-origin' });
+    if (response.status === 401) {
+      location.href = '/login?next=' + encodeURIComponent('/board-chat');
+      return false;
+    }
+    return response.ok;
+  }
+
+  async function ask(text) {
+    if (!(await ensureSession())) return;
+    messages.push({ role: 'user', content: text });
+    add('user', text);
+    const reply = add('assistant', '…');
+    let answer = '';
+    const used = [];
+    try {
+      const response = await fetch('/board-chat/api', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || `HTTP ${response.status}`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', event = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let end;
+        while ((end = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, end).replace(/\r$/, '');
+          buffer = buffer.slice(end + 1);
+          if (line.startsWith('event:')) { event = line.slice(6).trim(); continue; }
+          if (!line.startsWith('data:')) { if (line === '') event = ''; continue; }
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          let payload;
+          try { payload = JSON.parse(data); } catch { continue; }
+          if (event === 'hermes.tool.progress') {
+            const name = payload.tool || payload.name;
+            if (name && !used.includes(name)) { used.push(name); reply.tools.textContent = 'Used: ' + used.join(', '); }
+            continue;
+          }
+          const delta = payload.choices?.[0]?.delta?.content;
+          if (delta) { answer += delta; reply.body.textContent = answer; reply.div.scrollIntoView({ block: 'end' }); }
+        }
+      }
+      messages.push({ role: 'assistant', content: answer });
+      if (!answer) reply.body.textContent = '(no answer)';
+    } catch (error) {
+      messages.pop();
+      reply.div.classList.add('error');
+      reply.body.textContent = error.message;
+    }
+  }
+
+  document.getElementById('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    send.disabled = true;
+    try { await ask(text); } finally { send.disabled = false; input.focus(); }
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send.click(); }
+  });
+  document.getElementById('new').addEventListener('click', () => {
+    messages = [];
+    log.replaceChildren();
+    input.focus();
+  });
+</script>
+</body>
+</html>

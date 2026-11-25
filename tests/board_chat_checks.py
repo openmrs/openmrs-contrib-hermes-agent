@@ -1,15 +1,15 @@
-"""Checks the board page chat's tools, used by tests/run.sh.
+"""Checks the board chat's tools, used by tests/run.sh.
 
 Runs in the board page container (on stdin, as the Hermes user), with hermes/board.yaml as its config.
-Resolves the chat's toolsets as the dashboard's chat does, then runs the agent loop against
-tests/fake_openai.py, which asks for whatever tool the message names. Prints one `name: value` line
-per check.
+Resolves the toolsets of the board chat (the API server's platform, `api_server`), then runs the agent
+loop with them against tests/fake_openai.py, which asks for whatever tool the message names. Prints
+one `name: value` line per check.
 """
 
 import json
 
-import tui_gateway.server as tui
 from hermes_cli.config import load_config
+from hermes_cli.tools_config import _get_platform_tools
 from model_tools import get_tool_definitions
 from run_agent import AIAgent
 
@@ -20,7 +20,7 @@ FORBIDDEN = {"terminal", "process_manage", "read_file", "write_file", "patch", "
              "skill_manage", "skill_view", "image_generate", "text_to_speech", "vision_analyze"}
 
 config = load_config()
-toolsets = tui._load_enabled_toolsets("cli")
+toolsets = sorted(_get_platform_tools(config, "api_server", include_default_mcp_servers=True))
 disabled = config["agent"]["disabled_toolsets"]
 tools = {d["function"]["name"] for d in get_tool_definitions(enabled_toolsets=toolsets, disabled_toolsets=disabled,
                                                                quiet_mode=True)}

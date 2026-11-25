@@ -121,6 +121,8 @@ class Handler(BaseHTTPRequestHandler):
 server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(CERT, KEY)
-server.socket = context.wrap_socket(server.socket, server_side=True)
+# The handshake happens in each connection's thread: a client that connects and sends nothing (as
+# browsers' pre-connections do) would otherwise block accept() for everyone.
+server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
 print("fake-oidc listening on 8443", file=sys.stderr, flush=True)
 server.serve_forever()

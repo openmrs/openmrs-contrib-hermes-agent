@@ -38,8 +38,8 @@ administrators give the agent work as Kanban tasks and follow its progress (see 
     LiteLLM sends the granted server's Atlassian key with each request.
   - An agent's LiteLLM key and Slack tokens → its `.env` in its own `agents-data` subdirectory,
     which only it (and `admin`) mounts.
-  - A board page's LiteLLM key → its `.env` in its own `board-homes` subdirectory. It holds no
-    agent secret.
+  - A board page's LiteLLM and API server keys → its `.env` in its own `board-homes` subdirectory;
+    the API server key also in its `web/`, for `kanban-web`. It holds no agent secret.
 - **Agents run nothing themselves.** Hermes' `ssh` terminal backend sends the terminal, file tools,
   and `execute_code` to the agent's workspace, so building a pull request (running its author's
   code) can't read the agent's tokens. See [Workspaces](#workspaces).
@@ -109,49 +109,54 @@ and `gh`.
 
 ### Board pages
 
-Each agent `<name>` can have a `board-<name>` service (only started with the `boards` Compose
-profile): Hermes' web dashboard, whose Kanban tab shows the agent's boards (columns per status,
-drag and drop, comments, each run's history) and lets users create, change, and unblock tasks. The
-agent's own gateway runs the tasks assigned to it (`default`), each as a worker: a separate Hermes
+Each agent `<name>` can have a board page (only started with the `boards` Compose profile): two
+services that share a network namespace.
+
+- `board-<name>`: Hermes' web dashboard, whose Kanban tab shows the agent's boards (columns per
+  status, drag and drop, comments, each run's history) and lets users create, change, and unblock
+  tasks, and Hermes' API server, for the board chat.
+- `kanban-web-<name>` (`board-web/board_web.py`): the page's only way in.
+
+The agent's own gateway runs the tasks assigned to it (`default`), each as a worker: a separate Hermes
 run whose tools run in its workspace like any other.
 
-- **Logged-in users can run commands in the page's container.** Hermes has no roles, so they get the
-  whole dashboard, not just the Kanban tab, and its chat runs any line starting with `!` as a shell
-  command there; its Cron page, file API, and profiles are other ways in. So the page is contained
-  rather than locked down, like a workspace: everything below holds even for code running in it.
-- **Your OIDC provider decides who logs in.** The page binds to a non-loopback address, so Hermes'
-  auth gate is always on, with OIDC (`BOARD_OIDC_ISSUER`, a public PKCE client) as its only provider.
-  Restrict the client to the same people as `SLACK_ALLOWED_USERS` in the provider (see
-  [Setup](#board-page-setup)): they can direct the agent and run commands in the page's container.
-  A user who loses access keeps their session until it expires or the provider revokes it.
+- **Your OIDC provider decides who logs in.** OIDC (`BOARD_OIDC_ISSUER`, a public PKCE client) is
+  the dashboard's only login. Restrict the client to the same people as `SLACK_ALLOWED_USERS` in the
+  provider (see [Setup](#board-page-setup)). A user who loses access keeps their session until it
+  expires or the provider revokes it.
+- **Users get the Kanban tab and the board chat, nothing else.** Hermes' dashboard has no roles, and
+  much of it (its terminal chat, cron jobs, files, profiles, settings, hooks) can run commands or
+  read secrets. So the dashboard and API server listen on `127.0.0.1` in the page's namespace, and
+  `kanban-web` passes on only logging in and out, the app's files and start-up reads, and the Kanban
+  API and its live updates; everything else is refused, as are paths with dot segments or encoded
+  slashes. It refuses everything while the dashboard doesn't require a login (e.g. its public URL is
+  still a loopback one).
+- **The board chat** (`/board-chat`) sends a logged-in user's messages to the API server's chat
+  completions, adding the API server's key itself. The chat runs a plain agent turn with the Kanban
+  tools and the granted read-only MCP servers: no shell, files, code, web, delegation, schedules,
+  memory, or skills, and a model that asks for another tool is refused, also through `tool_call`.
+  `kanban-web` refuses messages starting with `/` or `!` (commands), and roles other than user and
+  assistant.
 - **Its users direct the agent.** Workers read a task's title, body, and comments as instructions,
-  as Slack requests are; `SOUL.md` tells the agent so.
-- **It holds only its own key**, which may use only `fast`, chat routes, and the read-only MCP servers
-  `atlassian_read` and `onyx_search` (`BOARD_MCP_SERVERS` in `admin/hermes_admin/agents.py`), with its
-  own monthly budget ($50 default) on the LiteLLM user `hermes-board-<name>`. It can't get GitHub
-  tokens (no `/key/info`).
+  as Slack requests are; `SOUL.md` tells the agent so. Tasks also accept per-task settings Slack
+  requests don't, such as a model override; workers still use the agent's key and budget.
+- **It holds only its own keys:** a LiteLLM key that may use only `fast`, chat routes, and the
+  read-only MCP servers `atlassian_read` and `onyx_search` (`BOARD_MCP_SERVERS` in
+  `admin/hermes_admin/agents.py`), with its own monthly budget ($50 default) on the LiteLLM user
+  `hermes-board-<name>`, and its API server's key. It can't get GitHub tokens (no `/key/info`).
 - **It shares only the agent's boards**, `<agent home>/kanban-shared` (`HERMES_KANBAN_HOME`), not the
   agent's `.env`, SSH key, sessions, or memories. Its `config.yaml` (`hermes/board.yaml`) and `SOUL.md`
-  (`hermes/souls/board.md`) are read-only, so the dashboard's settings pages can't save.
+  (`hermes/souls/board.md`) are read-only.
 - **It never runs tasks.** Its gateway has no dispatcher, and `kanban.dispatch_profiles: []` also
   stops the dashboard's dispatch button from starting a worker in the page's container.
-- **Its chat's tools are defaults, not a boundary.** The chat's model gets the Kanban tools, clarifying
-  questions, and the granted read-only MCP servers, and is refused any other tool, also through
-  `tool_call`. That keeps it on task and cheap; the key and the networks are what limit a user.
 - **Networks.** `boards` (internal: board pages and `litellm`) and `boards-egress` (the host port and
   the OIDC provider). Pages can't reach agents, workspaces, `github-token`, `mcp-atlassian`, or Postgres.
-  `boards-egress` has a fixed subnet (`BOARDS_SUBNET`, `BOARDS_GATEWAY`) so pages trust only its
-  gateway, where the host port's connections come from, to report HTTPS (`X-Forwarded-Proto`): behind
-  an HTTPS proxy on the host, cookies are `Secure`.
+  `kanban-web` passes on the browser's `X-Forwarded-Proto`, which the dashboard trusts over loopback:
+  behind an HTTPS proxy on the host, cookies are `Secure`.
 - **Worker limits.** Workers can't answer Slack approvals, so their Jira and Confluence writes are
   refused (they block the task instead, saying what they'd change). At most two tasks run at once
   (`kanban.max_in_progress`), each capped like any run. Triage cards wait for an administrator
   (`auto_decompose: false`), as do requests for review (`review_dispatch: false`).
-- **Accepted risks.** Code a logged-in user runs in the page's container can use its key up to its
-  budget, read and change the agent's boards (as the page can anyway), and reach the internet and the
-  other board pages' login screens. It can't change the page's `config.yaml`, `SOUL.md`, or `.env`, but
-  can add Hermes profiles and cron jobs to its home. Board tasks also accept per-task settings, such
-  as a model override, that Slack requests don't; workers still use the agent's key and budget.
 
 ### Data retention
 
@@ -275,12 +280,13 @@ Optional, per agent. Uses any OIDC provider; Keycloak is shown.
    per agent `BOARD_<NAME>_URL` (e.g. `BOARD_DEFAULT_URL=https://board.example.org`) and, if 9119 is
    taken, `BOARD_<NAME>_PORT`. `<NAME>` is the agent's name in capitals, dashes as underscores.
 4. **The page's key:** `bin/admin agent board default --mcp atlassian_read,onyx_search` (or no `--mcp`).
-5. **Start it:** `docker compose --profile boards up -d board-default`, then point an HTTPS reverse
-   proxy on the host at `http://127.0.0.1:9119`, passing the original `Host` and setting
-   `X-Forwarded-Proto: https`.
+5. **Start it:** `docker compose --profile boards up -d kanban-web-default` (which starts
+   `board-default` too), then point an HTTPS reverse proxy on the host at `http://127.0.0.1:9119`,
+   passing the original `Host` and setting `X-Forwarded-Proto: https`.
 
-In the dashboard, open the Kanban tab. Assign tasks to `default` (the agent). A task's commands run in
-the agent's workspace, so leave its workspace as scratch or use a directory under `/work` there.
+Open `/kanban` for the board and `/board-chat` for the chat; the dashboard's other pages are refused.
+Assign tasks to `default` (the agent). A task's commands run in the agent's workspace, so leave its
+workspace as scratch or use a directory under `/work` there.
 
 ### Atlassian keys
 
@@ -326,7 +332,6 @@ Read from the environment or a `.env` file next to `compose.yaml` (git-ignored).
 | `BOARD_OIDC_CLIENT_ID` | `hermes-board` | Board pages' OIDC client (public, PKCE) |
 | `BOARD_<NAME>_URL` | `http://127.0.0.1:9119` | Agent `<name>`'s board page address, as users reach it |
 | `BOARD_<NAME>_PORT` | `9119` | Host port for agent `<name>`'s board page, on 127.0.0.1 |
-| `BOARDS_SUBNET`, `BOARDS_GATEWAY` | `172.31.250.0/24`, `.1` | The `boards-egress` network; change both if the subnet is taken |
 | `GIT_BOT_NAME`, `GIT_BOT_EMAIL` | (none) | Author of agents' commits (the `github_pr` App's bot). Commits fail until both are set |
 
 ## Managing agents
@@ -351,7 +356,7 @@ bin/admin agent board [<name>] --revoke [--yes] # revoke the board page's key, k
 bin/admin agent slack [<name>]                  # prompts; blank keeps current values
 bin/admin agent rotate [<name>] [--yes]         # new agent, workspace, and SSH keys; old keys revoked
 bin/admin agent delete [<name>] [--purge] [--yes]
-bin/admin agent compose <name> [--board-port N] # agent-, workspace-, and board-<name> blocks for compose.yaml
+bin/admin agent compose <name> [--board-port N] # agent-, workspace-, board-, and kanban-web-<name> blocks
 
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
@@ -382,8 +387,9 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   `SLACK_*=...` lines on stdin (`agent add <name> --from-stdin`, `agent slack <name> --from-stdin`); Onyx
   source settings likewise (`onyx add ... --from-stdin`, `onyx edit <name> --from-stdin`).
 - **Restarts:** Slack changes need `docker compose restart agent-<name>`; `agent rotate`
-  needs `docker compose restart workspace-<name> agent-<name>`, plus `board-<name>` if the agent has a
-  board page; a new board page needs `docker compose --profile boards up -d board-<name>`. Admin has
+  needs `docker compose restart workspace-<name> agent-<name>`, plus `board-<name> kanban-web-<name>`
+  if the agent has a board page; a new board page needs `docker compose --profile boards up -d
+  kanban-web-<name>`. Admin has
   no Docker socket to do it.
 - **`agent delete`** revokes the keys (including its board page's) and removes the agent's secrets
   (`.env` values, SSH key, workspace config) but keeps its sessions, memories, skills, boards, and

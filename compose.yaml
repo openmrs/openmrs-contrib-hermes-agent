@@ -28,6 +28,8 @@
 #                 onyx-web's host port.
 #   boards      - board pages <-> litellm only. Internal.
 #   boards-egress - board pages' host ports and their OIDC provider (e.g. Keycloak). Not internal.
+#                 A board page's dashboard and API server listen on its own loopback only, behind
+#                 its kanban-web-<name> proxy, so nothing on these networks reaches them.
 
 name: hermes
 
@@ -106,13 +108,15 @@ x-hermes-agent: &hermes-agent
     # a path the workspace can create too (see SOUL.md), unlike the default, inside the agent's home.
     HERMES_KANBAN_WORKSPACES_ROOT: /work/kanban
 
-# Each agent's board page: Hermes' web dashboard, for its Kanban tab and a chat (hermes/board.yaml). Its
-# OIDC provider (e.g. Keycloak) decides who may log in; Hermes lets in anyone it vouches for, who can
-# then also run commands in this container (the chat's `!`). So it is contained, not locked down: it
-# shares only the agent's boards (<agent home>/kanban-shared) and holds only its own LiteLLM key (`fast`
-# and read-only MCP servers), from `bin/admin agent board <name>`. Its gateway serves no messaging
-# platform and runs no Kanban dispatcher: only the agent runs tasks. Started only with the `boards`
-# profile (see README.md).
+# Each agent's board page: Hermes' web dashboard and API server (hermes/board.yaml), behind its own
+# proxy, kanban-web-<name> (board-web/board_web.py), which shares its network namespace. Both listen on
+# 127.0.0.1 only, so every request goes through the proxy, which passes on only logging in and out,
+# the Kanban tab, and a chat page whose messages go to the API server's chat completions (no shell or
+# slash commands). The OIDC provider (e.g. Keycloak) decides who may log in. The page shares only the
+# agent's boards (<agent home>/kanban-shared) and holds only its own LiteLLM key (`fast` and read-only
+# MCP servers), from `bin/admin agent board <name>`. Its gateway serves no messaging platform and runs
+# no Kanban dispatcher: only the agent runs tasks. Started only with the `boards` profile (see
+# README.md).
 x-hermes-board: &hermes-board
   <<: *hermes-image
   restart: unless-stopped
@@ -121,7 +125,7 @@ x-hermes-board: &hermes-board
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
   cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID, SETUID]
-  # The gateway hosts the chat's agent; HERMES_DASHBOARD has the image also run the dashboard.
+  # The gateway runs the API server; HERMES_DASHBOARD has the image also run the dashboard.
   command: ["gateway", "run"]
   networks: [boards, boards-egress]
   depends_on:
@@ -131,14 +135,26 @@ x-hermes-board: &hermes-board
     HERMES_UID: ${HERMES_UID:-10000}
     HERMES_GID: ${HERMES_GID:-10000}
     HERMES_DASHBOARD: "1"
+    HERMES_DASHBOARD_HOST: 127.0.0.1
     HERMES_DASHBOARD_PORT: "9119"
+    API_SERVER_ENABLED: "true"
+    API_SERVER_HOST: 127.0.0.1
     HERMES_KANBAN_HOME: /opt/kanban
     # The OIDC provider, from ./.env (see README.md). Without an issuer the dashboard refuses to start.
     HERMES_DASHBOARD_OIDC_ISSUER: ${BOARD_OIDC_ISSUER:-}
     HERMES_DASHBOARD_OIDC_CLIENT_ID: ${BOARD_OIDC_CLIENT_ID:-hermes-board}
-    # Connections through a board's host port arrive from the boards-egress gateway, so it may say
-    # the original request was HTTPS (X-Forwarded-Proto), which makes session cookies Secure.
-    BOARD_TRUSTED_PROXY: ${BOARDS_GATEWAY:-172.31.250.1}
+
+# A board page's proxy: Python from the Hermes image, as the Hermes user, on a read-only filesystem.
+x-kanban-web: &kanban-web
+  <<: *hermes-image
+  restart: unless-stopped
+  logging: *logging
+  profiles: [boards]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  read_only: true
+  user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+  entrypoint: ["/opt/hermes/.venv/bin/python", "/app/board_web.py"]
 
 # Each agent's workspace, where all its commands run (see workspace/supervisor.py). Its only secret
 # is a LiteLLM key that can get GitHub tokens for the agent's granted levels.
@@ -451,6 +467,8 @@ services:
   #   board-<name>      its board page (only with the `boards` profile): its own board-homes
   #                     subdirectory, the agent's kanban-shared directory, and the shared
   #                     hermes/board.yaml and hermes/souls/board.md
+  #   kanban-web-<name> the board page's proxy, in its network namespace: board-web/ and the API
+  #                     server's key (its board-homes subdirectory's web/)
   # SOUL.md, config.yaml, and .env are read-only so the agent can't rewrite its instructions, where
   # its requests go, or its key. admin writes .env through the whole volume; changes apply on agent
   # restart. Restarting a workspace restarts its agent, so it forgets directories the reset removed.
@@ -502,11 +520,12 @@ services:
     environment:
       <<: *board-environment
       # The page's address as users reach it, e.g. https://board.example.org; its /auth/callback must be
-      # a redirect URI of the OIDC client.
+      # a redirect URI of the OIDC client. A loopback address turns off the login, so kanban-web refuses
+      # every request until this is set.
       HERMES_DASHBOARD_PUBLIC_URL: ${BOARD_DEFAULT_URL:-http://127.0.0.1:9119}
-    # Host-only; put a TLS reverse proxy in front.
+    # kanban-web-default's port, published from this namespace. Host-only; put a TLS reverse proxy in front.
     ports:
-      - "127.0.0.1:${BOARD_DEFAULT_PORT:-9119}:9119"
+      - "127.0.0.1:${BOARD_DEFAULT_PORT:-9119}:8080"
     volumes:
       - type: volume
         source: board-homes
@@ -526,6 +545,22 @@ services:
           subpath: default/kanban-shared
       - ./hermes/souls/board.md:/opt/data/SOUL.md:ro
       - ./hermes/board.yaml:/opt/data/config.yaml:ro
+
+  kanban-web-default:
+    <<: *kanban-web
+    network_mode: service:board-default
+    depends_on:
+      board-default:
+        condition: service_started
+        restart: true
+    volumes:
+      - ./board-web:/app:ro
+      - type: volume
+        source: board-homes
+        target: /run/board-web
+        read_only: true
+        volume:
+          subpath: default/web
 
 # Bridge names are pinned (at most 15 characters) because Podman's netavark can leave an internal
 # network's "no forwarding" setting behind for its bridge name, and an external network that later
@@ -560,14 +595,8 @@ networks:
   boards:
     internal: true
     driver_opts: {com.docker.network.bridge.name: hm-boards}
-  # The subnet is fixed so the board pages can trust its gateway as their proxy (BOARD_TRUSTED_PROXY);
-  # change both in ./.env if it collides with a network on the host.
   boards-egress:
     driver_opts: {com.docker.network.bridge.name: hm-boards-egr}
-    ipam:
-      config:
-        - subnet: ${BOARDS_SUBNET:-172.31.250.0/24}
-          gateway: ${BOARDS_GATEWAY:-172.31.250.1}
 
 volumes:
   postgres-data: {}
@@ -581,6 +610,7 @@ volumes:
   # Per agent: its Hermes home, including .env. Only admin mounts the whole volume. Its kanban-shared
   # subdirectory (the agent's boards) is also mounted by the agent's board page.
   agents-data: {}
-  # Per agent: its board page's Hermes home (chat sessions, logs) and .env (its LiteLLM key), written by
-  # admin. Only admin mounts the whole volume.
+  # Per agent: its board page's Hermes home (chat sessions, logs), .env (its LiteLLM and API server
+  # keys), and web/ (the API server key, for kanban-web), written by admin. Only admin mounts the whole
+  # volume.
   board-homes: {}

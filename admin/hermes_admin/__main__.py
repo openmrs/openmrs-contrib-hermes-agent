@@ -23,7 +23,7 @@ from .messages import (BOARD_EDIT_HINT, BOARD_HINT, BOARD_REVOKED, DELETED, EDIT
 from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, OnyxSettings,
                    SourceType, format_errors, source_settings)
 
-# The agent-<name>, workspace-<name>, and board-<name> services for compose.yaml. tests/run.sh checks
+# The agent-<name>, workspace-<name>, board-<name>, and kanban-web-<name> services for compose.yaml. tests/run.sh checks
 # that compose.yaml has this output for `default` and that the output passes the compose isolation
 # checks. {var} is the name for host settings (BOARD_<VAR>_URL), {port} the board page's default port.
 COMPOSE_SERVICE = """\
@@ -72,11 +72,12 @@ COMPOSE_SERVICE = """\
     environment:
       <<: *board-environment
       # The page's address as users reach it, e.g. https://board.example.org; its /auth/callback must be
-      # a redirect URI of the OIDC client.
+      # a redirect URI of the OIDC client. A loopback address turns off the login, so kanban-web refuses
+      # every request until this is set.
       HERMES_DASHBOARD_PUBLIC_URL: ${{BOARD_{var}_URL:-http://127.0.0.1:{port}}}
-    # Host-only; put a TLS reverse proxy in front.
+    # kanban-web-{name}'s port, published from this namespace. Host-only; put a TLS reverse proxy in front.
     ports:
-      - "127.0.0.1:${{BOARD_{var}_PORT:-{port}}}:9119"
+      - "127.0.0.1:${{BOARD_{var}_PORT:-{port}}}:8080"
     volumes:
       - type: volume
         source: board-homes
@@ -96,6 +97,22 @@ COMPOSE_SERVICE = """\
           subpath: {name}/kanban-shared
       - ./hermes/souls/board.md:/opt/data/SOUL.md:ro
       - ./hermes/board.yaml:/opt/data/config.yaml:ro
+
+  kanban-web-{name}:
+    <<: *kanban-web
+    network_mode: service:board-{name}
+    depends_on:
+      board-{name}:
+        condition: service_started
+        restart: true
+    volumes:
+      - ./board-web:/app:ro
+      - type: volume
+        source: board-homes
+        target: /run/board-web
+        read_only: true
+        volume:
+          subpath: {name}/web
 """
 
 COMPOSE_STEPS = """\
@@ -105,7 +122,7 @@ Next steps:
   3. docker compose run --rm admin agent add {name} ...  (if not done yet)
   4. docker compose up -d agent-{name}
   5. For its board page: docker compose run --rm admin agent board {name}, set BOARD_{var}_URL (and
-     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose --profile boards up -d board-{name}"""
+     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose --profile boards up -d kanban-web-{name}"""
 
 CANCELLED = "Cancelled (use --yes to skip confirmation)."
 

@@ -10,7 +10,8 @@ secret files can't be checked by path. `write-secrets` writes placeholder secret
 one marker variable, and the checks look for markers in each service's environment. Run `config` in
 a directory holding only those placeholders, so any other required env file makes it fail.
 
-Every `agent-*`, `workspace-*`, and `board-*` service is checked, so newly added agents are covered.
+Every `agent-*`, `workspace-*`, `board-*`, and `kanban-web-*` service is checked, so newly added agents
+are covered.
 """
 
 import json
@@ -23,9 +24,9 @@ AGENT_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_WRITE_SAFE_ROOT", "HERM
 AGENT_KANBAN_HOME = "/opt/data/kanban-shared"
 # A board page gets no secrets in its environment (its key is in its .env) and no auth provider but the
 # OIDC one: e.g. HERMES_DASHBOARD_BASIC_AUTH_* or HERMES_DASHBOARD_OAUTH_CLIENT_ID would add another way in.
-BOARD_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_DASHBOARD", "HERMES_DASHBOARD_PORT",
+BOARD_ENV_ALLOWED = {"HERMES_UID", "HERMES_GID", "HERMES_DASHBOARD", "HERMES_DASHBOARD_HOST", "HERMES_DASHBOARD_PORT",
                      "HERMES_DASHBOARD_PUBLIC_URL", "HERMES_DASHBOARD_OIDC_ISSUER", "HERMES_DASHBOARD_OIDC_CLIENT_ID",
-                     "HERMES_KANBAN_HOME", "BOARD_TRUSTED_PROXY"}
+                     "HERMES_KANBAN_HOME", "API_SERVER_ENABLED", "API_SERVER_HOST"}
 WORKSPACE_ENV_ALLOWED = {"WORKSPACE_IDLE_MINUTES", "WORKSPACE_KEEP_FILES", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
                          "GIT_COMMITTER_EMAIL"}
 # Secret files and the only services allowed to receive them.
@@ -141,8 +142,15 @@ for name, service in sorted(boards.items()):
           sorted(environment))
     check(f"{name}: only on the boards and boards-egress networks", network_names(service) == {"boards", "boards-egress"},
           sorted(network_names(service)))
-    check(f"{name}: host port bound to 127.0.0.1 only",
-          all(p.get("host_ip") == "127.0.0.1" for p in service.get("ports") or []), service.get("ports"))
+    # Only kanban-web, in this namespace, may reach the dashboard and API server; its port is the only one
+    # published, to the host only.
+    check(f"{name}: dashboard and API server listen on 127.0.0.1 only",
+          environment.get("HERMES_DASHBOARD_HOST") == "127.0.0.1" and environment.get("API_SERVER_HOST") == "127.0.0.1",
+          (environment.get("HERMES_DASHBOARD_HOST"), environment.get("API_SERVER_HOST")))
+    check(f"{name}: publishes only kanban-web's port, to 127.0.0.1",
+          bool(service.get("ports")) and all(p.get("host_ip") == "127.0.0.1" and int(p.get("target")) == 8080
+                                             for p in service.get("ports")), service.get("ports"))
+    check(f"{name}: has a kanban-web-{agent_name} service", f"kanban-web-{agent_name}" in services, sorted(services))
     check(f"{name}: not started by default (profile)", bool(service.get("profiles")), service.get("profiles"))
     service_mounts = mounts(service)
     homes = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data"]
@@ -167,6 +175,28 @@ for name, service in sorted(boards.items()):
     check(f"{name}: config.yaml is hermes/board.yaml, read-only",
           len(configs) == 1 and configs[0].get("type") == "bind" and configs[0].get("read_only") is True
           and str(configs[0].get("source", "")).replace("\\", "/").endswith("/hermes/board.yaml"), configs)
+
+webs = {name: s for name, s in services.items() if name.startswith("kanban-web-")}
+check("one kanban-web per board page", sorted(webs) == sorted(f"kanban-web-{b[len('board-'):]}" for b in boards),
+      sorted(webs))
+for name, service in sorted(webs.items()):
+    agent_name = name[len("kanban-web-"):]
+    check(f"{name}: in board-{agent_name}'s network namespace, on no network of its own",
+          service.get("network_mode") == f"service:board-{agent_name}" and not service.get("networks"),
+          (service.get("network_mode"), service.get("networks")))
+    check(f"{name}: no environment variables", not service.get("environment"), service.get("environment"))
+    check(f"{name}: read-only root filesystem, not root", service.get("read_only") is True
+          and str(service.get("user", "")).split(":")[0] not in ("", "0", "root"), (service.get("read_only"), service.get("user")))
+    check(f"{name}: no published ports of its own", not service.get("ports"), service.get("ports"))
+    check(f"{name}: not started by default (profile)", bool(service.get("profiles")), service.get("profiles"))
+    service_mounts = mounts(service)
+    code = [m for m in service_mounts if m.get("target") == "/app"]
+    keys = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/run/board-web"]
+    check(f"{name}: mounts only board-web/ and its API server key ({agent_name}/web), read-only",
+          len(service_mounts) == 2 and len(code) == 1 and len(keys) == 1
+          and code[0].get("read_only") is True and str(code[0].get("source", "")).replace("\\", "/").endswith("/board-web")
+          and keys[0].get("read_only") is True and (keys[0].get("volume") or {}).get("subpath") == f"{agent_name}/web",
+          service_mounts)
 
 workspaces = {name: s for name, s in services.items() if name.startswith("workspace-")}
 check("one workspace per agent", sorted(workspaces) == sorted(f"workspace-{a[len('agent-'):]}" for a in agents),
@@ -211,9 +241,11 @@ for name, service in services.items():
                   (name == f"agent-{owner}" and subpath in (owner, f"{owner}/.env"))
                   or (name == f"board-{owner}" and subpath == f"{owner}/kanban-shared"), m)
         if m.get("source") == "board-homes":
-            check(f"{name}: board-homes mounted only by admin (whole) or a board page (its own)",
+            owner = (subpath or "").split("/")[0]
+            check(f"{name}: board-homes mounted only by admin (whole), a board page (its own), or its proxy (web/)",
                   (name == "admin" and not subpath)
-                  or (subpath and name == f"board-{subpath.split('/')[0]}" and subpath.count("/") <= 1), m)
+                  or (name == f"board-{owner}" and subpath in (owner, f"{owner}/.env"))
+                  or (name == f"kanban-web-{owner}" and subpath == f"{owner}/web"), m)
         if m.get("source") == "workspace-config" and not (m.get("volume") or {}).get("subpath"):
             check(f"{name}: whole workspace-config volume mounted only by admin", name == "admin", m)
         if str(m.get("source", "")).endswith("docker.sock"):

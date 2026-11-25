@@ -1,7 +1,6 @@
 # Configuration of every agent's board page (board-<name> in compose.yaml): Hermes' web dashboard, for
-# the agent's Kanban boards and a chat about them. Shared by every board page and mounted read-only, so
-# neither the page's users nor its chat can change it; the dashboard's settings pages fail to save.
-# Changes apply on restart.
+# the agent's Kanban boards, and its API server, for the board chat (/board-chat, served by
+# kanban-web-<name>). Shared by every board page and mounted read-only. Changes apply on restart.
 
 # Keep at the compose.yaml image's version, as in hermes/config.yaml.
 _config_version: 51
@@ -48,12 +47,13 @@ auxiliary:
   tts_audio_tags: *fast
   voice_chat: *fast
 
-# The chat's tools: the Kanban tools (reading and changing the boards, as the page's users can anyway),
-# clarifying questions, and the MCP servers below. Everything else is off; disabled_toolsets wins over
-# any other selection, and the chat refuses tools it wasn't given, also through tool_call. These keep
-# the chat on task, but aren't a boundary: users can run shell commands here anyway (the chat's `!`),
-# so the page's key and networks are what limit them (see README.md, "Board pages").
+# The board chat's tools (the API server's): the Kanban tools (reading and changing the boards, as the
+# page's users can anyway) and the MCP servers below. Everything else is off; disabled_toolsets wins
+# over any other selection, and the chat refuses tools it wasn't given, also through tool_call. The
+# dashboard's own terminal chat (`cli`), which also runs shell commands, isn't reachable: kanban-web
+# refuses it.
 platform_toolsets:
+  api_server: [kanban]
   cli: [kanban, clarify]
 agent:
   max_turns: 20
@@ -73,7 +73,8 @@ sessions:
   retention_days: 30
 
 # Read-only servers only. The page's key is granted at most these (`bin/admin agent board --mcp`); an
-# ungranted one fails to connect. `trust: untrusted` makes any tool not annotated read-only ask first.
+# ungranted one fails to connect. `trust: untrusted` makes any tool not annotated read-only ask for
+# approval, which the board chat can't give, so such a tool is refused.
 mcp_servers:
   atlassian_read:
     url: http://litellm:4000/mcp/atlassian_read
@@ -97,10 +98,15 @@ kanban:
   notify_in_gateway: false
   auto_decompose: false
 
+# The board chat's API server, on 127.0.0.1 (compose.yaml), with its key in .env; only kanban-web
+# reaches it, and only its chat completions.
+gateway:
+  api_server:
+    max_concurrent_runs: 2
+
 dashboard:
   # The OIDC provider is set in compose.yaml (HERMES_DASHBOARD_OIDC_*); it decides who may log in.
+  # Requests come from kanban-web, over loopback, which the dashboard trusts to report the original
+  # scheme (X-Forwarded-Proto), so cookies are Secure behind an HTTPS proxy.
   oauth:
     provider: self-hosted
-  # The boards-egress gateway, which every connection through the host port comes from, may report the
-  # original scheme (X-Forwarded-Proto), so cookies are Secure behind an HTTPS proxy.
-  trusted_proxies: ["${BOARD_TRUSTED_PROXY}"]
