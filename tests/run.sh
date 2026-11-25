@@ -84,10 +84,22 @@ TEST_WORK="$(mktemp -d)"
 export TEST_WORK
 failures=0
 
+# compose.yaml with a board page for `default` added, as `bin/admin agent compose default --board` prints
+# it: what an operator does to give an agent one. compose.yaml itself has none.
+python3 - "$root" "$TEST_WORK/compose.yaml" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1] + "/admin")
+from hermes_admin.__main__ import COMPOSE_BOARD
+compose = open(sys.argv[1] + "/compose.yaml").read()
+board = COMPOSE_BOARD.format(name="default", var="DEFAULT", port=9119)
+assert compose.count("\nnetworks:\n") == 1, "compose.yaml: expected one top-level networks: line"
+open(sys.argv[2], "w").write(compose.replace("\nnetworks:\n", "\n" + board + "\nnetworks:\n", 1))
+EOF
+
 compose() {
   # shellcheck disable=SC2086 # compose_cmd may be two words ("docker compose")
   $compose_cmd --progress quiet -p "hermes-test-$TEST_SLOT" --project-directory "$root" \
-    -f "$root/compose.yaml" -f "$root/tests/compose.test.yaml" "$@"
+    -f "$TEST_WORK/compose.yaml" -f "$root/tests/compose.test.yaml" "$@"
 }
 
 cleanup() {
@@ -302,6 +314,15 @@ if $compose_cmd --profile '*' --project-directory "$TEST_WORK/compose-check" -f 
 else
   fail "compose.yaml isolation (see output above)"
 fi
+# shellcheck disable=SC2086
+if $compose_cmd --profile '*' --project-directory "$TEST_WORK/compose-check" -f "$TEST_WORK/compose.yaml" \
+  config --format json 2>/dev/null > "$TEST_WORK/compose-board.json" &&
+  grep -q '"kanban-web-default"' "$TEST_WORK/compose-board.json" &&
+  python3 "$root/tests/compose_isolation.py" < "$TEST_WORK/compose-board.json"; then
+  pass "compose.yaml with a board page isolation"
+else
+  fail "compose.yaml with a board page isolation (see output above)"
+fi
 
 echo "== Starting LiteLLM"
 compose --profile admin build admin agent-default workspace-default github-token >/dev/null
@@ -346,10 +367,8 @@ expect "default's .env: mode 600, owned by the Hermes user" "600 10000" "$(admin
 expect "default's .env has key, Slack settings, and workspace host" \
   "LITELLM_API_KEY SLACK_ALLOWED_USERS SLACK_APP_TOKEN SLACK_BOT_TOKEN TERMINAL_SSH_HOST" \
   "$(admin_sh 'cut -d= -f1 /agents/default/.env | sort | tr "\n" " "' | sed 's/ $//')"
-expect "agent add prepares a board page without keys, so compose.yaml can start it" \
-  "600 10000 0 700 10000 755 10000 none" \
-  "$(admin_sh 'stat -c "%a %u %s" /boards/writer/.env; stat -c "%a %u" /boards/writer/web /agents/writer/kanban-shared' |
-    tr '\n' ' ' | sed 's/ $//') $(admin agent show writer | sed -n 's/^  Board page: *//p')"
+expect "agent add gives the agent no board page: it doesn't need one" "absent none" \
+  "$(admin_sh 'test -e /boards/writer && echo present || echo absent') $(admin agent show writer | sed -n 's/^  Board page: *//p')"
 expect "agent add gives the agent a workspace key, not a second agent key" "1 1 True" \
   "$(agent_field default keys) $(agent_field default workspace_keys) $(agent_field default has_workspace)"
 expect "default's SSH key: mode 600, owned by the Hermes user; known_hosts pins workspace-default" \
@@ -636,19 +655,29 @@ if [ -s "$TEST_WORK/compose-default.yaml" ] &&
 else
   fail "agent compose prints the agent-default block in compose.yaml (got: $(cat "$TEST_WORK/compose-default.yaml"))"
 fi
+admin agent compose default --board > "$TEST_WORK/compose-default-board.yaml" 2>/dev/null || true
+if [ -s "$TEST_WORK/compose-default-board.yaml" ] &&
+  ! grep -q '^  agent-default:' "$TEST_WORK/compose-default-board.yaml" &&
+  python3 -c 'import sys; sys.exit(open(sys.argv[2]).read() not in open(sys.argv[1]).read())' \
+    "$TEST_WORK/compose.yaml" "$TEST_WORK/compose-default-board.yaml"; then
+  pass "agent compose --board prints only the board page's blocks, as the test stack runs them"
+else
+  fail "agent compose --board prints only the board page's blocks (got: $(head -n 5 "$TEST_WORK/compose-default-board.yaml"))"
+fi
 # The block uses compose.yaml's x-hermes-agent anchor, so it goes into a copy of compose.yaml, not
 # an override file.
-admin agent compose extra 2>/dev/null > "$TEST_WORK/compose-extra-block.yaml" || true
+{ admin agent compose extra; admin agent compose extra --board --board-port 9120; } 2>/dev/null \
+  > "$TEST_WORK/compose-extra-block.yaml" || true
 python3 -c 'import sys; c = open(sys.argv[1]).read(); b = open(sys.argv[2]).read(); print(c.replace("\nnetworks:\n", "\n" + b + "\nnetworks:\n", 1), end="")' \
   "$root/compose.yaml" "$TEST_WORK/compose-extra-block.yaml" > "$TEST_WORK/compose-extra.yaml"
 # shellcheck disable=SC2086
 if $compose_cmd --profile '*' --project-directory "$TEST_WORK/compose-check" -f "$TEST_WORK/compose-extra.yaml" \
   config --format json 2>/dev/null > "$TEST_WORK/compose-extra.json" &&
-  grep -q '"agent-extra"' "$TEST_WORK/compose-extra.json" &&
+  grep -q '"agent-extra"' "$TEST_WORK/compose-extra.json" && grep -q '"kanban-web-extra"' "$TEST_WORK/compose-extra.json" &&
   python3 "$root/tests/compose_isolation.py" < "$TEST_WORK/compose-extra.json" >/dev/null; then
-  pass "agent compose output for a new agent passes the isolation checks"
+  pass "agent compose output for a new agent and its board page passes the isolation checks"
 else
-  fail "agent compose output for a new agent passes the isolation checks"
+  fail "agent compose output for a new agent and its board page passes the isolation checks"
 fi
 expect_refused "agent compose refuses an invalid name" admin agent compose Bad_Name
 # The tests don't run Onyx, so these pass only if admin refuses before calling it. Only the

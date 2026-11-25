@@ -23,9 +23,8 @@ from .messages import (BOARD_EDIT_HINT, BOARD_HINT, BOARD_REVOKED, DELETED, EDIT
 from .onyx import (DEFAULT_ONYX_BUDGET, DEFAULT_REFRESH_HOURS, SOURCE_TYPES, Onyx, OnyxError, OnyxSettings,
                    SourceType, format_errors, source_settings)
 
-# The agent-<name>, workspace-<name>, board-<name>, and kanban-web-<name> services for compose.yaml. tests/run.sh checks
-# that compose.yaml has this output for `default` and that the output passes the compose isolation
-# checks. {var} is the name for host settings (BOARD_<VAR>_URL), {port} the board page's default port.
+# The agent-<name> and workspace-<name> services for compose.yaml. tests/run.sh checks that
+# compose.yaml has this output for `default` and that the output passes the compose isolation checks.
 COMPOSE_SERVICE = """\
   agent-{name}:
     <<: *hermes-agent
@@ -67,6 +66,12 @@ COMPOSE_SERVICE = """\
       # Emptied whenever the workspace resets.
       - /work
 
+"""
+
+# The board-<name> and kanban-web-<name> services, for an agent with a board page (optional). tests/run.sh
+# runs its stack with this output for `default` added, and checks it passes the isolation checks. {var}
+# is the name for host settings (BOARD_<VAR>_URL), {port} the board page's default host port.
+COMPOSE_BOARD = """\
   board-{name}:
     <<: *hermes-board
     environment:
@@ -121,8 +126,14 @@ Next steps:
   2. Write the agent's identity in hermes/souls/{name}.md.
   3. docker compose run --rm admin agent add {name} ...  (if not done yet)
   4. docker compose up -d agent-{name}
-  5. For its board page: docker compose run --rm admin agent board {name}, set BOARD_{var}_URL (and
-     BOARD_{var}_PORT if {port} is taken) in ./.env, then docker compose up -d board-{name} kanban-web-{name}"""
+For a board page (optional): agent compose {name} --board"""
+
+COMPOSE_BOARD_STEPS = """\
+Next steps:
+  1. docker compose run --rm admin agent board {name}  (if not done yet; the page can't start without it)
+  2. Add the blocks above under `services:` in compose.yaml.
+  3. Set BOARD_{var}_URL (and BOARD_{var}_PORT if {port} is taken) and the BOARD_OIDC_* settings in ./.env.
+  4. docker compose up -d board-{name} kanban-web-{name}"""
 
 CANCELLED = "Cancelled (use --yes to skip confirmation)."
 
@@ -298,10 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"monthly spend limit in USD (default: unchanged, or {DEFAULT_BOARD_BUDGET:g} for a new page)")
     p.add_argument("--revoke", action="store_true", help="revoke the page's key, keeping the boards and chats")
     p.add_argument("--yes", action="store_true", help=no_confirm + " (with --revoke)")
-    p = sub.add_parser("compose", help="print the agent's service blocks for compose.yaml")
+    p = sub.add_parser("compose", help="print the agent's service blocks for compose.yaml (or its board page's)")
     p.add_argument("name")
+    p.add_argument("--board", action="store_true",
+                   help="print the board page's blocks instead (optional; set it up with `agent board` first)")
     p.add_argument("--board-port", type=int, default=9119,
-                   help="the board page's default host port (default: 9119; each page needs its own)")
+                   help="with --board, the page's default host port (default: 9119; each page needs its own)")
     p = sub.add_parser("servers", help="list MCP servers agents can be granted")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("levels", help="list GitHub access levels agents can be granted")
@@ -385,8 +398,8 @@ def run_agent(args: argparse.Namespace, agents: Agents) -> int:
         if not 1 <= args.board_port <= 65535:
             raise AgentError(f"invalid port {args.board_port}")
         fields = {"name": name, "var": name.upper().replace("-", "_"), "port": args.board_port}
-        print(COMPOSE_SERVICE.format(**fields), end="")
-        print(COMPOSE_STEPS.format(**fields), file=sys.stderr)
+        print((COMPOSE_BOARD if args.board else COMPOSE_SERVICE).format(**fields), end="")
+        print((COMPOSE_BOARD_STEPS if args.board else COMPOSE_STEPS).format(**fields), file=sys.stderr)
         return 0
 
     if command == "edit":

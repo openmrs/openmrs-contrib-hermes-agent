@@ -115,8 +115,8 @@ x-hermes-agent: &hermes-agent
 # slash commands). The OIDC provider (e.g. Keycloak) decides who may log in. The page shares only the
 # agent's boards (<agent home>/kanban-shared) and holds only its own LiteLLM key (`fast` and read-only
 # MCP servers), from `bin/admin agent board <name>`. Its gateway serves no messaging platform and runs
-# no Kanban dispatcher: only the agent runs tasks. Until `bin/admin agent board <name>` and the OIDC
-# settings (see README.md), it has no keys and kanban-web refuses every request.
+# no Kanban dispatcher: only the agent runs tasks. Optional: add an agent's page with `bin/admin agent
+# compose <name> --board` (see README.md, "Board page setup"); the agent works without one.
 x-hermes-board: &hermes-board
   <<: *hermes-image
   restart: unless-stopped
@@ -459,7 +459,7 @@ services:
       litellm:
         condition: service_healthy
 
-  # Three services per agent:
+  # Two services per agent, and two more if it has a board page (optional; none here by default):
   #   agent-<name>      its own agents-data subdirectory, SOUL.md (identity prompt), and the shared
   #                     hermes/config.yaml
   #   workspace-<name>  its own workspace-config subdirectory and the shared caches
@@ -472,8 +472,9 @@ services:
   # its requests go, or its key. admin writes .env through the whole volume; changes apply on agent
   # restart. Restarting a workspace restarts its agent, so it forgets directories the reset removed.
   # To add an agent: append `bin/admin agent compose <name>` output here, write hermes/souls/<name>.md,
-  # then run `bin/admin agent add <name>` (required before the agent can start), and `bin/admin agent
-  # board <name>` before starting its board page.
+  # then run `bin/admin agent add <name>` (required before the agent can start). To give an agent a
+  # board page, run `bin/admin agent board <name>`, then append `bin/admin agent compose <name> --board`
+  # output here. The agent doesn't need its board page.
   agent-default:
     <<: *hermes-agent
     depends_on:
@@ -513,53 +514,6 @@ services:
       - workspace-cache:/cache
       # Emptied whenever the workspace resets.
       - /work
-
-  board-default:
-    <<: *hermes-board
-    environment:
-      <<: *board-environment
-      # The page's address as users reach it, e.g. https://board.example.org; its /auth/callback must be
-      # a redirect URI of the OIDC client. A loopback address turns off the login, so kanban-web refuses
-      # every request until this is set.
-      HERMES_DASHBOARD_PUBLIC_URL: ${BOARD_DEFAULT_URL:-http://127.0.0.1:9119}
-    # kanban-web-default's port, published from this namespace. Host-only; put a TLS reverse proxy in front.
-    ports:
-      - "127.0.0.1:${BOARD_DEFAULT_PORT:-9119}:8080"
-    volumes:
-      - type: volume
-        source: board-homes
-        target: /opt/data
-        volume:
-          subpath: default
-      - type: volume
-        source: board-homes
-        target: /opt/data/.env
-        read_only: true
-        volume:
-          subpath: default/.env
-      - type: volume
-        source: agents-data
-        target: /opt/data/kanban-shared
-        volume:
-          subpath: default/kanban-shared
-      - ./hermes/souls/board.md:/opt/data/SOUL.md:ro
-      - ./hermes/board.yaml:/opt/data/config.yaml:ro
-
-  kanban-web-default:
-    <<: *kanban-web
-    network_mode: service:board-default
-    depends_on:
-      board-default:
-        condition: service_started
-        restart: true
-    volumes:
-      - ./board-web:/app:ro
-      - type: volume
-        source: board-homes
-        target: /run/board-web
-        read_only: true
-        volume:
-          subpath: default/web
 
 # Bridge names are pinned (at most 15 characters) because Podman's netavark can leave an internal
 # network's "no forwarding" setting behind for its bridge name, and an external network that later

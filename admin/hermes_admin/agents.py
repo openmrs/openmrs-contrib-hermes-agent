@@ -340,7 +340,6 @@ class Agents:
             self._prepare_home(name)
             self._write_env(name, {KEY_VAR: key, **(slack or {})})
             self._write_workspace(name, workspace_key)
-            self._prepare_board_page(name)
         except Exception:
             self.api.delete_keys([key_hash, workspace_key_hash])
             raise
@@ -359,8 +358,6 @@ class Agents:
             validate_budget(budget)
         self.warnings = []
         agent = self._existing(name)
-        # Agents from before board pages get the directories their page needs to start.
-        self._prepare_board_page(name)
         if budget is not None or agent.budget is None:
             self._set_budget(name, DEFAULT_BUDGET if budget is None else budget)
         changes: dict = {}
@@ -399,7 +396,6 @@ class Agents:
                 self._write_board_page(name, board_key)
             self._write_env(name, {KEY_VAR: key})
             self._write_workspace(name, workspace_key)
-            self._prepare_board_page(name)
         except Exception:
             self.api.delete_keys(new_hashes)
             # The old keys still work: put back any already replaced, so nothing holds a revoked key.
@@ -459,7 +455,6 @@ class Agents:
             raise AgentError(f"unknown Slack settings {sorted(unknown)}; expected {list(SLACK_VARS)}")
         self._existing(name)
         self._write_env(name, values)
-        self._prepare_board_page(name)
         return self.get(name)
 
     def delete(self, name: str, purge: bool = False) -> None:
@@ -592,8 +587,7 @@ class Agents:
 
     def _prepare_board_page(self, name: str) -> None:
         """Create the page's home and .env, its proxy's directory, and the agent's board directory, which
-        the page mounts. compose.yaml starts every agent's page, and Compose refuses to start a container
-        whose volume subpath is missing; until `agent board`, the page has no keys and refuses everyone."""
+        the page mounts (Compose refuses to start a container whose volume subpath is missing)."""
         self._prepare_home(name)
         uid, gid = self.settings.uid, self.settings.gid
         # Hermes refuses a home others can write to.

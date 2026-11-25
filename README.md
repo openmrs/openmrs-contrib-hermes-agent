@@ -109,9 +109,9 @@ and `gh`.
 
 ### Board pages
 
-Each agent `<name>` has a board page, which starts with the rest of the stack but refuses everyone
-until it is set up (see [Board page setup](#board-page-setup)): two services that share a network
-namespace.
+Each agent `<name>` can have a board page (optional; the agent works without one, and `compose.yaml`
+has none until you add it, see [Board page setup](#board-page-setup)): two services that share a
+network namespace.
 
 - `board-<name>`: Hermes' web dashboard, whose Kanban tab shows the agent's boards (columns per
   status, drag and drop, comments, each run's history) and lets users create, change, and unblock
@@ -269,8 +269,7 @@ LiteLLM's admin UI is at http://127.0.0.1:4000/ui (host-only); log in with the m
 
 ### Board page setup
 
-Per agent; until then, its page answers every request with 503. Uses any OIDC provider; Keycloak is
-shown.
+Optional, per agent. Uses any OIDC provider; Keycloak is shown.
 
 1. **OIDC client.** Create a client, e.g. `hermes-board`: OpenID Connect, standard flow (authorization
    code) only, client authentication off (public; Hermes uses PKCE S256), and as valid redirect URI
@@ -286,10 +285,14 @@ shown.
    `https://keycloak.example.org/realms/openmrs`), `BOARD_OIDC_CLIENT_ID` if not `hermes-board`, and
    per agent `BOARD_<NAME>_URL` (e.g. `BOARD_DEFAULT_URL=https://board.example.org`) and, if 9119 is
    taken, `BOARD_<NAME>_PORT`. `<NAME>` is the agent's name in capitals, dashes as underscores.
-4. **The page's key:** `bin/admin agent board default --mcp atlassian_read,onyx_search` (or no `--mcp`).
-5. **Restart it** to pick up its keys and settings: `docker compose up -d --force-recreate board-default
-   kanban-web-default`, then point an HTTPS reverse proxy on the host at `http://127.0.0.1:9119`,
-   passing the original `Host` and setting `X-Forwarded-Proto: https`.
+4. **The page's keys and directories:** `bin/admin agent board default --mcp atlassian_read,onyx_search`
+   (or no `--mcp`). Compose can't start the page before this.
+5. **Its services:** add the output of `bin/admin agent compose default --board` under `services:` in
+   `compose.yaml` (give each agent's page its own `--board-port`).
+6. **Start it:** `docker compose up -d board-default kanban-web-default`, then point an HTTPS reverse
+   proxy on the host at `http://127.0.0.1:9119`, passing the original `Host` and setting
+   `X-Forwarded-Proto: https`. Until the dashboard requires a login (OIDC settings and a non-loopback
+   `BOARD_<NAME>_URL`), `kanban-web` answers every request with 503.
 
 Open `/kanban` for the board and `/board-chat` for the chat; the dashboard's other pages are refused.
 Assign tasks to `default` (the agent). A task's commands run in the agent's workspace, so leave its
@@ -363,7 +366,8 @@ bin/admin agent board [<name>] --revoke [--yes] # revoke the board page's key, k
 bin/admin agent slack [<name>]                  # prompts; blank keeps current values
 bin/admin agent rotate [<name>] [--yes]         # new agent, workspace, and SSH keys; old keys revoked
 bin/admin agent delete [<name>] [--purge] [--yes]
-bin/admin agent compose <name> [--board-port N] # agent-, workspace-, board-, and kanban-web-<name> blocks
+bin/admin agent compose <name>                  # agent-<name> and workspace-<name> blocks for compose.yaml
+bin/admin agent compose <name> --board [--board-port N]  # its board page's blocks (optional)
 
 bin/admin onyx setup [--budget USD] [--rotate-key]  # point Onyx at LiteLLM with its own key
 bin/admin onyx token                            # new ONYX_SEARCH_PAT for secrets/litellm.env
@@ -403,8 +407,8 @@ bin/admin onyx cleanup [--yes]                  # connectors and credentials a f
   spend, so `agent add` can bring it back. `--purge` also deletes its data, its board page's home, and
   both LiteLLM users.
 
-To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`
-(give each board page its own `--board-port`), write `hermes/souls/<name>.md`, run
+To add an agent: add the output of `bin/admin agent compose <name>` under `services:` in `compose.yaml`,
+write `hermes/souls/<name>.md`, run
 `bin/admin agent add <name> ...`, set up its Slack app (Setup step 6), then
 `docker compose up -d agent-<name>`. For its board page, see [Board page setup](#board-page-setup).
 
@@ -422,11 +426,6 @@ a matching `http://litellm:4000/mcp/<server>` entry with `strict_redirect_header
 keep it short. Hermes reads it when a session starts: use `/new` in Slack, or restart the agent.
 
 ## Upgrading
-
-**From before board pages:** every agent's page starts with the stack, and needs directories admin
-creates. Before `docker compose up -d`, run `bin/admin agent edit <name> --budget <its budget>` (or
-`agent board`, `agent rotate`, or `agent slack`) for each agent; otherwise Compose refuses to start its
-`board-<name>` (`cannot access path .../board-homes/_data/<name>`).
 
 Images are pinned by tag and digest, in `compose.yaml` and the Dockerfiles. Change both, using the
 digest of the tag's multi-platform index (`docker buildx imagetools inspect <image>:<tag>`), run

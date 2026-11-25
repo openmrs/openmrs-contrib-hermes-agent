@@ -9,9 +9,9 @@ ROTATE_DONE = "Issued new keys for {name} and its workspace and revoked the old 
 ROTATE_HINT = ("Restart the agent and its workspace to apply: docker compose restart workspace-{name} agent-{name} "
                "(and its board page, if it has one: docker compose restart board-{name} kanban-web-{name})")
 ROTATE_WARNING = "The agent stops working until it and its workspace are restarted."
-BOARD_HINT = ("Start or restart its board page with: docker compose up -d --force-recreate board-{name} kanban-web-{name}. If compose.yaml "
-              "has no board-{name} and kanban-web-{name} services yet, see: docker compose run --rm admin agent "
-              "compose {name}")
+BOARD_HINT = ("Start its board page with: docker compose up -d --force-recreate board-{name} kanban-web-{name}. If "
+              "compose.yaml has no board-{name} service yet, see: docker compose run --rm admin agent compose {name} "
+              "--board")
 BOARD_EDIT_HINT = "MCP and budget changes take effect immediately."
 BOARD_REVOKED = ("Revoked {name}'s board page key; its boards and chats are kept. Its page refuses everyone once "
                  "restarted: "
