@@ -71,6 +71,10 @@ services:
       - "127.0.0.1:${TEST_REVIEWER_PORT:-14644}:8644"
     environment:
       GITHUB_API_URL: http://fake-github:8004
+    # The real managed config with a short coalesce window (see run.sh); Compose replaces the mount
+    # with the same target.
+    volumes:
+      - ${TEST_WORK}/reviewer-config.yaml:/etc/hermes/config.yaml:ro
 
   # Like workspace-default; 2 GB because the production 8 GB doesn't fit next to the test stack.
   workspace-reviewer:

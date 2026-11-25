@@ -478,6 +478,8 @@ services:
       - ./hermes/reviewer/config.yaml:/etc/hermes/config.yaml:ro
       - ./hermes/plugins/github-review:/opt/data/plugins/github-review:ro
       - ./hermes/reviewer/skills:/opt/data/skills:ro
+      # The review-queue cron job's wake script (see README.md).
+      - ./hermes/reviewer/scripts:/opt/data/scripts:ro
       # The workspace supervisor's answer to a reset request (see workspace/supervisor.py).
       - type: volume
         source: reviewer-reset

@@ -116,10 +116,11 @@ and `gh`.
 ### PR reviewer
 
 The `reviewer` agent reviews pull requests in `openmrs-esm-patient-chart`,
-`openmrs-esm-patient-management`, and `openmrs-core`. GitHub's `pull_request` webhook (opened or
-ready for review; not drafts or bots) hits a signed route on the agent, which starts a run. The run
-checks the PR out in `workspace-reviewer`, builds and tests it and opens its UI in a browser if the
-diff looks safe to build, and posts one COMMENT review.
+`openmrs-esm-patient-management`, and `openmrs-core`. GitHub's `pull_request` webhook (opened,
+ready for review, or new commits; not drafts or bots) hits a signed route on the agent. Once a PR
+has had no event for 15 minutes (or an hour after its first), the route starts one run, for the
+newest commit. The run checks the PR out in `workspace-reviewer`, builds and tests it and opens its
+UI in a browser if the diff looks safe to build, and posts one COMMENT review.
 
 - **Config and tools.** Its managed config (`hermes/reviewer/config.yaml`, read-only) turns off tool
   search (plugin tools are listed directly), memory, background review, the curator, and all MCP
@@ -130,11 +131,24 @@ diff looks safe to build, and posts one COMMENT review.
 - **Profile.** `agent-reviewer` and `workspace-reviewer` are in the `reviewer` Compose profile, so a
   plain `docker compose up -d` doesn't start them. Commands that should include them, such as the
   update steps in [Upgrading](#upgrading), need `--profile reviewer` or `COMPOSE_PROFILES=reviewer`.
-- **One review at a time.** `prepare_workspace` resets the workspace and takes a lock. A review waits
-  up to 2 hours for it; a holder with no activity for 45 minutes loses it, and none keeps it over 3
-  hours. A failed run doesn't fire `on_session_end`, so its lock is freed only once it goes stale
-  and another review is waiting. `prepare_workspace` has its own tool deadline of about 2 hours.
-  It refuses a PR and commit already reviewed.
+- **One review at a time.** `prepare_workspace` resets the workspace and takes a lock. Waiting
+  reviews get it in the order they asked, each for up to 2 hours; a holder with no activity for 45
+  minutes loses it, and none keeps it over 3 hours. A failed run doesn't fire `on_session_end`, so
+  its lock is freed only once it goes stale and another review is waiting. `prepare_workspace` has
+  its own tool deadline of about 2 hours. It refuses a PR and commit already reviewed, a waiting
+  review whose PR has a newer commit queued, and, after asking GitHub with the `github_review`
+  token, a closed PR or one whose head moved (the new head is queued instead).
+- **Review queue.** The plugin keeps `/opt/data/github-review/queue.json`: one entry per PR, for its
+  newest commit. A bound run adds or replaces it; a posted review, a closed or draft PR, or a refusal
+  GitHub will repeat (a 422 not about a line, a 404) removes it; a run that ends without one gives
+  it back. A run that failed on a model error never ends that way, so its entry is free again after
+  45 minutes without a model request or tool result (or at once if the agent restarts). After three
+  runs it is dropped with a warning in the agent's log.
+  The `review-queue` cron job (see [PR reviewer setup](#pr-reviewer-setup)) runs every 15 minutes
+  and reviews the oldest entry no live run has: one left by a restart, a 2-hour wait that ran out,
+  or a failed run. Its wake script (`hermes/reviewer/scripts`, read-only) skips the model when no
+  entry is free, so an empty queue costs nothing. The job runs in the gateway's process, so it
+  shares the lock (not under systemd, where Hermes would start it as a separate process).
 - **Browser.** Only `openmrsinfra/hermes-workspace-reviewer` (the `reviewer` stage of
   `workspace/Dockerfile`) has Chromium and `agent-browser`. Chromium is pinned to a build from a
   `debian-security` snapshot; bump the pin periodically (see the Dockerfile) so it isn't behind
@@ -146,6 +160,8 @@ diff looks safe to build, and posts one COMMENT review.
     of that PR and commit is done, `prepare_workspace` refuses the resend at once. If it still runs,
     the resend waits in `prepare_workspace` (up to 2 hours) and is refused when it gets the
     workspace. Hermes limits each route to 30 requests a minute.
+  - Events in a PR's 15-minute coalesce window are held in memory. A restart starts their review at
+    once, but a hard kill of the agent loses them; that PR is reviewed only after its next event.
   - The Hermes webhook server on 8644 is reachable from the internet and from every workspace on
     the `workspaces` network. Every route needs a valid signature.
   - The reviewer's Maven and npm cache (`reviewer-cache`) survives resets, so a PR build can poison
@@ -280,8 +296,16 @@ Optional; needs the `github_read` App from step 4 above.
    `docker compose --profile reviewer up -d agent-reviewer workspace-reviewer`. Later commands that
    should include the reviewer (such as the update in [Upgrading](#upgrading)) need
    `--profile reviewer`, or set `COMPOSE_PROFILES=reviewer` in `./.env`.
-5. **Test:** open a PR in one of the three repositories and watch
-   `docker compose logs -f agent-reviewer`.
+5. **Review queue:** create the cron job that reviews what the webhook's runs left (the prompt must
+   contain `REVIEW-QUEUE-WORKER`; the plugin binds only those runs):
+   ```sh
+   bin/agent reviewer cron create --name review-queue --skill pr-review \
+     --script review-queue-check.py --deliver local 'every 15m' \
+     'REVIEW-QUEUE-WORKER: review the next pull request in the review queue.'
+   ```
+   It lives in the agent's data (`/opt/data/cron/jobs.json`), so it survives restarts and updates.
+6. **Test:** open a PR in one of the three repositories and watch
+   `docker compose logs -f agent-reviewer`. Its review starts 15 minutes after the last event.
 
 ### Atlassian keys
 

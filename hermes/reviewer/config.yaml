@@ -28,6 +28,12 @@ plugins:
 tools:
   tool_search:
     enabled: "off"
+# The review-queue cron job (README.md) runs reviews the webhook's sessions didn't finish, with the
+# route's toolsets. One job at a time; the plugin serves the workspace to one review at a time anyway.
+platform_toolsets:
+  cron: [terminal, file, github_review, no_mcp]
+cron:
+  max_parallel_jobs: 1
 platforms:
   webhook:
     enabled: true
@@ -38,13 +44,21 @@ platforms:
           # No route secret: falls back to WEBHOOK_SECRET (<H>/gateway/config_env.py:123-132).
           filters:
             - field: action
-              in: [opened, ready_for_review]
+              in: [opened, ready_for_review, synchronize]
             - field: pull_request.draft
               equals: false
             - field: pull_request.user.type
               not_equals: Bot
             - field: repository.full_name
               in: [openmrs/openmrs-esm-patient-chart, openmrs/openmrs-esm-patient-management, openmrs/openmrs-core]
+          # A pull request's events start one review, for the newest, once it has had none for 15
+          # minutes (or an hour after the first); the group's earlier commits aren't reviewed. Waiting events
+          # are in memory: a restart sends them at once, a hard kill loses them
+          # (<H>/gateway/platforms/webhook_coalesce.py).
+          coalesce:
+            key: "{repository.full_name}#{pull_request.number}"
+            window_seconds: 900
+            max_wait_seconds: 3600
           # A skill folder on disk (/opt/data/skills/pr-review); plugin skills are not found here
           # (<H>/gateway/platforms/webhook.py:645-661).
           skills: [pr-review]

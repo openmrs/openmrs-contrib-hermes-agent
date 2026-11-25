@@ -9,6 +9,11 @@ Review requests: logs a "review" line with the repository, pull request, commit,
 inline comments, and token, and answers as GitHub does. A comment on the path "not-in-diff.txt"
 gets GitHub's 422 for a line outside the diff; pull request 30 gets a 422 about the commit. Pull request 15 gets a 500 and pull request 16 a 200
 whose body isn't JSON, both after the review is logged, as if GitHub had created it.
+
+Pull request reads (GET /repos/<repo>/pulls/<n>): logs a "pull" line with the repository, pull
+request, and token. Pull request 40 is closed and 43 a draft; pull request 44's answer isn't JSON;
+pull request 41's head is "f" * 40 and 28's is "e" * 40; any other is open with head "c" * 40
+(run.sh's webhook events use that commit).
 """
 
 import base64
@@ -53,6 +58,8 @@ def jwt_ok(token):
 
 
 REVIEW_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/reviews$")
+PULL_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)$")
+HEADS = {"41": "f" * 40, "28": "e" * 40}
 LINE_NOT_IN_DIFF = "Unprocessable Entity: pull_request_review_thread.line must be part of the diff"
 # A 422 that moving a comment can't fix, e.g. after a force-push. Not GitHub's exact wording.
 COMMIT_NOT_IN_PR = "commit_id is not part of the pull request"
@@ -83,6 +90,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"<html>not JSON</html>")
             return
         self.send_json(200, {"id": 1, "html_url": f"https://github.com/{repo}/pull/{pr}#pullrequestreview-1"})
+
+    def do_GET(self):
+        pull = PULL_PATH.match(self.path)
+        if not pull:
+            self.send_json(404, {"message": "Not Found"})
+            return
+        auth = self.headers.get("Authorization", "")
+        token = auth.split(" ", 1)[1] if " " in auth else ""
+        repo, pr = pull.groups()
+        print(f"pull repo={repo} pr={pr} token={token}", flush=True)
+        if pr == "44":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html>not JSON</html>")
+            return
+        self.send_json(200, {"number": int(pr), "state": "closed" if pr == "40" else "open", "draft": pr == "43",
+                             "head": {"sha": HEADS.get(pr, "c" * 40)}})
 
     def do_POST(self):
         global minted

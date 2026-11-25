@@ -34,6 +34,10 @@ install_profile_terminal_scope(get_hermes_home())
 discover_plugins()
 plugin = next(p.module for p in get_plugin_manager()._plugins.values()
               if p.manifest.name == "github-review" and p.enabled and p.module)
+# Until case (bb), GitHub's answer for a pull request is open, not a draft, at the bound commit: the cases use
+# commits fake-github doesn't know. (bb) checks the real request.
+real_pull_request = plugin._pull_request
+plugin._pull_request = lambda binding: ("open", binding.head_sha, False)
 
 CHART = "openmrs/openmrs-esm-patient-chart"
 COMMENTS = [
@@ -47,14 +51,24 @@ def target(repo, pr, sha):
 
 
 def bind(session, message, platform="webhook", first_turn=True):
-    invoke_hook("pre_llm_call", session_id=session, task_id=session, turn_id="t1", user_message=message,
-                conversation_history=[], is_first_turn=first_turn, model="auto", platform=platform,
-                parent_session_id="", sender_id="")
+    """Hermes' pre_llm_call; returns the context the hooks add to the prompt."""
+    results = invoke_hook("pre_llm_call", session_id=session, task_id=session, turn_id="t1", user_message=message,
+                          conversation_history=[], is_first_turn=first_turn, model="auto", platform=platform,
+                          parent_session_id="", sender_id="")
+    return " ".join(str(r.get("context")) for r in results or [] if isinstance(r, dict) and r.get("context"))
 
 
 def prepare(session):
     result = json.loads(handle_function_call("prepare_workspace", {}, task_id=session, session_id=session))
-    return "prepared" if result.get("success") else "refused"
+    if result.get("success"):
+        return "prepared"
+    if "newer commit" in str(result.get("error")):
+        return "superseded"
+    if "is closed" in str(result.get("error")):
+        return "closed"
+    if "is a draft" in str(result.get("error")):
+        return "draft"
+    return "refused"
 
 
 def end(session, platform="webhook"):
@@ -210,7 +224,7 @@ while waiter.is_alive():
     heartbeat("review-l1")
     time.sleep(1)
 error = str(second.get("result", {}).get("error"))
-outcomes["l"] = "refused" if "another review held the workspace" in error else str(second)
+outcomes["l"] = "refused" if "other reviews held the workspace" in error else str(second)
 end("review-l1")
 end("review-l2")
 plugin.LOCK_WAIT_SECONDS, plugin.LOCK_STALE_SECONDS, plugin.LOCK_SLICE_SECONDS = limits
@@ -304,6 +318,8 @@ end("review-i3")
 # not to retry, and nothing is recorded.
 bind_prepared("review-r", target(CHART, 30, "e" * 40))
 outcomes["r"] = post("review-r", review)
+# ...and it leaves the review queue, so no later session tries it again.
+outcomes["r-queue"] = "none" if plugin._read_queue().get(f"{CHART}#30") is None else "kept"
 end("review-r")
 # (t) GitHub's address refuses the connection: nothing was sent, so nothing is recorded, and the
 # same session posts once GitHub is back.
@@ -330,5 +346,170 @@ outcomes["n1"] = prepare("review-n")
 end("review-m2")
 outcomes["n2"] = prepare("review-n")
 end("review-n")
+
+# The review queue. Waiters recheck every second.
+plugin.LOCK_WAIT_SECONDS, plugin.LOCK_SLICE_SECONDS = 60, 1
+plugin._write_queue({})
+
+
+def entry(repo, pr):
+    return plugin._read_queue().get(f"{repo}#{pr}")
+
+
+def in_thread(function):
+    """Runs function in a thread with this context (the secret scope is a context variable)."""
+    thread = threading.Thread(target=contextvars.copy_context().run, args=(function,))
+    thread.start()
+    return thread
+
+
+def wake_gate():
+    """The review-queue job's wake script: "sleep" if it skips the model, else "wake"."""
+    import subprocess
+    out = subprocess.run([sys.executable, "/opt/data/scripts/review-queue-check.py"], capture_output=True, text=True,
+                         check=False).stdout.strip().splitlines()
+    return "sleep" if out and out[-1] == '{"wakeAgent": false}' else f"wake:{out}"
+
+
+def queue_state(repo, pr):
+    e = entry(repo, pr)
+    return "none" if e is None else f"{e['attempts']}:{(e.get('owner') or {}).get('session')}"
+
+
+# (v) a bound session queues its pull request; a redelivery of the same commit counts another
+# session; both ending leave the entry free.
+bind("review-v", target(CHART, 50, "1" * 40))
+outcomes["v"] = queue_state(CHART, 50)
+bind("review-v2", target(CHART, 50, "1" * 40))
+outcomes["v2"] = queue_state(CHART, 50)
+end("review-v")
+end("review-v2")
+outcomes["v-end"] = queue_state(CHART, 50)
+
+# (w) a newer commit of the pull request a review waits for: the waiting review stops (superseded),
+# and the newer one's review gets the workspace.
+bind_prepared("review-w0", target(CHART, 51, "a" * 40))
+bind("review-w1", target(CHART, 52, "1" * 40))
+w = {}
+w1 = in_thread(lambda: w.update(w1=prepare("review-w1")))
+time.sleep(2)
+bind("review-w2", target(CHART, 52, "2" * 40))
+w1.join(15)
+outcomes["w1"] = w.get("w1", "waiting")
+w2 = in_thread(lambda: w.update(w2=prepare("review-w2")))
+time.sleep(2)
+end("review-w0")
+w2.join(60)
+outcomes["w2"] = w.get("w2", "waiting")
+end("review-w1")
+end("review-w2")
+
+# (x) waiting reviews get the workspace in the order they asked.
+bind_prepared("review-x0", target(CHART, 53, "a" * 40))
+bind("review-x1", target(CHART, 54, "1" * 40))
+bind("review-x2", target(CHART, 55, "2" * 40))
+x = {}
+x1 = in_thread(lambda: x.update(x1=prepare("review-x1")))
+time.sleep(1)
+x2 = in_thread(lambda: x.update(x2=prepare("review-x2")))
+time.sleep(1)
+end("review-x0")
+x1.join(60)
+x2_waited = x2.is_alive()
+end("review-x1")
+x2.join(60)
+outcomes["x"] = ("in-order" if x.get("x1") == "prepared" and x2_waited and x.get("x2") == "prepared"
+                 else f"{x} x2_waited={x2_waited}")
+end("review-x2")
+
+# (y) a posted review leaves the queue.
+bind_prepared("review-y", target(CHART, 56, "a" * 40))
+outcomes["y"] = f"{post('review-y', review)}:{queue_state(CHART, 56)}"
+end("review-y")
+
+# (z) the review-queue cron job: its sessions take the oldest free entries (one whose session's
+# process is gone, then one with no session), never one at MAX_ATTEMPTS or for an unlisted
+# repository, and get its REVIEW-TARGET line. A cron session without the job's marker takes none.
+# The wake script skips the model once no entry is free.
+WORKER = f"{plugin.WORKER_MARKER}: review the next pull request in the review queue."
+plugin._write_queue({
+    f"{CHART}#60": {"sha": "1" * 40, "queued": 1, "attempts": 1, "owner": {"pid": 999999, "start": "1", "session": "gone"}},
+    f"{CHART}#61": {"sha": "2" * 40, "queued": 2, "attempts": 0, "owner": None},
+    f"{CHART}#62": {"sha": "3" * 40, "queued": 0.5, "attempts": 3, "owner": None},
+    "openmrs/openmrs-module-fhir2#63": {"sha": "4" * 40, "queued": 0.1, "attempts": 0, "owner": None},
+})
+outcomes["z-gate"] = wake_gate().split(":")[0]
+outcomes["z0"] = (bind("review-z0", "Some other cron job.", platform="cron") or "none") + ":" + prepare("review-z0")
+outcomes["z1"] = "pr60" if target(CHART, 60, "1" * 40) in bind("review-z1", WORKER, platform="cron") else "other"
+outcomes["z2"] = "pr61" if target(CHART, 61, "2" * 40) in bind("review-z2", WORKER, platform="cron") else "other"
+outcomes["z3"] = "empty" if "no pull request for you" in bind("review-z3", WORKER, platform="cron") else "other"
+outcomes["z3-prepare"] = prepare("review-z3")
+# A review-queue session with no pull request can't use the workspace's tools.
+outcomes["z3-terminal"] = terminal_as("review-z3", "echo ran")
+outcomes["z-unlisted"] = "dropped" if entry("openmrs/openmrs-module-fhir2", 63) is None else "kept"
+outcomes["z-gate-after"] = wake_gate().split(":")[0]
+outcomes["z1-prepare"] = prepare("review-z1")
+end("review-z1", platform="cron")
+outcomes["z1-end"] = queue_state(CHART, 60)
+end("review-z2", platform="cron")
+end("review-z3", platform="cron")
+
+# (aa) an entry's third session ends without a review: the entry is dropped.
+plugin._write_queue({f"{CHART}#64": {"sha": "5" * 40, "queued": 1, "attempts": 2, "owner": None}})
+bind("review-aa", WORKER, platform="cron")
+outcomes["aa"] = queue_state(CHART, 64)
+end("review-aa", platform="cron")
+outcomes["aa-end"] = queue_state(CHART, 64)
+
+# (cc) an entry whose session's process is alive but hasn't stamped it for OWNER_STALE_SECONDS (a
+# run that failed without on_session_end) is free: the wake script wakes, and a session takes it.
+plugin._write_queue({f"{CHART}#65": {"sha": "6" * 40, "queued": 1, "attempts": 1, "owner": {
+    **plugin._PROCESS, "session": "failed-run", "beat": time.time() - plugin.OWNER_STALE_SECONDS - 5}}})
+outcomes["cc-gate"] = wake_gate().split(":")[0]
+outcomes["cc"] = "pr65" if target(CHART, 65, "6" * 40) in bind("review-cc", WORKER, platform="cron") else "other"
+end("review-cc", platform="cron")
+# (dd) a live session's heartbeat stamps its entry again, so it stays taken.
+plugin._write_queue({})
+bind("review-dd", target(CHART, 66, "7" * 40))
+queue = plugin._read_queue()
+queue[f"{CHART}#66"]["owner"]["beat"] = time.time() - plugin.OWNER_STALE_SECONDS - 5
+plugin._write_queue(queue)
+outcomes["dd-stale"] = wake_gate().split(":")[0]
+beat_write = plugin.BEAT_WRITE_SECONDS
+plugin.BEAT_WRITE_SECONDS = 0
+heartbeat("review-dd")
+plugin.BEAT_WRITE_SECONDS = beat_write
+outcomes["dd"] = wake_gate().split(":")[0]
+end("review-dd")
+# (ee) the wake script doesn't count an entry for a commit already reviewed (posted.json has (a)).
+plugin._write_queue({f"{CHART}#11": {"sha": "a" * 40, "queued": 1, "attempts": 0, "owner": None}})
+outcomes["ee"] = wake_gate().split(":")[0]
+# (ff) a moved head that is already queued keeps its entry, and the session that has it.
+plugin._write_queue({f"{CHART}#41": {"sha": "f" * 40, "queued": 1, "attempts": 1, "owner": plugin._owner("ff-live")}})
+with plugin._lock:
+    plugin._requeue(plugin.Binding(CHART, 41, "c" * 40), "f" * 40)
+outcomes["ff"] = queue_state(CHART, 41)
+plugin._write_queue({})
+
+# (bb) GitHub's answer, from fake-github with the github_review token: a closed pull request leaves
+# the queue; a moved head stops this review and queues the new head; an open one at the bound commit
+# is prepared.
+plugin._pull_request = real_pull_request
+bind("review-bb1", target(CHART, 40, "c" * 40))
+outcomes["bb1"] = f"{prepare('review-bb1')}:{queue_state(CHART, 40)}"
+end("review-bb1")
+bind("review-bb2", target(CHART, 41, "c" * 40))
+outcomes["bb2"] = f"{prepare('review-bb2')}:{(entry(CHART, 41) or {}).get('sha', '')[:1]}:{queue_state(CHART, 41)}"
+end("review-bb2")
+bind("review-bb3", target(CHART, 42, "c" * 40))
+outcomes["bb3"] = prepare("review-bb3")
+end("review-bb3")
+# A draft leaves the queue; an answer that isn't JSON stops the review but keeps the entry.
+bind("review-bb4", target(CHART, 43, "c" * 40))
+outcomes["bb4"] = f"{prepare('review-bb4')}:{queue_state(CHART, 43)}"
+end("review-bb4")
+bind("review-bb5", target(CHART, 44, "c" * 40))
+outcomes["bb5"] = f"{prepare('review-bb5')}:{queue_state(CHART, 44)}"
+end("review-bb5")
 
 print(" ".join(f"{case}={outcome}" for case, outcome in outcomes.items()))

@@ -41,6 +41,7 @@ AGENT_EXTRA_BINDS = {
         "/etc/hermes/config.yaml": "hermes/reviewer/config.yaml",
         "/opt/data/plugins/github-review": "hermes/plugins/github-review",
         "/opt/data/skills": "hermes/reviewer/skills",
+        "/opt/data/scripts": "hermes/reviewer/scripts",
     },
 }
 # Named volumes an agent mounts read-only, and its workspace mounts read-write, beyond the above
