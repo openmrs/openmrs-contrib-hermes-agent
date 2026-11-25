@@ -155,7 +155,7 @@ for name, service in sorted(boards.items()):
     service_mounts = mounts(service)
     homes = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data"]
     envs = [m for m in service_mounts if m.get("source") == "board-homes" and m.get("target") == "/opt/data/.env"]
-    shared = [m for m in service_mounts if m.get("source") == "agents-data" and m.get("target") == "/opt/kanban"]
+    shared = [m for m in service_mounts if m.get("source") == "agents-data" and m.get("target") == AGENT_KANBAN_HOME]
     souls = [m for m in service_mounts if m.get("target") == "/opt/data/SOUL.md"]
     configs = [m for m in service_mounts if m.get("target") == "/opt/data/config.yaml"]
     check(f"{name}: mounts only its own board-homes subdirectory and .env, the agent's boards, SOUL.md, and config.yaml",
@@ -166,9 +166,9 @@ for name, service in sorted(boards.items()):
     check(f"{name}: .env is {agent_name}/.env in board-homes, read-only",
           len(envs) == 1 and envs[0].get("read_only") is True
           and (envs[0].get("volume") or {}).get("subpath") == f"{agent_name}/.env", envs)
-    check(f"{name}: of agents-data, only {agent_name}/kanban-shared, as Kanban's home",
+    check(f"{name}: of agents-data, only {agent_name}/kanban-shared, as Kanban's home at the agent's path",
           len(shared) == 1 and (shared[0].get("volume") or {}).get("subpath") == f"{agent_name}/kanban-shared"
-          and environment.get("HERMES_KANBAN_HOME") == "/opt/kanban", shared)
+          and environment.get("HERMES_KANBAN_HOME") == AGENT_KANBAN_HOME, shared)
     check(f"{name}: SOUL.md is hermes/souls/board.md, read-only",
           len(souls) == 1 and souls[0].get("type") == "bind" and souls[0].get("read_only") is True
           and str(souls[0].get("source", "")).replace("\\", "/").endswith("/hermes/souls/board.md"), souls)

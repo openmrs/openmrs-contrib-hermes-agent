@@ -25,7 +25,7 @@ import re
 import time
 from pathlib import Path
 
-from aiohttp import ClientSession, ClientTimeout, DummyCookieJar, WSMsgType, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, DummyCookieJar, WSMsgType, web
 
 DASHBOARD = os.environ.get("BOARD_DASHBOARD", "http://127.0.0.1:9119")
 API = os.environ.get("BOARD_API", "http://127.0.0.1:8642")
@@ -42,13 +42,23 @@ GET_PATHS = {
 }
 GET_PREFIXES = ("/assets/", "/dashboard-plugins/", "/ds-assets/", "/fonts/", "/fonts-terminal/")
 POST_PATHS = {"/auth/logout", "/api/auth/ws-ticket"}
-# Any method: the Kanban tab's API. Its only WebSocket is its live updates.
+# Any method: the Kanban tab's API, except what acts on this container's processes or on server paths:
+# a dispatcher tick (which reclaims tasks the agent is still running, since the agent's workers aren't
+# processes here), reclaiming or terminating a run, exporting or importing a board (server file
+# paths), and switching the shared current board. Its only WebSocket is its live updates.
 KANBAN_PREFIX = "/api/plugins/kanban/"
 KANBAN_EVENTS = "/api/plugins/kanban/events"
+KANBAN_REFUSED = re.compile(r"^/api/plugins/kanban/(dispatch|tasks/[^/]+/reclaim|runs/[^/]+/terminate|"
+                            r"boards/import|boards/[^/]+/(export|switch))/?$")
 
 # Not forwarded either way (RFC 9110 hop-by-hop headers, and lengths aiohttp recomputes).
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
               "transfer-encoding", "upgrade", "content-length"}
+# Forwarding headers from the browser are dropped (the dashboard trusts them from here, so a user could
+# forge the client address it logs, or the prefix it redirects to); X-Forwarded-For is set to the peer.
+# X-Forwarded-Proto is kept: the host's TLS proxy sets it, and it only decides whether cookies are Secure.
+CLIENT_FORWARDING = {"x-forwarded-for", "x-forwarded-host", "x-forwarded-prefix", "x-forwarded-port",
+                     "x-forwarded-server", "x-real-ip", "forwarded"}
 # Raw paths with dot segments, encoded slashes or dots, or backslashes could be read differently here
 # and by the dashboard, so they're refused outright.
 SUSPICIOUS_PATH = re.compile(r"(^|/)\.\.?(/|$)|%2e|%2f|%5c|\\|//", re.IGNORECASE)
@@ -62,7 +72,7 @@ def allowed(method: str, path: str, websocket: bool) -> bool:
     if websocket:
         return method == "GET" and path == KANBAN_EVENTS
     if path.startswith(KANBAN_PREFIX):
-        return True
+        return not KANBAN_REFUSED.match(path)
     if method in ("GET", "HEAD"):
         return path in GET_PATHS or path.startswith(GET_PREFIXES)
     return method == "POST" and path in POST_PATHS
@@ -98,9 +108,12 @@ class BoardWeb:
     @staticmethod
     def upstream_headers(request: web.Request) -> dict[str, str]:
         headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in HOP_BY_HOP and not k.lower().startswith("sec-websocket")}
+                   if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_FORWARDING
+                   and not k.lower().startswith("sec-websocket")}
         # The host's TLS proxy says whether the browser used HTTPS; the dashboard trusts loopback.
         headers.setdefault("X-Forwarded-Proto", "http")
+        if request.remote:
+            headers["X-Forwarded-For"] = request.remote
         return headers
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
@@ -119,9 +132,12 @@ class BoardWeb:
         websocket = request.headers.get("Upgrade", "").lower() == "websocket"
         if not allowed(request.method, path, websocket):
             return web.Response(status=404, text="Not available on the board page.\n")
-        if websocket:
-            return await self.relay_websocket(request)
-        return await self.forward(request)
+        try:
+            if websocket:
+                return await self.relay_websocket(request)
+            return await self.forward(request)
+        except (OSError, asyncio.TimeoutError, ClientError):
+            return web.Response(status=502, text="The board page isn't answering.\n")
 
     async def forward(self, request: web.Request) -> web.StreamResponse:
         async with self.session.request(request.method, DASHBOARD + request.raw_path,
@@ -174,25 +190,49 @@ class BoardWeb:
     async def chat(self, request: web.Request) -> web.StreamResponse:
         if request.method != "POST":
             return web.Response(status=405)
-        if not await self.logged_in(request):
-            return web.json_response({"error": "Log in to the board page first."}, status=401)
-        body = await request.content.read(MAX_CHAT_BYTES + 1)
+        try:
+            if not await self.logged_in(request):
+                return web.json_response({"error": "Log in to the board page first."}, status=401)
+        except (OSError, asyncio.TimeoutError, ClientError):
+            return web.json_response({"error": "The board page isn't answering."}, status=502)
+        body = await self.read_body(request)
         try:
             messages = self.chat_messages(body)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
-        key = KEY_FILE.read_text().strip()
+        try:
+            key = KEY_FILE.read_text().strip()
+        except OSError:
+            key = ""
+        if not key:
+            return web.json_response({"error": "The board chat has no key; see `bin/admin agent board`."}, status=502)
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-store"})
-        async with self.session.post(API + "/v1/chat/completions",
-                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                                     json={"model": "hermes-agent", "messages": messages, "stream": True}) as upstream:
-            if upstream.status != 200:
-                return web.json_response({"error": f"The chat failed (HTTP {upstream.status})."}, status=502)
-            await response.prepare(request)
-            async for chunk in upstream.content.iter_any():
-                await response.write(chunk)
+        try:
+            async with self.session.post(API + "/v1/chat/completions",
+                                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                         json={"model": "hermes-agent", "messages": messages, "stream": True}) as upstream:
+                if upstream.status != 200:
+                    return web.json_response({"error": f"The chat failed (HTTP {upstream.status})."}, status=502)
+                await response.prepare(request)
+                async for chunk in upstream.content.iter_any():
+                    await response.write(chunk)
+        except (OSError, asyncio.TimeoutError, ClientError):
+            if not response.prepared:
+                return web.json_response({"error": "The board chat isn't answering."}, status=502)
         await response.write_eof()
         return response
+
+    @staticmethod
+    async def read_body(request: web.Request) -> bytes:
+        """The whole request body, or its first MAX_CHAT_BYTES + 1 bytes (enough to refuse it)."""
+        chunks, size = [], 0
+        while size <= MAX_CHAT_BYTES:
+            chunk = await request.content.read(MAX_CHAT_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
 
     @staticmethod
     def chat_messages(body: bytes) -> list[dict[str, str]]:

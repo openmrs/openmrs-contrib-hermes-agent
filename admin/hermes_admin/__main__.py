@@ -92,7 +92,7 @@ COMPOSE_SERVICE = """\
           subpath: {name}/.env
       - type: volume
         source: agents-data
-        target: /opt/kanban
+        target: /opt/data/kanban-shared
         volume:
           subpath: {name}/kanban-shared
       - ./hermes/souls/board.md:/opt/data/SOUL.md:ro

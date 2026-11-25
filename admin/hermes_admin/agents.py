@@ -28,6 +28,7 @@ read at startup, so changes need a restart.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -379,18 +380,32 @@ class Agents:
         """Issue new LiteLLM and SSH keys for the agent and its workspace, then revoke the old ones.
         Also creates a missing workspace key."""
         agent = self._existing(name)
+        old_key = env_values(self._home(name) / ".env").get(KEY_VAR)
+        board_env = self._board_home(name) / ".env"
+        web_key = self._board_home(name) / BOARD_WEB_SUBDIR / BOARD_WEB_KEY_FILE
+        old_board = env_values(board_env)
+        old_web_key = web_key.read_text() if web_key.is_file() else None
         key, key_hash = self._issue_key(name, agent.mcp_servers, agent.github_levels)
         workspace_key, workspace_key_hash = self._issue_workspace_key(name, agent.github_levels)
         new_hashes = [key_hash, workspace_key_hash]
         try:
-            self._write_env(name, {KEY_VAR: key})
-            self._write_workspace(name, workspace_key)
+            # The board page first, so its failure (it's optional) leaves the agent's files untouched.
             if agent.board_key_hashes:
                 board_key, board_key_hash = self._issue_board_key(name, agent.board_mcp_servers)
                 new_hashes.append(board_key_hash)
                 self._write_board_page(name, board_key)
+            self._write_env(name, {KEY_VAR: key})
+            self._write_workspace(name, workspace_key)
         except Exception:
             self.api.delete_keys(new_hashes)
+            # The old keys still work: put back any already replaced, so nothing holds a revoked key.
+            with contextlib.suppress(Exception):
+                if old_key:
+                    self._write_env(name, {KEY_VAR: old_key})
+                if agent.board_key_hashes and old_board:
+                    self._write_env(name, {var: old_board.get(var) for var in (KEY_VAR, API_SERVER_KEY_VAR)}, board_env)
+                if agent.board_key_hashes and old_web_key is not None:
+                    self._write_file(web_key, old_web_key, 0o600, self.settings.uid, self.settings.gid)
             raise
         self.api.delete_keys(agent.key_hashes + agent.workspace_key_hashes + agent.board_key_hashes)
         return self.get(name)
@@ -578,6 +593,10 @@ class Agents:
         # Hermes refuses a home others can write to.
         for path, mode in ((self._home(name) / BOARD_SUBDIR, 0o755), (self._board_home(name), 0o755),
                            (self._board_home(name) / BOARD_WEB_SUBDIR, 0o700)):
+            # The agent and the page can write in their homes; admin, as root, must not follow a link
+            # either planted.
+            if path.is_symlink():
+                raise AgentError(f"{path} is a symbolic link; remove it and run `agent board` again")
             path.mkdir(exist_ok=True)
             os.chown(path, uid, gid)
             os.chmod(path, mode)

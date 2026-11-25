@@ -496,6 +496,11 @@ old_nobody_ssh_key="$(admin_sh 'cat /agents/nobody/ssh/id_ed25519' | shasum -a 2
 # Agents created before admin wrote the workspace host to .env get it from rotate.
 admin_sh 'grep -v ^TERMINAL_SSH_HOST= /agents/nobody/.env > /agents/nobody/.env.new && cat /agents/nobody/.env.new > /agents/nobody/.env && rm /agents/nobody/.env.new'
 expect_ok "agent board nobody" admin agent board nobody
+if compose run --rm -T --entrypoint python admin /tests/admin_rotate_checks.py nobody; then
+  pass "a rotate that fails at the board page puts back the keys it replaced"
+else
+  fail "a rotate that fails at the board page puts back the keys it replaced (see output above)"
+fi
 old_nobody_board_key="$(board_key nobody)"
 expect_refused "agent rotate needs confirmation without --yes" admin agent rotate nobody </dev/null
 expect "agent rotate without confirmation keeps the key" "$nobody_key" "$(agent_key nobody)"
@@ -992,14 +997,18 @@ expect "a user the provider logs in reaches the board" "302 / | 200 board-user@e
   "$(board_check login) | $(board_check me) | $(board_check board)"
 board_task="$(board_check task)"
 expect "a logged-in user creates and comments on a task" "200  200" "$(board_check create) $(board_check comment)"
-expect "the page's dispatch button starts nothing: the page claims no tasks" "200 spawned=0 skipped=True" \
-  "$(board_check dispatch)"
+board_attachment="$(board_check attachment | cut -d' ' -f2-)"
+expect "an attachment uploaded on the page is stored where the agent can read it" "200 present" \
+  "$(board_check attachment | cut -d' ' -f1) $(compose exec -T agent-default sh -c "test -f '$board_attachment' && echo present || echo missing" 2>&1)"
 expect "the Kanban tab's live updates connect through kanban-web" "connected" "$(board_check "live updates")"
 expect "kanban-web refuses the dashboard's terminal chat" "refused 404" "$(board_check "terminal websocket")"
-expect "kanban-web refuses the rest of the dashboard to a logged-in user (secrets, settings, sessions, files, cron, profiles, hooks, skills, gateway)" \
-  "404 404 404 404 404 404 404 404 404 404 404 404 404 404" "$(board_check refused)"
+expect "kanban-web refuses the rest of the dashboard to a logged-in user (secrets, settings, sessions, files, cron, profiles, hooks, skills, gateway, Kanban dispatch, reclaim, terminate, import, export, switch)" \
+  "$(printf '404 %.0s' $(seq 1 20) | sed 's/ $//')" "$(board_check refused)"
 expect "kanban-web refuses dot segments and encoded slashes" "400 400 400 400" "$(board_check "refused paths")"
 expect "the board chat answers a logged-in user, with fast through the page's key" "200 fast-model-answered" "$(board_check chat)"
+expect "the board chat takes a long conversation that arrives in pieces" "200" "$(board_check "chat in pieces")"
+expect "a forged client address doesn't reach the dashboard's audit log" "0" \
+  "$(compose exec -T board-default sh -c 'grep -c 203.0.113.99 /opt/data/logs/dashboard-auth.log || true' 2>&1)"
 expect "the board chat refuses slash and shell commands" \
   "400 Commands (messages starting with / or !) aren't available here. | 400 Commands (messages starting with / or !) aren't available here." \
   "$(board_check "chat slash command") | $(board_check "chat shell command")"
@@ -1113,7 +1122,7 @@ expect "board page environment and files hold no agent, workspace, LiteLLM, mast
     env > /tmp/board-env; checked=0; leaked=0
     while read -r s; do
       checked=$((checked + 1))
-      if grep -rqF -- "$s" /tmp/board-env /opt/data /opt/kanban; then leaked=$((leaked + 1)); fi
+      if grep -rqF -- "$s" /tmp/board-env /opt/data; then leaked=$((leaked + 1)); fi
     done
     rm /tmp/board-env; echo "$checked $leaked"' || true)"
 expect "board page reaches LiteLLM, but not Postgres, the workspace, github-token, or mcp-atlassian" \

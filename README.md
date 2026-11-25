@@ -129,7 +129,10 @@ run whose tools run in its workspace like any other.
   read secrets. So the dashboard and API server listen on `127.0.0.1` in the page's namespace, and
   `kanban-web` passes on only logging in and out, the app's files and start-up reads, and the Kanban
   API and its live updates; everything else is refused, as are paths with dot segments or encoded
-  slashes. It refuses everything while the dashboard doesn't require a login (e.g. its public URL is
+  slashes. Of the Kanban API, it refuses what acts on the page's own container or on server paths:
+  the dispatcher button (a tick there would reclaim tasks the agent is still running), reclaiming or
+  terminating a run, exporting or importing a board, and switching the shared current board. It
+  replaces the browser's forwarding headers, so the dashboard's audit log records real addresses. It refuses everything while the dashboard doesn't require a login (e.g. its public URL is
   still a loopback one).
 - **The board chat** (`/board-chat`) sends a logged-in user's messages to the API server's chat
   completions, adding the API server's key itself. The chat runs a plain agent turn with the Kanban
@@ -144,11 +147,13 @@ run whose tools run in its workspace like any other.
   read-only MCP servers `atlassian_read` and `onyx_search` (`BOARD_MCP_SERVERS` in
   `admin/hermes_admin/agents.py`), with its own monthly budget ($50 default) on the LiteLLM user
   `hermes-board-<name>`, and its API server's key. It can't get GitHub tokens (no `/key/info`).
-- **It shares only the agent's boards**, `<agent home>/kanban-shared` (`HERMES_KANBAN_HOME`), not the
-  agent's `.env`, SSH key, sessions, or memories. Its `config.yaml` (`hermes/board.yaml`) and `SOUL.md`
+- **It shares only the agent's boards**, `<agent home>/kanban-shared` (`HERMES_KANBAN_HOME`, mounted at
+  the same path in both, since Kanban stores absolute paths), not the agent's `.env`, SSH key,
+  sessions, or memories. Attachments work both ways, but a worker's file tools run in its workspace,
+  which can't open them, so put what a task needs in its body or comments. Its `config.yaml` (`hermes/board.yaml`) and `SOUL.md`
   (`hermes/souls/board.md`) are read-only.
-- **It never runs tasks.** Its gateway has no dispatcher, and `kanban.dispatch_profiles: []` also
-  stops the dashboard's dispatch button from starting a worker in the page's container.
+- **It never runs tasks.** Its gateway has no dispatcher, and `kanban.dispatch_profiles: []` would also
+  stop a dispatcher tick from starting a worker in the page's container.
 - **Networks.** `boards` (internal: board pages and `litellm`) and `boards-egress` (the host port and
   the OIDC provider). Pages can't reach agents, workspaces, `github-token`, `mcp-atlassian`, or Postgres.
   `kanban-web` passes on the browser's `X-Forwarded-Proto`, which the dashboard trusts over loopback:

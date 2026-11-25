@@ -10,6 +10,7 @@ creates, assigned to `default`.
 """
 
 import asyncio
+import http.client
 import http.cookiejar
 import json
 import ssl
@@ -37,6 +38,14 @@ REFUSED = [
     ("POST", "/api/ops/hooks", {"event": "on_session_start", "command": "id"}),
     ("POST", "/api/skills/hub/install", {"identifier": "x"}),
     ("POST", "/api/gateway/restart", {}),
+    # Kanban routes that act on this container's processes or on server paths: a dispatcher tick would
+    # reclaim tasks the agent is still running.
+    ("POST", "/api/plugins/kanban/dispatch", None),
+    ("POST", "/api/plugins/kanban/tasks/TASK/reclaim", {}),
+    ("POST", "/api/plugins/kanban/runs/1/terminate", {}),
+    ("POST", "/api/plugins/kanban/boards/import", {"path": "/etc/passwd"}),
+    ("POST", "/api/plugins/kanban/boards/default/export", {"path": "/tmp/x"}),
+    ("POST", "/api/plugins/kanban/boards/default/switch", {}),
 ]
 
 
@@ -52,12 +61,13 @@ def browser():
     return jar, opener
 
 
-def request(opener, method, url, body=None):
+def request(opener, method, url, body=None, headers=None, raw=None):
     """(status, Location header, body text); redirects are returned, not followed."""
     if not url.startswith("http"):
         url = base + url
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    data = raw if raw is not None else json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=headers or {"Content-Type": "application/json"})
     try:
         response = opener.open(req, timeout=120)
     except urllib.error.HTTPError as e:
@@ -140,18 +150,45 @@ print(f"task: {task}")
 status, _, body = request(user, "POST", f"/api/plugins/kanban/tasks/{task}/comments",
                           {"body": "Comment from the board page."})
 print(f"comment: {status}")
-# The page must never run tasks itself, even when asked to dispatch.
-status, _, body = request(user, "POST", "/api/plugins/kanban/dispatch")
-result = json.loads(body) if status == 200 else {}
-print(f"dispatch: {status} spawned={len(result.get('spawned') or [])} "
-      f"skipped={task in (result.get('skipped_nonspawnable') or [])}")
+# An attachment uploaded here must be readable by the agent at the path Kanban stores.
+boundary = "board-page-checks"
+upload = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"spec.txt\"\r\n"
+          f"Content-Type: text/plain\r\n\r\nspec from the board page\r\n--{boundary}--\r\n").encode()
+status, _, body = request(user, "POST", f"/api/plugins/kanban/tasks/{task}/attachments", raw=upload,
+                          headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+print(f"attachment: {status} {(json.loads(body).get('attachment') or {}).get('stored_path') if status == 200 else body[:200]}")
+# A forged client address must not reach the dashboard's audit log, which records logins' addresses.
+request(user, "GET", "/auth/login?provider=self-hosted", headers={"X-Forwarded-For": "203.0.113.99",
+                                                                  "X-Real-IP": "203.0.113.99"})
 print(f"live updates: {asyncio.run(websocket(jar, user, '/api/plugins/kanban/events'))}")
 print(f"terminal websocket: {asyncio.run(websocket(jar, user, '/api/pty'))}")
-print(f"refused: {' '.join(str(request(user, method, path, body)[0]) for method, path, body in REFUSED)}")
+print(f"refused: {' '.join(str(request(user, method, path.replace('TASK', str(task)), body)[0]) for method, path, body in REFUSED)}")
 tricks = ("/api/plugins/kanban/../../env", "/api/plugins/kanban/%2e%2e/%2e%2e/env", "/api/plugins/kanban/..%2f..%2fenv",
           "//api/env")
 print(f"refused paths: {' '.join(str(request(user, 'GET', path)[0]) for path in tricks)}")
 print(f"chat: {chat(user, 'hello')}")
+
+
+def chat_in_pieces(jar, size):
+    """Sends a `size`-byte conversation in two pieces, as a slow connection would; the chat's status."""
+    body = json.dumps({"messages": [{"role": "assistant", "content": "x" * size}, {"role": "user", "content": "hello"}]})
+    url = urllib.parse.urlsplit(base)
+    connection = http.client.HTTPConnection(url.hostname, url.port, timeout=120)
+    connection.putrequest("POST", "/board-chat/api")
+    for name, value in (("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                        ("Cookie", "; ".join(f"{c.name}={c.value}" for c in jar))):
+        connection.putheader(name, value)
+    connection.endheaders()
+    connection.send(body[: len(body) // 2].encode())
+    import time
+    time.sleep(0.5)
+    connection.send(body[len(body) // 2:].encode())
+    status = connection.getresponse().status
+    connection.close()
+    return status
+
+
+print(f"chat in pieces: {chat_in_pieces(jar, 100_000)}")
 print(f"chat slash command: {chat(user, '/help')}")
 print(f"chat shell command: {chat(user, '  !id')}")
 status, _, _ = request(user, "POST", "/auth/logout")

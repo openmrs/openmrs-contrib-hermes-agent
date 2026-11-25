@@ -139,7 +139,8 @@ x-hermes-board: &hermes-board
     HERMES_DASHBOARD_PORT: "9119"
     API_SERVER_ENABLED: "true"
     API_SERVER_HOST: 127.0.0.1
-    HERMES_KANBAN_HOME: /opt/kanban
+    # The same path as in the agent, since Kanban stores absolute paths (e.g. attachments').
+    HERMES_KANBAN_HOME: /opt/data/kanban-shared
     # The OIDC provider, from ./.env (see README.md). Without an issuer the dashboard refuses to start.
     HERMES_DASHBOARD_OIDC_ISSUER: ${BOARD_OIDC_ISSUER:-}
     HERMES_DASHBOARD_OIDC_CLIENT_ID: ${BOARD_OIDC_CLIENT_ID:-hermes-board}
@@ -540,7 +541,7 @@ services:
           subpath: default/.env
       - type: volume
         source: agents-data
-        target: /opt/kanban
+        target: /opt/data/kanban-shared
         volume:
           subpath: default/kanban-shared
       - ./hermes/souls/board.md:/opt/data/SOUL.md:ro
