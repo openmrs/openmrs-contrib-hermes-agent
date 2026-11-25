@@ -478,6 +478,11 @@ services:
       - ./hermes/reviewer/config.yaml:/etc/hermes/config.yaml:ro
       - ./hermes/plugins/github-review:/opt/data/plugins/github-review:ro
       - ./hermes/reviewer/skills:/opt/data/skills:ro
+      # The workspace supervisor's answer to a reset request (see workspace/supervisor.py).
+      - type: volume
+        source: reviewer-reset
+        target: /opt/workspace-reset
+        read_only: true
     # GitHub's webhooks (the github-pr route in hermes/reviewer/config.yaml).
     ports: ["8644:8644"]
 
@@ -503,6 +508,8 @@ services:
         volume:
           subpath: reviewer
       - reviewer-cache:/cache
+      # Only the supervisor (root) writes here; agent-reviewer reads it.
+      - reviewer-reset:/reset-status
       # Emptied whenever the workspace resets.
       - /work
 
@@ -545,6 +552,9 @@ volumes:
   workspace-cache: {}
   # The same caches for workspace-reviewer only, which builds untrusted pull requests.
   reviewer-cache: {}
+  # workspace-reviewer's answer to the reviewer's reset requests, which the reviewer reads without
+  # going through the workspace user's shell.
+  reviewer-reset: {}
   # Per agent: its workspace's SSH keys and LiteLLM key, written by admin. Each workspace mounts
   # only its own; agents mount none of it.
   workspace-config: {}

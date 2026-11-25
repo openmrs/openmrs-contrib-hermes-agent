@@ -30,9 +30,15 @@ the workspace and prepare_workspace has reset it for this review: not before the
 another review took the workspace from it. Sessions without a binding are not affected.
 
 Hermes abandons a tool call after a generic deadline (420 s, <H>/agent/tool_executor.py:137), so
-prepare_workspace registers a longer one (PREPARE_TIMEOUT_SECONDS); the call stamps the turn's
-activity every 30 s, so the gateway's inactivity timeout doesn't end the turn while it waits. A wait
-that Hermes cancels anyway stops without taking the workspace.
+prepare_workspace registers a longer one (PREPARE_TIMEOUT_SECONDS). Hermes' tool executor stamps the
+turn's activity while a tool runs (<H>/agent/tool_executor.py:626), so the gateway's inactivity
+timeout doesn't end the turn while it waits. A wait that Hermes cancels anyway stops without taking
+the workspace.
+
+The reset request goes over SSH, but the supervisor's answer is read from a volume that only it
+writes (RESET_DONE), never over SSH: every SSH command runs the workspace user's shell, which reads
+~/.bashrc first, so an earlier review's build could make it swallow the request and print the nonce.
+At worst, that build keeps the request from the supervisor, and prepare_workspace fails.
 
 The github_review token comes from github-token with the agent's LiteLLM key, and stays in this
 process: workspaces can't get it.
@@ -43,6 +49,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import subprocess
 import tempfile
 import threading
@@ -68,12 +75,16 @@ TARGET_MARKER = "REVIEW-TARGET"
 TARGET_LINE = re.compile(r"REVIEW-TARGET repo=([A-Za-z0-9-]+/[A-Za-z0-9._-]+) pr=([1-9][0-9]{0,9}) sha=([0-9a-f]{40})")
 POSTED_FILE = Path("/opt/data/github-review/posted.json")
 TOKEN_URL = "http://github-token:8080/token/github_review"
+# A 422 the model can fix by moving a comment ("Line could not be resolved", "... line must be part of
+# the diff"). Any other 422 (a commit no longer in the pull request, say) won't pass on a retry.
+LINE_ERROR = re.compile(r"\bline\b|\bpath\b|part of the diff|could not be resolved", re.IGNORECASE)
 TIMEOUT_SECONDS = 30
 # The agent's workspace: Hermes' terminal settings (hermes/config.yaml), with the host from .env.
 SSH_KEY = "/opt/data/ssh/id_ed25519"
 SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
 RESET_REQUEST_DIR = "/run/workspace-reset"
-RESET_DONE = "/run/workspace/reset-done"
+# The supervisor's answer, on the reviewer-reset volume (read-only here; see compose.yaml).
+RESET_DONE = Path("/opt/workspace-reset/reset-done")
 RESET_WAIT_SECONDS = 120
 RESET_POLL_SECONDS = 2
 # Long enough to wait behind a 60-90 minute review. A holder is stale after LOCK_STALE_SECONDS with no
@@ -241,8 +252,8 @@ def _ssh(host, command):
 
 
 def _reset_workspace():
-    """Asks the workspace's supervisor for a reset and waits until it has written back our nonce,
-    which only it can. Raises if it can't."""
+    """Asks the workspace's supervisor for a reset and waits until it has written back our nonce to
+    RESET_DONE, which only it can. Raises if it can't."""
     # TERMINAL_* is not a profile secret (get_secret reads it from the process environment); the
     # terminal tool reads it from the turn's terminal scope, built from the agent's .env.
     host = terminal_env("TERMINAL_SSH_HOST")
@@ -258,11 +269,10 @@ def _reset_workspace():
     while time.monotonic() < deadline:
         time.sleep(RESET_POLL_SECONDS)
         try:
-            done = _ssh(host, f"cat {RESET_DONE}")
-        except subprocess.TimeoutExpired:
+            if RESET_DONE.read_text().strip() == nonce:
+                return
+        except FileNotFoundError:
             continue
-        if done.returncode == 0 and done.stdout.strip() == nonce:
-            return
     raise RuntimeError(f"the workspace didn't reset within {RESET_WAIT_SECONDS} seconds")
 
 
@@ -439,10 +449,18 @@ def _post(binding, body, comments):
         return _result(False, error=f"Can't get a GitHub token ({type(e).__name__}).")
     try:
         status, response = _create_review(binding, body, comments, token)
+    except urllib.error.URLError as e:
+        # GitHub's address didn't resolve or the connection was refused: the request never left.
+        if isinstance(e.reason, (socket.gaierror, ConnectionRefusedError)):
+            return _result(False, error=f"Can't reach GitHub ({type(e.reason).__name__}); nothing was sent.")
+        return _unknown_outcome(binding, f"GitHub's answer was lost ({type(e).__name__})")
     except Exception as e:  # noqa: BLE001 - once the request is sent, any failure is an unknown outcome
         return _unknown_outcome(binding, f"GitHub's answer was lost ({type(e).__name__})")
     if status == 422:
-        return _result(False, error=f"GitHub refused the review: {response.get('message', 'unprocessable')}. "
+        message = " ".join([str(response.get("message", "unprocessable")), *map(str, response.get("errors") or [])])
+        if not LINE_ERROR.search(message):
+            return _result(False, error=f"GitHub refused the review: {message}. Don't retry.")
+        return _result(False, error=f"GitHub refused the review: {message}. "
                                     "Fix the comments (each line must be in the diff) and call post_pr_review again.")
     if status >= 500:
         return _unknown_outcome(binding, f"GitHub answered {status}")

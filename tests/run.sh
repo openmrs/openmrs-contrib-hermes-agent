@@ -52,12 +52,13 @@
 #      prepare_workspace resets the workspace, also the reset-request directory (the terminal still
 #      works after), for one review at a time (a waiter takes the workspace from a holder with no
 #      heartbeat, not from a live one), with its own longer tool deadline, never for a PR and commit
-#      already reviewed, and fails when the workspace is down; the
-#      workspace rejects a reset request that is a symlink; a compacted session keeps its binding and
+#      already reviewed, and fails when the workspace is down or a planted ~/.bashrc fakes the
+#      reset over SSH; the workspace rejects a reset request that is a symlink; a compacted session keeps its binding and
 #      the workspace;
 #      post_pr_review posts one COMMENT review, with a github_review token, only for the PR and
 #      commit the webhook prompt bound the session to, only after the workspace is prepared, and
-#      once per session and per (repository, PR, commit); GitHub's 422 leaves a retry possible, and
+#      once per session and per (repository, PR, commit); GitHub's 422 for a line leaves a retry
+#      possible, any other 422 says not to retry, a refused connection records nothing, and
 #      an unknown outcome (a 5xx, an unreadable answer) counts as posted. The github-pr webhook route
 #      needs a valid signature, starts a run only for a ready, human-authored PR to a listed
 #      repository, and gives the model the reviewer's SOUL.md, the pr-review skill, and exactly its
@@ -1046,6 +1047,7 @@ from model_tools import handle_function_call
 print(" ".join(s["name"] for s in json.loads(handle_function_call("skills_list", {}, task_id="skills-check"))["skills"]))' 2>/dev/null)"
 expect_refused "reviewer can't write its skills" compose exec -T agent-reviewer sh -c 'echo x > /opt/data/skills/planted'
 expect_refused "reviewer can't write its plugin" compose exec -T agent-reviewer sh -c 'echo x >> /opt/data/plugins/github-review/__init__.py'
+expect_refused "reviewer can't write the workspace's reset answer" compose exec -T agent-reviewer sh -c 'echo x > /opt/workspace-reset/reset-done'
 # Ending a terminal session copies changed files in the workspace's .hermes back to the agent
 # (sync_back), also into skills/: a changed skill file, and a new file next to it. The read-only
 # mount makes that copy fail without a trace.
@@ -1061,13 +1063,13 @@ expect "the workspace's changes don't reach the reviewer's skills" "$skill_hash 
 expect "reviewer is still running, with its webhook listener, after sync_back" "running listening" \
   "$(compose ps --format '{{.State}}' agent-reviewer) $(compose exec -T agent-reviewer python3 -c \
     'import socket; socket.create_connection(("127.0.0.1", 8644), timeout=3); print("listening")' 2>/dev/null)"
-# Each successful prepare_workspace below (sixteen of them) is one reset on request.
+# Each successful prepare_workspace below (eighteen of them) is one reset on request.
 resets_before="$(log_count_fixed workspace-reviewer "reset on request")"
 expect "prepare_workspace and post_pr_review: one review at a time, only for the bound, prepared PR, once" \
-  "deadline=extended j=prepared j-reset=clean k=waited s=prepared s-fast=yes s-old=refused p-before=blocked p=prepared p-after=ran p-taken=blocked p-unbound=ran l=refused a0=prepared a=posted b=refused q-unlocked=yes q-second=busy q=posted c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused m1=refused m2=posted n1=refused n2=prepared" \
+  "deadline=extended j=prepared j-reset=clean k=waited s=prepared s-fast=yes s-old=refused p-before=blocked p=prepared p-after=ran p-taken=blocked p-unbound=ran l=refused a0=prepared a=posted b=refused q-unlocked=yes q-second=busy q=posted c=refused d0=refused d1=refused d2=refused d3=refused d4=refused d5=refused d6=refused e0=refused e=refused f=posted g1=github-422 g2=posted h1=unknown h2=refused h3=refused i1=posted i2=refused i3=refused r=github-422-final t1=unsent t2=posted m1=refused m2=posted n1=refused n2=prepared" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - < "$root/tests/hermes_review_tool.py" 2>/dev/null |
     tail -n 1)"
-expect "workspace-reviewer resets once per prepare_workspace" "16" \
+expect "workspace-reviewer resets once per prepare_workspace" "18" \
   "$(($(log_count_fixed workspace-reviewer "reset on request") - resets_before))"
 review_token="$(compose exec -T -e KEY="$(agent_key reviewer)" agent-reviewer sh -c \
   'curl -sf -H "Authorization: Bearer $KEY" http://github-token:8080/token/github_review' || true)"
@@ -1081,10 +1083,22 @@ expect "review is posted again after GitHub's 422" "2" \
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-management pr=14 commit=$(printf '1%.0s' $(seq 40)) event=COMMENT ")"
 expect "GitHub's 500 and a non-JSON answer each reach GitHub once, with no retry" "1 1" \
   "$(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=15 ") $(log_count_fixed fake-github "review repo=openmrs/openmrs-esm-patient-chart pr=16 ")"
-expect "refused reviews never reach GitHub" "8" "$(log_count fake-github "^review ")"
-expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "7 ${HERMES_UID:-10000}" \
+expect "refused reviews never reach GitHub" "10" "$(log_count fake-github "^review ")"
+expect "posted reviews, and reviews whose outcome is unknown, are recorded, owned by the Hermes user" "8 ${HERMES_UID:-10000}" \
   "$(compose exec -T agent-reviewer sh -c 'f=/opt/data/github-review/posted.json
     echo $(python3 -c "import json, sys; print(len(json.load(open(sys.argv[1]))))" $f) $(stat -c %u $f)' 2>&1)"
+# A build leaves a ~/.bashrc that, before every command sshd runs, makes `mv` swallow the reset
+# request and `cat` print its nonce. prepare_workspace reads the answer from the reviewer-reset
+# volume, not over SSH, so it refuses. Checked within the 15-second idle limit.
+compose exec -T -u "${HERMES_UID:-10000}" agent-reviewer \
+  ssh -p 2222 -i /opt/data/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 workspace@workspace-reviewer \
+  'cat > ~/.bashrc' >/dev/null 2>&1 <<'BASHRC' || true
+mv() { command cp "$2" ~/.nonce; command rm -f "$2"; }
+cat() { command cat ~/.nonce; }
+BASHRC
+expect "a planted .bashrc that fakes the reset: prepare_workspace refuses" "prepare=refused swallowed" \
+  "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - bashrc < "$root/tests/hermes_review_tool.py" 2>/dev/null |
+    tail -n 1) $(compose exec -T workspace-reviewer sh -c 'test -s /work/home/.nonce && echo swallowed || echo "not swallowed"')"
 compose stop workspace-reviewer >/dev/null
 expect "prepare_workspace fails while the workspace is down, so post_pr_review refuses" "prepare=refused post=refused" \
   "$(compose exec -T -u "${HERMES_UID:-10000}" -w /opt/hermes agent-reviewer python - stopped < "$root/tests/hermes_review_tool.py" 2>/dev/null |
@@ -1101,7 +1115,7 @@ sleep 6
 expect "a symlinked reset request is deleted and logged, without a reset or the key in reset-done" "1 0 deleted /work/home/kept clean" \
   "$(($(log_count_fixed workspace-reviewer "rejected a reset request") - rejected_before)) $(($(log_count_fixed workspace-reviewer "reset on request") - resets_before)) $(
     compose exec -T workspace-reviewer sh -c '[ -L /run/workspace-reset/request ] || echo deleted; ls /work/home/kept
-      grep -qF -f /config/litellm_key /run/workspace/reset-done 2>/dev/null && echo leaked || echo clean' 2>&1 |
+      grep -qF -f /config/litellm_key /reset-status/reset-done 2>/dev/null && echo leaked || echo clean' 2>&1 |
     tr '\n' ' ' | sed 's/ $//')"
 
 # The webhook route. The tier models now go to fake-anthropic, which logs what the model gets and

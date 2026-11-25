@@ -7,7 +7,7 @@ and repositories, and answers with a numbered token.
 
 Review requests: logs a "review" line with the repository, pull request, commit, event, number of
 inline comments, and token, and answers as GitHub does. A comment on the path "not-in-diff.txt"
-gets GitHub's 422 for a line outside the diff. Pull request 15 gets a 500 and pull request 16 a 200
+gets GitHub's 422 for a line outside the diff; pull request 30 gets a 422 about the commit. Pull request 15 gets a 500 and pull request 16 a 200
 whose body isn't JSON, both after the review is logged, as if GitHub had created it.
 """
 
@@ -54,6 +54,8 @@ def jwt_ok(token):
 
 REVIEW_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/reviews$")
 LINE_NOT_IN_DIFF = "Unprocessable Entity: pull_request_review_thread.line must be part of the diff"
+# A 422 that moving a comment can't fix, e.g. after a force-push. Not GitHub's exact wording.
+COMMIT_NOT_IN_PR = "commit_id is not part of the pull request"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,6 +72,9 @@ class Handler(BaseHTTPRequestHandler):
               f"comments={len(comments)} token={token}", flush=True)
         if any(c.get("path") == "not-in-diff.txt" for c in comments):
             self.send_json(422, {"message": LINE_NOT_IN_DIFF, "status": "422"})
+            return
+        if pr == "30":
+            self.send_json(422, {"message": "Unprocessable Entity", "errors": [COMMIT_NOT_IN_PR], "status": "422"})
             return
         if pr in ("15", "16"):
             self.send_response(500 if pr == "15" else 200)

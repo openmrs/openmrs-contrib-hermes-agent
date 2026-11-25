@@ -23,8 +23,10 @@ holds its connection open while commands run and for five minutes after.
 
 The agent can also ask for a reset (the reviewer does before each review): as the workspace user it
 puts a 32-hex-digit nonce in /run/workspace-reset/request. The supervisor checks for one every
-POLL_SECONDS, resets, and then writes the nonce to /run/workspace/reset-done, which only root can
-write, so the agent knows the reset happened. A request that isn't a small regular file of the
+POLL_SECONDS, resets, and then writes the nonce to /reset-status/reset-done, which only root can
+write, so the agent knows the reset happened. /reset-status is a volume the agent mounts read-only
+and reads directly, not over SSH, where the workspace user's ~/.bashrc could fake the answer; a
+workspace without it is reset on request but writes no answer. A request that isn't a small regular file of the
 workspace user's holding a nonce (a symlink to a secret, say) is deleted and logged, never read
 through.
 """
@@ -51,7 +53,8 @@ CONFIG = Path("/config")
 RUN = Path("/run/workspace")
 RESET_REQUESTS = Path("/run/workspace-reset")
 RESET_REQUEST = RESET_REQUESTS / "request"
-RESET_DONE = RUN / "reset-done"
+RESET_STATUS = Path("/reset-status")
+RESET_DONE = RESET_STATUS / "reset-done"
 NONCE = re.compile(rb"([0-9a-f]{32})\n?")
 WORK = Path("/work")
 HOME = WORK / "home"
@@ -138,6 +141,9 @@ def setup_reset_requests() -> None:
     RESET_REQUESTS.mkdir()
     os.chown(RESET_REQUESTS, 0, 0)
     os.chmod(RESET_REQUESTS, 0o1733)
+    if RESET_STATUS.is_dir():
+        os.chown(RESET_STATUS, 0, 0)
+        os.chmod(RESET_STATUS, 0o755)
 
 
 def remove(path: Path) -> None:
@@ -192,7 +198,10 @@ def take_reset_request() -> str | None:
 
 
 def write_reset_done(nonce: str) -> None:
-    tmp = RUN / ".reset-done"
+    if not RESET_STATUS.is_dir():
+        log(f"no {RESET_STATUS}, so the reset isn't confirmed")
+        return
+    tmp = RESET_STATUS / ".reset-done"
     write(tmp, nonce + "\n", 0o644)
     os.replace(tmp, RESET_DONE)
 

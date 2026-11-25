@@ -6,8 +6,10 @@ discovery, so it also checks that the managed config (/etc/hermes/config.yaml) e
 uses its own session id; prepare_workspace really resets workspace-reviewer, and posts go to
 tests/fake_github.py, whose log run.sh checks. Prints one summary line, `<case>=<outcome>` for each
 case: "posted", "refused", "github-422" (GitHub's message for a line outside the diff came back),
+"github-422-final" (a 422 the model must not retry), "unsent" (GitHub couldn't be reached),
 "unknown" (the tool can't tell whether GitHub created the review), "prepared", or a case's own
-outcome. With the argument `stopped` (workspace-reviewer stopped), runs only that case.
+outcome. With the argument `stopped` (workspace-reviewer stopped) or `bashrc` (a planted ~/.bashrc
+in the workspace), runs only that case.
 
 The tools need the agent's LiteLLM key for github-token and its workspace host, which Hermes reads
 from the profile's secret scope; a bare `compose exec` has no scope, so the scope is loaded here from
@@ -16,6 +18,7 @@ the agent's .env first, and the terminal scope too, for the terminal tool.
 
 import contextvars
 import json
+import os
 import sys
 import threading
 import time
@@ -84,6 +87,10 @@ def post(session, args):
         return "posted"
     if "must be part of the diff" in str(result.get("error")):
         return "github-422"
+    if "refused the review" in str(result.get("error")) and "Don't retry" in str(result.get("error")):
+        return "github-422-final"
+    if "nothing was sent" in str(result.get("error")):
+        return "unsent"
     if "may or may not have been posted" in str(result.get("error")):
         return "unknown"
     if "being posted" in str(result.get("error")):
@@ -100,6 +107,16 @@ if sys.argv[1:] == ["stopped"]:
     outcomes["prepare"] = prepare("review-stopped")
     outcomes["post"] = post("review-stopped", review)
     end("review-stopped")
+    print(" ".join(f"{case}={outcome}" for case, outcome in outcomes.items()))
+    sys.exit()
+
+if sys.argv[1:] == ["bashrc"]:
+    # An earlier build left a ~/.bashrc that swallows the reset request and makes `cat` print its
+    # nonce: prepare_workspace reads the answer from its volume, so it refuses (a 6-second wait).
+    plugin.RESET_WAIT_SECONDS = 6
+    bind("review-bashrc", target(CHART, 31, "6" * 40))
+    outcomes["prepare"] = prepare("review-bashrc")
+    end("review-bashrc")
     print(" ".join(f"{case}={outcome}" for case, outcome in outcomes.items()))
     sys.exit()
 
@@ -283,6 +300,20 @@ end("review-i")
 bind_prepared("review-i3", target(CHART, 16, "3" * 40))
 outcomes["i3"] = post("review-i3", review)
 end("review-i3")
+# (r) GitHub's 422 that isn't about a line (the commit left the pull request): the model is told
+# not to retry, and nothing is recorded.
+bind_prepared("review-r", target(CHART, 30, "e" * 40))
+outcomes["r"] = post("review-r", review)
+end("review-r")
+# (t) GitHub's address refuses the connection: nothing was sent, so nothing is recorded, and the
+# same session posts once GitHub is back.
+bind_prepared("review-t", target(CHART, 32, "7" * 40))
+github_api = os.environ["GITHUB_API_URL"]
+os.environ["GITHUB_API_URL"] = "http://127.0.0.1:9"
+outcomes["t1"] = post("review-t", review)
+os.environ["GITHUB_API_URL"] = github_api
+outcomes["t2"] = post("review-t", review)
+end("review-t")
 
 # (m) Hermes compacts session m1 into m2 mid-review: m2 keeps the binding and the workspace, m1 has
 # neither. While m2 holds the workspace, another session's prepare_workspace times out (the wait is
